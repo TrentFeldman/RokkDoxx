@@ -7,11 +7,10 @@ searches the coordinate space for a target bedrock pattern — without running t
 engine. Given a world seed and a picture of some bedrock (e.g. the floor of the Nether, or
 a hole dug to bedrock), it tells you where in the world that pattern occurs.
 
-The design goal (sketched in the early [`whitepaper.md`](whitepaper.md)) is a GPU/OpenCL
-search over the full `30,000,000 × 30,000,000` world. The architecture is three tiers — thin
-front-ends, a CPU orchestrator that tiles the region and aggregates results, and one compute
-worker (GPU or CPU) — see [`docs/design.md`](docs/design.md). What the project deliberately
-does *not* do is spelled out in [`docs/SCOPE.md`](docs/SCOPE.md).
+The design goal ([`whitepaper.md`](whitepaper.md)) is a GPU/OpenCL
+search over the full `30,000,000 × 30,000,000` world. The architecture is three tiers, a thin
+tui front end, a CPU scheduler that tiles the region and validates results, and a compute
+worker (GPU or CPU). As a full time student, this project's scope is very narrow.[`docs/SCOPE.md`](docs/SCOPE.md).
 
 ---
 
@@ -36,9 +35,9 @@ does *not* do is spelled out in [`docs/SCOPE.md`](docs/SCOPE.md).
 ## Quick start
 
 ```sh
-git clone <your-fork-url> RokkDoxx && cd RokkDoxx
+git clone https://github.com/TrentFeldman/RokkDoxx RokkDoxx && cd RokkDoxx
 
-cmake -B build -DROKK_ENABLE_OPENCL=ON     # drop the flag for a CPU-only build
+cmake -B build -DROKK_ENABLE_OPENCL=ON     # DROKK_ENABLE_OPENCL=ON for GPU compute
 cmake --build build
 ctest --test-dir build --output-on-failure
 
@@ -54,14 +53,14 @@ No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`
 
 | Component | State |
 |---|---|
-| Minecraft **26.2** Overworld bedrock-floor generation (`B(seed, x, y, z)`) | ✅ verified |
+| Minecraft 26.2 Overworld bedrock-floor generation (`B(seed, x, y, z)`) | ✅ verified |
 | Shared C/OpenCL generation core (`bedrock_core.h`) | ✅ |
 | Search service — tiling, scheduling, dedup, progress, cancel, resume | ✅ |
 | `rokkd` daemon + Unix-socket protocol | ✅ |
 | `rokktui` (interactive) / `rokksearch` (headless) — both clients | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ verified on RX 7900 XTX (~76 Gcand/s) |
-| Local-memory tile cache, async tile pipelining | ⬜ later (~2× more) |
+| Local-memory tile cache, async tile pipelining | IN PROGRESS |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
 
 The generation logic is documented in [`docs/bedrock-generation.md`](docs/bedrock-generation.md).
