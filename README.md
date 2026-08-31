@@ -93,6 +93,7 @@ Short version:
   `opencl-mesa` for Rusticl). See [`docs/design.md`](docs/design.md).
 
 ---
+## CURRENTLY LINUX ONLY! WORKING ON WINDOWS COMPATABILITY 
 
 ## Build
 
