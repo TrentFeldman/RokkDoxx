@@ -1,6 +1,6 @@
 # RokkDoxx
 
-**Find bedrock formations in a Minecraft world by math, not by exploring.**
+**Got Bedrock? Get Locations.**
 
 RokkDoxx reproduces Minecraft's bedrock world-generation rule as a plain function and
 searches the coordinate space for a target bedrock pattern — without running the game
@@ -37,7 +37,7 @@ worker (GPU or CPU). As a full time student, this project's scope is very narrow
 ```sh
 git clone https://github.com/TrentFeldman/RokkDoxx RokkDoxx && cd RokkDoxx
 
-cmake -B build -DROKK_ENABLE_OPENCL=ON     # DROKK_ENABLE_OPENCL=ON for GPU compute
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # DROKK_ENABLE_OPENCL=ON for GPU compute
 cmake --build build
 ctest --test-dir build --output-on-failure
 
@@ -60,11 +60,12 @@ No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`
 | `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Local-memory tile cache, async tile pipelining | IN PROGRESS |
+| Windows Compatability | IN PROGRESS |
+| Local-memory tile cache, async tile pipelining | ⬜ later |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
 | `rokktui` redo | ⬜ later |
 | Further optimizations, early test rejections | ⬜ later |
-| Work on optimizing 8 direction increased search times| ⬜ later | 
+| Work on optimizing 8 direction search slowdowns| ⬜ later | 
 
 The generation logic is documented in [`docs/bedrock-generation.md`](docs/bedrock-generation.md).
 Short version:
@@ -100,14 +101,14 @@ Short version:
 ### CMake (preferred)
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release        # add -DROKK_ENABLE_OPENCL=ON for the GPU worker
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # DROKK_ENABLE_OPENCL=ON for GPU compute
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
 Produces `build/{dump_bedrock, rokktui, rokksearch, rokkd, test_*}`.
 
-### Fallback (`build.sh`, no build system)
+### Fallback (`build.sh`, no build system, not reccomended, not windows compatable)
 
 ```sh
 ./build.sh                 # CPU only
@@ -138,8 +139,8 @@ HOW TO USE ROKKTUI
    - `Y layer` — which bedrock layer the pattern is on, `-64 … -59` (Left/Right). `-60` is
      the default and the most useful — it has the most detail per cell. The screen shows
      `P(bedrock)` for the chosen layer and warns if you pick `-64` (solid) or `-59` (empty).
-   - `center X` / `center Z` and `radius` — the square region to search:
-     `x ∈ [X−r, X+r]`, `z ∈ [Z−r, Z+r]`.
+   -center X / center Z and radius — defines the square area to search around the center point. 
+    The radius controls how far the search extends in each direction.
    - `Enter` opens the pattern editor.
 
 2. **Pattern editor.** A grid of the size you chose. Arrow keys / `hjkl` move the cursor.
@@ -273,7 +274,7 @@ link `rokksvc` and use `rokkdoxx::svc::make_client(...)` — see
    run. You get back every `(x, z)` where the pattern occurs — each is already an in-game
    coordinate.
 
-On CPU this covers a region a few hundred thousand blocks across in seconds; a whole-world
+On CPU this covers a region a few thousand blocks<sup>2</sup>  in seconds; a whole-world
 sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`). See
 [Performance](#performance).
 
