@@ -57,11 +57,14 @@ No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`
 | Shared C/OpenCL generation core (`bedrock_core.h`) | ✅ |
 | Search service — tiling, scheduling, dedup, progress, cancel, resume | ✅ |
 | `rokkd` daemon + Unix-socket protocol | ✅ |
-| `rokktui` (interactive) / `rokksearch` (headless) — both clients | ✅ |
+| `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
-| OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ verified on RX 7900 XTX (~76 Gcand/s) |
+| OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
 | Local-memory tile cache, async tile pipelining | IN PROGRESS |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
+| `rokktui` redo | ⬜ later |
+| Further optimizations, early test rejections | ⬜ later |
+| Work on optimizing 8 direction increased search times| ⬜ later | 
 
 The generation logic is documented in [`docs/bedrock-generation.md`](docs/bedrock-generation.md).
 Short version:
@@ -124,7 +127,7 @@ project builds on a box with a compiler but no `make`/`ninja`.
 build/rokktui              # or: build/rokktui --load pattern.txt
 ```
 
-A full-screen terminal app. Three steps:
+HOW TO USE ROKKTUI
 
 1. **Parameters screen.** Up/Down (or Tab) to move between fields, type to edit.
    - `seed` — numeric (may be negative), or any text string (hashed the way Minecraft
@@ -156,7 +159,7 @@ A full-screen terminal app. Three steps:
 
 `rokktui` is a **client** — it submits the job to the search service and streams progress.
 By default the service runs in-process; `--service unix:/path` points it at a `rokkd`
-daemon, `--backend opencl:0` picks the GPU (in-process only). `q` quits.
+daemon, `--backend opencl:0` picks the GPU (in-process only). `q` quits. 
 
 ### `rokksearch` — headless search
 
@@ -178,6 +181,7 @@ rokkd --backend auto            # listens on $XDG_RUNTIME_DIR/rokkd.sock
 rokksearch --service unix:$XDG_RUNTIME_DIR/rokkd.sock --pattern p.txt --center 0,0 --radius 3000000
 ```
 
+
 One `SearchService` behind a Unix socket. Handy when the box doing the crunching isn't the
 box you're driving from, or to keep a warm GPU context around across many searches.
 
@@ -195,6 +199,8 @@ dump_bedrock <seed> <x0> <z0> <width> <height> [y | all]
 Output is an ASCII grid: rows run along **z** (increasing = south), columns along **x**
 (increasing = east), `X` = bedrock, `.` = not bedrock. A per-layer bedrock count is printed
 to stderr.
+
+The bedrock output shown in dump_bedrock can be used as a template for the p.txt input. 
 
 ```
 $ build/dump_bedrock 0 0 0 32 8 -60
@@ -261,7 +267,7 @@ link `rokksvc` and use `rokkdoxx::svc::make_client(...)` — see
    bedrock). Note the layout of bedrock / non-bedrock on one layer.
 2. Run `rokktui`, enter the seed, set the pattern size and Y layer, and paint what you saw.
    Mark cells you're unsure about as unknown; leave `orientations` on `all 8` so you don't
-   have to align the screenshot to north.
+   have to align the screenshot to north. NOTE: This increases search time drastically
 3. Set a search center + radius and run, or use `rokksearch` for a scripted / very large
    run. You get back every `(x, z)` where the pattern occurs — each is already an in-game
    coordinate.
@@ -289,59 +295,11 @@ argument, and the tile-size tuning are in [`docs/design.md`](docs/design.md).
 
 ### Why not just use Minecraft to check?
 
-Letting the game generate and inspect terrain is far slower *and* doesn't parallelize well:
+As expected, the speedup vs in-engine usage is drastically increased. 
 
-- A vanilla client only "generates" terrain as you load/travel near it — you cannot sweep
-  millions of chunks this way at all.
-- Headless / datapack chunk generation still runs the whole pipeline the whitepaper lists
-  (noise, surface, carvers, features, lighting, chunk serialization) to get at bedrock.
-  Optimised setups reach roughly 1 k–20 k chunks/s — i.e. ~0.25 M–5 M **columns**/s, versus
-  ~95 M columns/s on a *single* CPU core here (and ~7·10¹⁰/s on the GPU), and it needs
-  gigabytes of RAM/disk for a large area.
-- That's a 20–400× slowdown vs one CPU core before GPU scaling on top.
+- A vanilla client only uses JIT (Just-In-Time) generation, which limits large-scale sweeps like this program does
+- Headless generation ignores all wasted computation time for in-game objects such as mobs, entity calculations, etc. 
 
-The one thing the game is still needed for: a final ground-truth check that our generator
-matches 26.2 exactly for a known seed (see Verification).
-
----
-
-## Project layout
-
-```
-whitepaper.md                Origin document: the GPU bedrock-search idea
-docs/bedrock-generation.md   How Minecraft 26.2 generates the bedrock floor (the algorithm)
-docs/design.md               Three-tier architecture + the OpenCL kernel + measured perf
-docs/SCOPE.md                What the project does and deliberately does not do; file manifest
-src/gen/
-  bedrock_core.h             Shared C99 / C++ / OpenCL-C generation math (one source of truth)
-  xoroshiro128pp.hpp         C++ wrapper: the Xoroshiro128++ RNG
-  positional_random.hpp      C++ wrapper: forkPositional + the block-position hash
-  md5.hpp                    Minimal MD5 (host-only: hashes the surface-rule id)
-  bedrock.hpp / bedrock.cpp  BedrockGenerator: seed -> derived state + per-plane thresholds
-src/cl/search_tile.cl        OpenCL search + dump kernels
-src/svc/                     librokksvc, 8 units:
-  service_types.hpp            the shared data types + the Worker interface
-  search_service.{hpp,cpp}     TileScheduler + ResultSink + SearchService (the orchestrator)
-  workers.{hpp,cpp}            CpuWorker + backend selection
-  opencl_worker.{hpp,cpp}      OpenclWorker (built only with OpenCL)
-  protocol.{hpp,cpp}           the rokkd wire format (JSON + framing)
-  client.{hpp,cpp}             SearchClient: in-process + socket transports
-  daemon.{hpp,cpp}             the rokkd accept loop
-  pattern_io.{hpp,cpp}         the on-disk pattern file format
-tools/
-  dump_bedrock.cpp           CLI grid dump
-  rokktui.cpp                Interactive front-end (client)
-  rokksearch.cpp             Headless front-end (client)
-  rokkd.cpp                  Search daemon
-tests/
-  test_bedrock.cpp           Generator unit + known-answer tests
-  test_search.cpp            Service vs brute-force, tiling invariance, cancel, checkpoint
-  test_daemon.cpp            Socket path == in-process path
-  test_gpu.cpp               OpenCL bit-exactness + CPU/GPU search parity (skips w/o a device)
-  reference/bedrock_ref.py   Independent Python reimplementation
-  diff_test.py               C++ vs Python differential test
-CMakeLists.txt / build.sh    Build (CMake, or a no-make fallback)
-```
 
 ---
 
@@ -356,9 +314,6 @@ CMakeLists.txt / build.sh    Build (CMake, or a no-make fallback)
 - **The GPU kernel** is diffed byte-for-byte against the CPU and checked for CPU/GPU search
   parity (`test_gpu`, needs a device).
 
-Not yet verified: a direct comparison against the actual 26.2 game client. See
-[`docs/bedrock-generation.md`](docs/bedrock-generation.md) for the open items and the three
-community implementations the algorithm was cross-read against.
 
 ---
 
@@ -378,8 +333,3 @@ source file. Before opening a PR:
 
 RokkDoxx is free software under the **GNU General Public License v3.0** — see
 [`LICENSE`](LICENSE).
-
-## Legal / ethical note
-
-This is a world-generation research tool. "Finding a base from a bedrock screenshot" only
-works if you already know the world seed. Use it on your own worlds, or with permission.
