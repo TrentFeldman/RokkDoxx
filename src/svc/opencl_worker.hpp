@@ -16,6 +16,9 @@ struct OpenclDevice {
     std::string label;
     std::string platform;
     std::string device;
+    std::string cl_version;      // CL_DEVICE_VERSION, e.g. "OpenCL 2.0 AMD-APP..."
+    std::string driver_version;  // CL_DRIVER_VERSION
+    int compute_units = 0;       // CL_DEVICE_MAX_COMPUTE_UNITS
 };
 
 // Enumerate every OpenCL device on the host (empty if no platform / ICD).

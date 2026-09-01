@@ -37,9 +37,12 @@ private:
 // --- backend selection -------------------------------------------------
 
 struct BackendInfo {
-    std::string id;      // "cpu", "opencl:0", ...
-    std::string label;   // human-readable
+    std::string id;       // "cpu", "opencl:0", ...
+    std::string label;    // human-readable
     bool is_gpu = false;
+    std::string version;  // GPU: CL_DEVICE_VERSION; CPU: empty
+    std::string driver;   // GPU: CL_DRIVER_VERSION; CPU: empty
+    int units = 0;        // GPU: compute units; CPU: hardware threads
 };
 
 // Every backend runnable on this build + host.

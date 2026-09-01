@@ -96,10 +96,24 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
 
 std::vector<BackendInfo> list_backends() {
     std::vector<BackendInfo> out;
-    out.push_back({"cpu", CpuWorker().name(), false});
+    {
+        BackendInfo cpu;
+        cpu.id = "cpu";
+        cpu.label = CpuWorker().name();
+        cpu.units = static_cast<int>(std::thread::hardware_concurrency());
+        out.push_back(std::move(cpu));
+    }
 #ifdef ROKK_ENABLE_OPENCL
-    for (const OpenclDevice& d : opencl_list_devices())
-        out.push_back({"opencl:" + std::to_string(d.index), d.label, true});
+    for (const OpenclDevice& d : opencl_list_devices()) {
+        BackendInfo b;
+        b.id = "opencl:" + std::to_string(d.index);
+        b.label = d.label;
+        b.is_gpu = true;
+        b.version = d.cl_version;
+        b.driver = d.driver_version;
+        b.units = d.compute_units;
+        out.push_back(std::move(b));
+    }
 #endif
     return out;
 }

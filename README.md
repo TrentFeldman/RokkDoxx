@@ -3,11 +3,11 @@
 **Got Bedrock? Get Locations.**
 
 RokkDoxx reproduces Minecraft's bedrock world-generation rule as a plain function and
-searches the coordinate space for a target bedrock pattern — without running the game
-engine. Given a world seed and a picture of some bedrock (e.g. the floor of the Nether, or
-a hole dug to bedrock), it tells you where in the world that pattern occurs.
+searches the coordinate space for a target bedrock pattern without running the game
+engine. Given a world seed and a picture of some bedrock, it tells you where in 
+the world that pattern occurs.
 
-The design goal is a GPU/OpenCL search over the full `30,000,000 × 30,000,000` world. The
+The end goal is a GPU/OpenCL search over the full `30,000,000 × 30,000,000` world. The
 architecture is three tiers: a thin TUI front end, a CPU scheduler that tiles the region and
 validates results, and a compute worker (GPU or CPU). As a full time student, I'm keeping
 this project's scope very narrow — see [Non-goals](#non-goals).
@@ -47,6 +47,7 @@ build/rokktui                             # interactive pattern search
 
 No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`), then
 `./build.sh test`.
+(unix only)
 
 ---
 
@@ -187,12 +188,19 @@ default and prefers a GPU if present). `q` quits.
 rokksearch --pattern p.txt --center 0,0 --radius 2000000        # p.txt carries seed/y too
 rokksearch --seed 12345 --y -60 --size 8x8 --region -1000000,1000000,-1000000,1000000 --backend opencl:0
 rokksearch --list-backends
-rokksearch --bench --pattern p.txt --center 0,0 --radius 5000000
+rokksearch --benchmark                                          # standard reproducible benchmark
+rokksearch --bench --pattern p.txt --center 0,0 --radius 5000000  # rate of *this* search
 ```
 
 Streams a progress line to stderr; prints matches (`x z orient_mask`) to stdout. `--json`
 for machine output, `--checkpoint FILE` to make a long run resumable (Ctrl-C, then re-run
 the same command). `--help` for everything.
+
+`--benchmark` runs a **fixed** workload (seed 0, a 6×6 pattern, region auto-sized per run)
+so numbers are comparable across machines — warm-up + 5 timed iterations, reported as a
+median with min/max. `--backend cpu` for the CPU figure; `--json` for a pasteable result;
+`--benchmark-seconds` / `--benchmark-iters` to trade run time for stability. See
+[Performance](#performance).
 
 ### `dump_bedrock` — print the bedrock layer for a seed
 
@@ -288,18 +296,31 @@ sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`
 
 ## Performance
 
-Measured, `rokksearch --bench`, an 8×8 pattern. CPU = 6-core / 12-thread Ryzen 5 5600;
-GPU = Radeon RX 7900 XTX (gfx1100, ROCm). **`G` = 10⁹** (one billion) candidate origins
-checked per second.
+**`G` = 10⁹** (one billion) candidate origins checked per second.
 
-| | CPU, 12 threads | GPU | speedup |
+| | CPU (6c/12t Ryzen 5 5600) | GPU (RX 7900 XTX) | speedup |
 |---|---|---|---|
-| candidate origins/s, **exact** orientation | ~0.7 G | **~76 G** | ~110× |
-| candidate origins/s, **all 8** orientations | ~0.09 G | **~10 G** | ~115× |
+| **exact** orientation | ~0.8 G | **~76 G** | ~95× |
+| **all 8** orientations | ~0.14 G | **~10.5 G** | ~75× |
 
 A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~3.5 h** on the GPU (exact
 orientation), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
 the GPU makes a blind whole-world sweep practical.
+
+### Benchmark it yourself
+
+```sh
+build/rokksearch --benchmark              # GPU (or CPU if no GPU / --backend cpu)
+build/rokksearch --backend cpu --benchmark
+```
+
+Fixed workload, auto-sized region, warm-up + 5 timed iterations. Takes ~30 s. This is where
+the table above comes from. 
+
+| machine | backend | exact G | all-8 G | notes | date |
+|---|---|---|---|---|---|
+| RX 7900 XTX (gfx1100) | opencl | 76 | 10.5 | ROCm driver 3581, 48 CU | 2026-08 |
+| Ryzen 5 5600 | cpu | 0.80 | 0.14 | 12 threads, gcc | 2026-08 |
 
 ### Why not just use Minecraft to check?
 

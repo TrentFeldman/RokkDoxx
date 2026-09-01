@@ -28,6 +28,11 @@ namespace rokkdoxx::svc {
 
 namespace {
 
+std::string trimmed(std::string s) {
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\0')) s.pop_back();
+    return s;
+}
+
 std::string kernel_source() {
     return std::string(kBedrockCoreSrc) + "\n\n" + kSearchTileSrc;
 }
@@ -76,6 +81,18 @@ std::vector<OpenclDevice> opencl_list_devices() {
             d.label = labels[i];
             try {
                 d.device = devs[i].getInfo<CL_DEVICE_NAME>();
+            } catch (...) {
+            }
+            try {
+                d.cl_version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
+            } catch (...) {
+            }
+            try {
+                d.driver_version = trimmed(devs[i].getInfo<CL_DRIVER_VERSION>());
+            } catch (...) {
+            }
+            try {
+                d.compute_units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
             } catch (...) {
             }
             out.push_back(std::move(d));
