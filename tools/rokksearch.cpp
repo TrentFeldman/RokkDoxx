@@ -38,7 +38,6 @@ namespace {
                  "  --tile <n>            tile side floor (default 4096)\n"
                  "  --checkpoint <file>   resumable progress file\n"
                  "  --backend <id>        cpu | opencl:N | auto (default auto)\n"
-                 "  --service <target>    local (default) | unix:/path/to.sock\n"
                  "  --json               machine-readable output\n"
                  "  --bench              report throughput only\n"
                  "  --list-backends\n");
@@ -56,8 +55,10 @@ bool parse2(const char* s, long long& a, long long& b, char sep) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::signal(SIGPIPE, SIG_IGN);
-    std::string pattern_path, checkpoint, backend, service = "local";
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);  // don't die if the reader of stdout goes away
+#endif
+    std::string pattern_path, checkpoint, backend;
     const char *seed_s = nullptr, *size_s = nullptr, *center_s = nullptr, *radius_s = nullptr,
                *region_s = nullptr, *orient_s = nullptr;
     int y = -60;
@@ -86,7 +87,6 @@ int main(int argc, char** argv) {
         else if (a == "--tile") tile = std::atoi(val("tile"));
         else if (a == "--checkpoint") checkpoint = val("checkpoint");
         else if (a == "--backend") backend = val("backend");
-        else if (a == "--service") service = val("service");
         else if (a == "--json") json = true;
         else if (a == "--bench") bench = true;
         else if (a == "--list-backends") {
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
     JobStatus fin;
     std::vector<Match> matches;
     try {
-        client = make_client(parse_target(service, backend));
+        client = make_client(backend);
         std::fprintf(stderr, "backend: %s\n", client->backend_name().c_str());
         job = client->submit(req);
         for (;;) {

@@ -9,8 +9,8 @@
 //     the orientation masks.
 //   - SearchService: the job registry + the per-job loop that pumps tiles
 //     through a Worker, updates JobStatus, and honours cancellation.
-// Not this file's job: the compute (workers.*, opencl_worker.*), or the wire
-// protocol (protocol.*, daemon.*).
+// Not this file's job: the compute (workers.*, opencl_worker.*) or the
+// front-end handle (client.*).
 #pragma once
 
 #include <cstdint>

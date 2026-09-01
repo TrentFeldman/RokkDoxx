@@ -12,8 +12,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
 
 #define CL_HPP_ENABLE_EXCEPTIONS
@@ -21,25 +19,17 @@
 #define CL_HPP_MINIMUM_OPENCL_VERSION 120
 #include <CL/opencl.hpp>
 
+// Generated at configure time by CMake (build.sh writes an equivalent header):
+// the text of src/gen/bedrock_core.h and src/cl/search_tile.cl as string
+// literals, so the binary carries its own kernel and is relocatable.
+#include "kernel_sources.h"
+
 namespace rokkdoxx::svc {
 
 namespace {
 
-std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("cannot read kernel source: " + path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 std::string kernel_source() {
-#ifdef ROKK_SRC_DIR
-    const std::string root = ROKK_SRC_DIR;
-    return read_file(root + "/gen/bedrock_core.h") + "\n\n" + read_file(root + "/cl/search_tile.cl");
-#else
-    throw std::runtime_error("ROKK_SRC_DIR not configured -- cannot locate the kernel");
-#endif
+    return std::string(kBedrockCoreSrc) + "\n\n" + kSearchTileSrc;
 }
 
 std::vector<cl::Device> flat_devices(std::vector<std::string>* labels = nullptr) {

@@ -1,0 +1,11 @@
+// Generated from src/svc/kernel_sources.h.in by CMake (configure_file).
+// Do not edit -- edit src/gen/bedrock_core.h / src/cl/search_tile.cl instead.
+#pragma once
+
+namespace rokkdoxx::svc {
+
+inline constexpr const char* kBedrockCoreSrc = R"ROKKCL(@ROKK_BEDROCK_CORE@)ROKKCL";
+
+inline constexpr const char* kSearchTileSrc = R"ROKKCL(@ROKK_SEARCH_TILE@)ROKKCL";
+
+}  // namespace rokkdoxx::svc

@@ -1,13 +1,19 @@
-// rokktui -- interactive front-end (client) for the RokkDoxx search service.
+// rokktui -- interactive front-end for RokkDoxx.
 //
 //   * enter a world seed (numeric, or a text seed hashed the way Minecraft does)
 //   * choose the pattern size (width x height), the Y layer, and orientations
 //   * paint the bedrock pattern on a grid (bedrock / not-bedrock / unknown)
-//   * submit it to the service and watch progress; list every matching origin
+//   * run the search and watch progress; list every matching origin
 //
-// The search itself lives in librokksvc (SearchService + a compute Worker). This
-// process only renders and talks to a SearchClient -- in-process by default, or
-// a rokkd daemon via `--service unix:/path`.
+// The search itself lives in librokksvc (SearchService + a compute Worker),
+// run in-process. This file only renders and drives it.
+//
+// POSIX-only for now: it puts the terminal in raw mode via <termios.h>. The
+// Windows console backend is deferred to the rokktui rework (see README).
+#if defined(_WIN32)
+#  error "rokktui is POSIX-only for now (raw-terminal input). Use rokksearch on Windows; see README."
+#endif
+
 #include <termios.h>
 #include <unistd.h>
 
@@ -189,7 +195,7 @@ struct Ui {
     int gx = 0, gy = 0;
     std::string status;
 
-    // service
+    // in-process search handle
     std::unique_ptr<svc::SearchClient> client;
     std::string backend_label;
     svc::JobId job = 0;
@@ -691,20 +697,18 @@ bool handle_text(Ui& u, int k) {
 
 int main(int argc, char** argv) {
     Ui u;
-    std::string service = "local", backend, load_path;
+    std::string backend, load_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
             std::puts(
-                "rokktui -- interactive bedrock pattern search (client)\n"
+                "rokktui -- interactive bedrock pattern search\n"
                 "  --load FILE        preload a pattern file\n"
-                "  --service TARGET   local (default) | unix:/path/to.sock\n"
-                "  --backend ID       cpu | opencl:N | auto  (in-process only)\n"
+                "  --backend ID       cpu | opencl:N | auto\n"
                 "Requires an interactive terminal. Controls are shown on screen.");
             return 0;
         }
         if (a == "--load" && i + 1 < argc) load_path = argv[++i];
-        else if (a == "--service" && i + 1 < argc) service = argv[++i];
         else if (a == "--backend" && i + 1 < argc) backend = argv[++i];
     }
 
@@ -720,10 +724,10 @@ int main(int argc, char** argv) {
 
     std::signal(SIGPIPE, SIG_IGN);
     try {
-        u.client = svc::make_client(svc::parse_target(service, backend));
+        u.client = svc::make_client(backend);
         u.backend_label = u.client->backend_name();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "service error: %s\n", e.what());
+        std::fprintf(stderr, "backend error: %s\n", e.what());
         return 1;
     }
 

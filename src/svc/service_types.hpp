@@ -7,7 +7,7 @@
 //   - describe a unit of work (Tile, WorkerConfig) and the Worker interface
 //   - parse a world seed string (seed_from_string)
 // Not this file's job: running a search (search_service.*), the compute itself
-// (workers.*, opencl_worker.*), or talking to a daemon (protocol.*, client.*).
+// (workers.*, opencl_worker.*), or the front-end handle (client.*).
 #pragma once
 
 #include <array>

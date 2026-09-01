@@ -1,29 +1,22 @@
-// SearchClient: what a front-end talks to. Two transports behind one interface:
-//   - InProcessClient  -> owns a SearchService in the same process
-//   - SocketClient      -> talks to a rokkd daemon over a Unix socket
-// Selected by a target string: "local" (default) or "unix:/path/to.sock".
+// SearchClient: the thin handle a front-end holds. It owns a SearchService that
+// runs in the same process -- there is no daemon and no IPC.
 //
-// Responsibilities: the SearchClient interface and its two transports.
-// Not this file's job: the wire format (protocol.*) or the service itself
-// (search_service.*).
+// The interface is kept as a seam so a front-end never touches SearchService
+// directly; if an out-of-process transport is ever needed again, it slots in
+// here.
+//
+// Responsibilities: the SearchClient interface + the in-process implementation.
+// Not this file's job: the service itself (search_service.*) or the compute
+// (workers.*, opencl_worker.*).
 #pragma once
 
 #include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "service_types.hpp"
 
 namespace rokkdoxx::svc {
-
-struct ServiceTarget {
-    enum Kind { in_process, unix_socket } kind = in_process;
-    std::string path;
-    std::string backend;  // for in_process: which compute backend ("", "cpu", "opencl:0")
-};
-
-ServiceTarget parse_target(std::string_view s, std::string backend = "");
 
 class SearchClient {
 public:
@@ -35,6 +28,7 @@ public:
     virtual void cancel(JobId) = 0;
 };
 
-std::unique_ptr<SearchClient> make_client(const ServiceTarget&);
+// `backend` selects the compute device: "" / "auto", "cpu", or "opencl:N".
+std::unique_ptr<SearchClient> make_client(const std::string& backend);
 
 }  // namespace rokkdoxx::svc

@@ -7,10 +7,10 @@ searches the coordinate space for a target bedrock pattern — without running t
 engine. Given a world seed and a picture of some bedrock (e.g. the floor of the Nether, or
 a hole dug to bedrock), it tells you where in the world that pattern occurs.
 
-The design goal ([`whitepaper.md`](whitepaper.md)) is a GPU/OpenCL
-search over the full `30,000,000 × 30,000,000` world. The architecture is three tiers, a thin
-tui front end, a CPU scheduler that tiles the region and validates results, and a compute
-worker (GPU or CPU). As a full time student, this project's scope is very narrow.[`docs/SCOPE.md`](docs/SCOPE.md).
+The design goal is a GPU/OpenCL search over the full `30,000,000 × 30,000,000` world. The
+architecture is three tiers: a thin TUI front end, a CPU scheduler that tiles the region and
+validates results, and a compute worker (GPU or CPU). As a full time student, I'm keeping
+this project's scope very narrow — see [Non-goals](#non-goals).
 
 ---
 
@@ -18,15 +18,16 @@ worker (GPU or CPU). As a full time student, this project's scope is very narrow
 
 - [Quick start](#quick-start)
 - [What's implemented](#whats-implemented)
+- [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Build](#build)
 - [Usage](#usage) — [`rokktui`](#rokktui--interactive-pattern-search),
-  [`rokksearch`](#rokksearch--headless-search), [`rokkd`](#rokkd--search-daemon),
+  [`rokksearch`](#rokksearch--headless-search),
   [`dump_bedrock`](#dump_bedrock--print-the-bedrock-layer-for-a-seed), [Python](#testsreferencebedrock_refpy--same-thing-in-python), [C++ library](#c-library)
 - [How to use it to actually find a location](#how-to-use-it-to-actually-find-a-location)
 - [Performance](#performance)
-- [Project layout](#project-layout)
 - [Verification](#verification)
+- [Non-goals](#non-goals)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -55,20 +56,21 @@ No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`
 |---|---|
 | Minecraft 26.2 Overworld bedrock-floor generation (`B(seed, x, y, z)`) | ✅ verified |
 | Shared C/OpenCL generation core (`bedrock_core.h`) | ✅ |
-| Search service — tiling, scheduling, dedup, progress, cancel, resume | ✅ |
-| `rokkd` daemon + Unix-socket protocol | ✅ |
+| Search — tiling, scheduling, dedup, progress, cancel | ✅ |
 | `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Windows Compatability | IN PROGRESS |
+| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 in progress |
+| Windows: `rokktui` | ⬜ later (needs a console backend) |
+| Resumable long runs (`--checkpoint`) | ⬜ revisit |
 | Local-memory tile cache, async tile pipelining | ⬜ later |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
 | `rokktui` redo | ⬜ later |
 | Further optimizations, early test rejections | ⬜ later |
-| Work on optimizing 8 direction search slowdowns| ⬜ later | 
+| Work on optimizing 8 direction search slowdowns | ⬜ later |
+| Reattach to a running / detached search | ⬜ later |
 
-The generation logic is documented in [`docs/bedrock-generation.md`](docs/bedrock-generation.md).
-Short version:
+How the generation works, short version:
 
 - Bedrock floor is a **surface rule** (`minecraft:bedrock_floor`) with a `vertical_gradient`
   condition. It depends only on the seed and block coordinates — not biome, terrain, or
@@ -76,9 +78,25 @@ Short version:
 - `y = -64` is always bedrock; `y ≥ -59` never is; `y = -63..-60` fade out linearly
   (probability 0.8, 0.6, 0.4, 0.2).
 - The RNG is **Xoroshiro128++** (`XoroshiroRandomSource`), unchanged since Java 1.18.
-- The GPU search is **bit-exact** with the CPU: the one float compare is replaced by a
-  host-precomputed integer threshold, so the kernel is pure integer math on any device.
-  See [`docs/design.md`](docs/design.md).
+- The GPU search is **bit-exact** with the CPU. Vanilla places bedrock when
+  `(double)nextFloat() < prob`; the host precomputes `threshold = ceil(prob · 2²⁴)` once and
+  the kernel does the integer compare `bits24 < threshold` instead. No `fp64`, no rounding
+  modes — identical results on any OpenCL device.
+
+---
+
+## Architecture
+
+Three tiers, so the compute scales independently of the UI:
+
+- **Front-ends** (`rokktui`, `rokksearch`) — thin. They build a search request and poll for
+  progress; no search logic of their own.
+- **`SearchService`** (CPU) — cuts the region into tiles, schedules them, deduplicates
+  matches (a symmetric pattern can hit under several orientations at one origin), tracks
+  progress, and supports cancel.
+- **`Worker`** — one compute device: `CpuWorker` (multi-threaded) or `OpenclWorker`.
+
+It all runs in one process — there is no daemon and no IPC.
 
 ---
 
@@ -91,7 +109,7 @@ Short version:
 - Python 3 — for the reference implementation and the differential test
 - *Optional, for the GPU worker:* `opencl-headers`, `opencl-clhpp`, and one OpenCL
   platform (`rocm-opencl-runtime` for an AMD RX 7900 XTX, `pocl` for CPU OpenCL, or
-  `opencl-mesa` for Rusticl). See [`docs/design.md`](docs/design.md).
+  `opencl-mesa` for Rusticl).
 
 ---
 ## CURRENTLY LINUX ONLY! WORKING ON WINDOWS COMPATABILITY 
@@ -106,7 +124,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Produces `build/{dump_bedrock, rokktui, rokksearch, rokkd, test_*}`.
+Produces `build/{dump_bedrock, rokksearch, test_*}` (plus `rokktui` on
+Linux/macOS).
 
 ### Fallback (`build.sh`, no build system, not reccomended, not windows compatable)
 
@@ -159,9 +178,8 @@ HOW TO USE ROKKTUI
 3. **Results screen.** Live progress bar + rate while the job runs (`c` cancels); then
    every matching origin `(x, z)` with the orientation bitmask. `S` saves the list.
 
-`rokktui` is a **client** — it submits the job to the search service and streams progress.
-By default the service runs in-process; `--service unix:/path` points it at a `rokkd`
-daemon, `--backend opencl:0` picks the GPU (in-process only). `q` quits. 
+The search runs in this process. `--backend opencl:0` picks the GPU (`auto` is the
+default and prefers a GPU if present). `q` quits.
 
 ### `rokksearch` — headless search
 
@@ -173,19 +191,8 @@ rokksearch --bench --pattern p.txt --center 0,0 --radius 5000000
 ```
 
 Streams a progress line to stderr; prints matches (`x z orient_mask`) to stdout. `--json`
-for machine output, `--checkpoint FILE` to make a long run resumable, `--service unix:...`
-to use a daemon. `--help` for everything.
-
-### `rokkd` — search daemon
-
-```sh
-rokkd --backend auto            # listens on $XDG_RUNTIME_DIR/rokkd.sock
-rokksearch --service unix:$XDG_RUNTIME_DIR/rokkd.sock --pattern p.txt --center 0,0 --radius 3000000
-```
-
-
-One `SearchService` behind a Unix socket. Handy when the box doing the crunching isn't the
-box you're driving from, or to keep a warm GPU context around across many searches.
+for machine output, `--checkpoint FILE` to make a long run resumable (Ctrl-C, then re-run
+the same command). `--help` for everything.
 
 ### `dump_bedrock` — print the bedrock layer for a seed
 
@@ -258,8 +265,7 @@ uint32_t t  = gen.threshold(-60);            // rk_bits24_at(lo,hi,x,-60,z) < t 
 ```
 
 Link `rokkdoxx_gen` (`src/gen/bedrock.cpp` + headers). To run a search from your own code,
-link `rokksvc` and use `rokkdoxx::svc::make_client(...)` — see
-[`docs/design.md`](docs/design.md).
+link `rokksvc` and use `rokkdoxx::svc::make_client(...)`.
 
 ---
 
@@ -283,7 +289,8 @@ sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`
 ## Performance
 
 Measured, `rokksearch --bench`, an 8×8 pattern. CPU = 6-core / 12-thread Ryzen 5 5600;
-GPU = Radeon RX 7900 XTX (gfx1100, ROCm).
+GPU = Radeon RX 7900 XTX (gfx1100, ROCm). **`G` = 10⁹** (one billion) candidate origins
+checked per second.
 
 | | CPU, 12 threads | GPU | speedup |
 |---|---|---|---|
@@ -292,8 +299,7 @@ GPU = Radeon RX 7900 XTX (gfx1100, ROCm).
 
 A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~3.5 h** on the GPU (exact
 orientation), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
-the GPU makes a blind whole-world sweep practical. Per-region timings, the bit-exactness
-argument, and the tile-size tuning are in [`docs/design.md`](docs/design.md).
+the GPU makes a blind whole-world sweep practical.
 
 ### Why not just use Minecraft to check?
 
@@ -307,29 +313,16 @@ As expected, the speedup vs in-engine usage is drastically increased.
 
 ## Verification
 
-- **The generator** is checked against Java-generated RNG vectors and, byte-for-byte,
+- The generator itself is checked against Java-generated RNG vectors and, byte-for-byte,
   against an independent Python reimplementation over adversarial seeds and coordinates
   (`test_bedrock`, `diff_test.py`).
-- **The service** is checked against a direct `BedrockGenerator` brute force (all 8
-  orientations), proven tile-size-independent, and exercised over the socket transport
-  (`test_search`, `test_daemon`).
+- **The search** is checked against a direct `BedrockGenerator` brute force (all 8
+  orientations) and proven independent of tile size (`test_search`).
 - **The GPU kernel** is diffed byte-for-byte against the CPU and checked for CPU/GPU search
   parity (`test_gpu`, needs a device).
 
 
 ---
-
-## Contributing
-
-The project has a deliberately small, fixed scope — [`docs/SCOPE.md`](docs/SCOPE.md) lists
-what it does, what it explicitly will **not** do, and a one-line responsibility for every
-source file. Before opening a PR:
-
-- Read the **Non-goals** list. If your change crosses one of those lines, say so explicitly
-  in the PR — it's a scope decision, not a detail.
-- Keep the test suite green: `ctest --test-dir build --output-on-failure` (or
-  `./build.sh test`). Behaviour changes need a test that fails without them.
-- Put the four-question checklist from the end of `SCOPE.md` in the PR description.
 
 ## License
 

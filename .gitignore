@@ -16,11 +16,24 @@ cmake-build-*/
 *.pyc
 __pycache__/
 
+*.exe
+*.lib
+*.pdb
+*.ilk
+*.exp
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+out/
+
 .vscode/
 *.swp
 *~
 .DS_Store
 
 /.claude/
+
+/docs-internal/
 
 *.sock

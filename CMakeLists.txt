@@ -9,7 +9,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-add_compile_options(-Wall -Wextra)
+if(MSVC)
+  add_compile_options(/W3 /permissive-)
+else()
+  add_compile_options(-Wall -Wextra)
+endif()
 
 option(ROKK_ENABLE_OPENCL "Build the OpenCL compute worker" ON)
 
@@ -19,13 +23,11 @@ find_package(Threads REQUIRED)
 add_library(rokkdoxx_gen STATIC src/gen/bedrock.cpp)
 target_include_directories(rokkdoxx_gen PUBLIC src)
 
-# --- search service (orchestrator + workers + client) ---------------------
+# --- search service (orchestrator + workers + in-process handle) ----------
 set(SVC_SOURCES
   src/svc/search_service.cpp
   src/svc/workers.cpp
   src/svc/client.cpp
-  src/svc/protocol.cpp
-  src/svc/daemon.cpp
   src/svc/pattern_io.cpp)
 
 set(ROKK_HAVE_OPENCL FALSE)
@@ -35,6 +37,13 @@ if(ROKK_ENABLE_OPENCL)
     set(ROKK_HAVE_OPENCL TRUE)
     list(APPEND SVC_SOURCES src/svc/opencl_worker.cpp)
     message(STATUS "OpenCL found: ${OpenCL_LIBRARIES}")
+    # Embed the kernel text so the binary is self-contained / relocatable.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/gen/bedrock_core.h" ROKK_BEDROCK_CORE)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/cl/search_tile.cl" ROKK_SEARCH_TILE)
+    configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/svc/kernel_sources.h.in"
+      "${CMAKE_BINARY_DIR}/generated/kernel_sources.h"
+      @ONLY)
   else()
     message(STATUS "OpenCL not found -- building CPU worker only")
   endif()
@@ -46,22 +55,21 @@ target_link_libraries(rokksvc PUBLIC rokkdoxx_gen Threads::Threads)
 if(ROKK_HAVE_OPENCL)
   target_compile_definitions(rokksvc PUBLIC ROKK_ENABLE_OPENCL)
   target_link_libraries(rokksvc PUBLIC OpenCL::OpenCL)
-  target_compile_definitions(rokksvc PRIVATE
-    ROKK_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_include_directories(rokksvc PRIVATE "${CMAKE_BINARY_DIR}/generated")
 endif()
 
 # --- tools ---------------------------------------------------------------
 add_executable(dump_bedrock tools/dump_bedrock.cpp)
 target_link_libraries(dump_bedrock PRIVATE rokkdoxx_gen)
 
-add_executable(rokktui tools/rokktui.cpp)
-target_link_libraries(rokktui PRIVATE rokksvc)
-
 add_executable(rokksearch tools/rokksearch.cpp)
 target_link_libraries(rokksearch PRIVATE rokksvc)
 
-add_executable(rokkd tools/rokkd.cpp)
-target_link_libraries(rokkd PRIVATE rokksvc)
+# rokktui uses a POSIX raw-terminal backend (<termios.h>); no Windows build yet.
+if(NOT WIN32)
+  add_executable(rokktui tools/rokktui.cpp)
+  target_link_libraries(rokktui PRIVATE rokksvc)
+endif()
 
 # --- tests -------------------------------------------------------------
 enable_testing()
@@ -73,10 +81,6 @@ add_test(NAME unit COMMAND test_bedrock)
 add_executable(test_search tests/test_search.cpp)
 target_link_libraries(test_search PRIVATE rokksvc)
 add_test(NAME search COMMAND test_search)
-
-add_executable(test_daemon tests/test_daemon.cpp)
-target_link_libraries(test_daemon PRIVATE rokksvc)
-add_test(NAME daemon COMMAND test_daemon)
 
 if(ROKK_HAVE_OPENCL)
   add_executable(test_gpu tests/test_gpu.cpp)

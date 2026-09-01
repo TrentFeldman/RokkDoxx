@@ -4,7 +4,7 @@
 // `vertical_gradient` condition. For a fixed world seed this is a pure function
 //   B(seed, x, y, z) -> {bedrock, not bedrock}
 // with no dependence on biome, terrain noise, or chunk state -- which is what
-// makes the RokkDoxx pattern search possible (see whitepaper.md).
+// makes the RokkDoxx pattern search possible (see the README).
 //
 // Overworld noise settings use `legacy_random_source: false`, i.e. the
 // Xoroshiro128++ positional RNG. This code path is unchanged since Java 1.18.
@@ -24,7 +24,7 @@ public:
     static constexpr int kFloorMinY = -64;
     static constexpr int kFloorMaxY = -59;
 
-    // Default sampling plane for the whitepaper's M(x, z): the highest y with
+    // Default sampling plane for the M(x, z) plane function: the highest y with
     // non-trivial variation (P(bedrock) = 0.2).
     static constexpr int kDefaultPlaneY = -60;
 
@@ -33,7 +33,7 @@ public:
     // True iff block (x, y, z) is bedrock in the Overworld bedrock floor.
     bool is_bedrock_floor(int x, int y, int z) const noexcept;
 
-    // The whitepaper's M(x, z): bedrock presence on a single horizontal plane.
+    // M(x, z): bedrock presence on a single horizontal plane.
     bool floor_plane(int x, int z, int y = kDefaultPlaneY) const noexcept {
         return is_bedrock_floor(x, y, z);
     }
