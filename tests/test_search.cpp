@@ -49,8 +49,8 @@ std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
     const auto knowns = req.pattern.knowns();
     const int gN = req.all_orientations ? 8 : 1;
     std::map<std::pair<int, int>, std::uint8_t> out;
-    for (long z = req.region.z0; z <= req.region.z1; ++z)
-        for (long x = req.region.x0; x <= req.region.x1; ++x) {
+    for (std::int64_t z = req.region.z0; z <= req.region.z1; ++z)
+        for (std::int64_t x = req.region.x0; x <= req.region.x1; ++x) {
             std::uint8_t mask = 0;
             for (int g = 0; g < gN; ++g) {
                 Transform tf = kOrientations[static_cast<std::size_t>(g)];

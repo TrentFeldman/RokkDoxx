@@ -152,9 +152,9 @@ inline PhaseResult run_phase(Worker& w, const char* name, bool all_orient, int t
 
     std::vector<double> rates, times;
     for (int i = 0; i < iters; ++i) {
-        const double e = sweep(w, region, tile_side);
-        times.push_back(e);
-        rates.push_back(static_cast<double>(cand) / e / 1e9);
+        const double el = sweep(w, region, tile_side);
+        times.push_back(el);
+        rates.push_back(static_cast<double>(cand) / el / 1e9);
     }
     std::sort(rates.begin(), rates.end());
     std::sort(times.begin(), times.end());
@@ -331,10 +331,9 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto val = [&](const char* name) -> const char* {
+        auto val = [&](const char* /*hint*/) -> const char* {
             if (i + 1 >= argc) usage(2);
             return argv[++i];
-            (void)name;
         };
         if (a == "-h" || a == "--help") usage(0);
         else if (a == "--seed") seed_s = val("seed");
@@ -406,7 +405,6 @@ int main(int argc, char** argv) {
     }
 
     if (region_s) {
-        long long a, b;
         const char* p1 = std::strchr(region_s, ',');
         if (!p1) usage(2);
         const char* p2 = std::strchr(p1 + 1, ',');
@@ -416,8 +414,6 @@ int main(int argc, char** argv) {
         req.region.x1 = std::atoll(std::string(p1 + 1, p2).c_str());
         req.region.z0 = std::atoll(std::string(p2 + 1, p3).c_str());
         req.region.z1 = std::atoll(p3 + 1);
-        (void)a;
-        (void)b;
     } else if (center_s) {
         long long cx, cz;
         if (!parse2(center_s, cx, cz, ',')) usage(2);

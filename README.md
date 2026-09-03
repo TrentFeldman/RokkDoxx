@@ -45,9 +45,18 @@ ctest --test-dir build --output-on-failure
 build/rokktui                             # interactive pattern search
 ```
 
-No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`), then
-`./build.sh test`.
-(unix only)
+On Windows, use the Visual Studio generator:
+
+```bat
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+build\Release\rokksearch.exe --benchmark --backend cpu
+```
+
+No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
+`ROKK_OPENCL=1 ./build.sh`), then `./build.sh test`. See [Build](#build) for the
+Windows OpenCL setup and details.
 
 ---
 
@@ -61,7 +70,7 @@ No `make`/`ninja`? Use the fallback: `./build.sh` (or `ROKK_OPENCL=1 ./build.sh`
 | `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 in progress |
+| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 code ready, pending a build on a Windows box |
 | Windows: `rokktui` | ⬜ later (needs a console backend) |
 | Resumable long runs (`--checkpoint`) | ⬜ revisit |
 | Local-memory tile cache, async tile pipelining | ⬜ later |
@@ -103,32 +112,62 @@ It all runs in one process — there is no daemon and no IPC.
 
 ## Requirements
 
-- A C++20 compiler (`g++` ≥ 13 or `clang++` ≥ 16)
-- **Primary build:** CMake ≥ 3.16 + `make` or `ninja`
-- **Fallback build:** just `bash` — [`build.sh`](build.sh) compiles everything with one
-  `g++` invocation per target, no build system needed
+- A C++20 compiler:
+  - Linux / macOS: `g++` ≥ 13 or `clang++` ≥ 16
+  - Windows: MSVC (Visual Studio 2022 / Build Tools ≥ 17.8), or MinGW-w64 with a
+    `std::thread`-capable runtime (posix thread model, or GCC ≥ 13)
+- **Primary build:** CMake ≥ 3.16 + a generator (`make`, `ninja`, or Visual Studio)
+- **Fallback build (Linux / macOS only):** just `bash` — [`build.sh`](build.sh)
+  compiles everything with one `g++` invocation per target, no build system needed
 - Python 3 — for the reference implementation and the differential test
-- *Optional, for the GPU worker:* `opencl-headers`, `opencl-clhpp`, and one OpenCL
-  platform (`rocm-opencl-runtime` for an AMD RX 7900 XTX, `pocl` for CPU OpenCL, or
-  `opencl-mesa` for Rusticl).
+- *Optional, for the GPU worker:* OpenCL headers + an ICD loader, and one OpenCL
+  platform. Linux: `opencl-headers`, `opencl-clhpp`, plus `rocm-opencl-runtime`
+  (AMD), `pocl` (CPU OpenCL), or `opencl-mesa` (Rusticl). Windows: see below.
 
 ---
-## CURRENTLY LINUX ONLY! WORKING ON WINDOWS COMPATABILITY 
 
 ## Build
 
 ### CMake (preferred)
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # DROKK_ENABLE_OPENCL=ON for GPU compute
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # -DROKK_ENABLE_OPENCL=ON for GPU compute
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
 Produces `build/{dump_bedrock, rokksearch, test_*}` (plus `rokktui` on
-Linux/macOS).
+Linux/macOS — it uses a POSIX raw-terminal backend and is not built on Windows).
 
-### Fallback (`build.sh`, no build system, not reccomended, not windows compatable)
+### Windows (MSVC)
+
+```bat
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+
+build\Release\rokksearch.exe --benchmark --backend cpu
+```
+
+The Visual Studio generator is multi-config, so pass `--config Release` at build
+time and `-C Release` to `ctest`. Without an OpenCL SDK the build is CPU-only —
+that is fully supported.
+
+**OpenCL on Windows.** The build needs OpenCL headers + an `OpenCL.lib` import
+stub; `OpenCL.dll` itself ships with every modern GPU driver, so nothing extra is
+needed at runtime. Easiest path:
+
+```bat
+vcpkg install opencl
+cmake -B build -DROKK_ENABLE_OPENCL=ON ^
+  -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+Alternatives: a [Khronos OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)
+release (`-DOpenCL_ROOT=C:/path/to/OpenCL-SDK`), or an installed CUDA Toolkit
+(sets `CUDA_PATH`, which CMake's `find_package(OpenCL)` checks).
+
+### Fallback (`build.sh`, no build system, not reccomended, Linux / macOS only)
 
 ```sh
 ./build.sh                 # CPU only

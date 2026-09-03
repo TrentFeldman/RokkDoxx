@@ -75,12 +75,13 @@ inline constexpr std::array<Transform, 8> kOrientations = {{
 
 // --- region ----------------------------------------------------------------
 
-// The square of world to search, as inclusive block-coordinate ranges. Uses
-// `long` so a full 30M x 30M sweep does not overflow the span arithmetic.
+// The square of world to search, as inclusive block-coordinate ranges. 64-bit
+// so a full 30M x 30M sweep does not overflow the span arithmetic (and so it
+// stays 64-bit on Win64, where `long` is only 32 bits).
 struct Region {
-    long x0 = 0, x1 = 0, z0 = 0, z1 = 0;
+    std::int64_t x0 = 0, x1 = 0, z0 = 0, z1 = 0;
 
-    static Region centered(long cx, long cz, long radius) {
+    static Region centered(std::int64_t cx, std::int64_t cz, std::int64_t radius) {
         return Region{cx - radius, cx + radius, cz - radius, cz + radius};
     }
     long long candidates() const {
@@ -143,7 +144,7 @@ using JobId = std::uint64_t;
 // A rectangular block of candidate origins to test. World block coordinates.
 struct Tile {
     int index = 0;
-    long x0 = 0, z0 = 0;
+    std::int64_t x0 = 0, z0 = 0;
     int w = 0, h = 0;
 };
 

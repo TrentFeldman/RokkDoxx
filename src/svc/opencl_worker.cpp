@@ -17,7 +17,13 @@
 #define CL_HPP_ENABLE_EXCEPTIONS
 #define CL_HPP_TARGET_OPENCL_VERSION 120
 #define CL_HPP_MINIMUM_OPENCL_VERSION 120
+#define CL_TARGET_OPENCL_VERSION 120  // silences the <CL/cl.h> "defaulting to 300" pragma
+#define NOMINMAX                      // in case an SDK header pulls in <windows.h>
+#if __has_include(<CL/opencl.hpp>)
 #include <CL/opencl.hpp>
+#else
+#include <CL/cl2.hpp>  // older OpenCL SDKs (some CUDA toolkits) ship only this
+#endif
 
 // Generated at configure time by CMake (build.sh writes an equivalent header):
 // the text of src/gen/bedrock_core.h and src/cl/search_tile.cl as string

@@ -40,6 +40,10 @@ if(ROKK_ENABLE_OPENCL)
     # Embed the kernel text so the binary is self-contained / relocatable.
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/gen/bedrock_core.h" ROKK_BEDROCK_CORE)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/cl/search_tile.cl" ROKK_SEARCH_TILE)
+    # Normalise line endings so a CRLF checkout (Windows, autocrlf) does not put
+    # stray \r inside the embedded raw-string literals.
+    string(REGEX REPLACE "\r\n" "\n" ROKK_BEDROCK_CORE "${ROKK_BEDROCK_CORE}")
+    string(REGEX REPLACE "\r\n" "\n" ROKK_SEARCH_TILE "${ROKK_SEARCH_TILE}")
     configure_file(
       "${CMAKE_CURRENT_SOURCE_DIR}/src/svc/kernel_sources.h.in"
       "${CMAKE_BINARY_DIR}/generated/kernel_sources.h"
@@ -54,6 +58,7 @@ target_include_directories(rokksvc PUBLIC src)
 target_link_libraries(rokksvc PUBLIC rokkdoxx_gen Threads::Threads)
 if(ROKK_HAVE_OPENCL)
   target_compile_definitions(rokksvc PUBLIC ROKK_ENABLE_OPENCL)
+  target_compile_definitions(rokksvc PRIVATE CL_TARGET_OPENCL_VERSION=120)
   target_link_libraries(rokksvc PUBLIC OpenCL::OpenCL)
   target_include_directories(rokksvc PRIVATE "${CMAKE_BINARY_DIR}/generated")
 endif()

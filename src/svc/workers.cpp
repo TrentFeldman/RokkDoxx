@@ -1,6 +1,7 @@
 #include "workers.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
 
@@ -53,9 +54,9 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     auto work = [&](int t) {
         auto& out = buckets[static_cast<std::size_t>(t)];
         for (int dz = t; dz < tile.h; dz += T) {
-            const long z = tile.z0 + dz;
+            const std::int64_t z = tile.z0 + dz;
             for (int dx = 0; dx < tile.w; ++dx) {
-                const long x = tile.x0 + dx;
+                const std::int64_t x = tile.x0 + dx;
                 std::uint8_t mask = 0;
                 for (int g = 0; g < gN; ++g) {
                     const Transform tf = kOrientations[static_cast<std::size_t>(g)];

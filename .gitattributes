@@ -1,0 +1,13 @@
+# Normalise line endings. The OpenCL kernel text (src/gen/bedrock_core.h,
+# src/cl/search_tile.cl) is embedded verbatim into a C++ raw-string literal at
+# build time, so a CRLF checkout would put stray \r into the kernel source.
+# Keep LF everywhere the compiler and the differential test read; CRLF only for
+# the Windows-native project files Git should leave native.
+* text=auto eol=lf
+
+*.sln       text eol=crlf
+*.vcxproj*  text eol=crlf
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+*.png       binary

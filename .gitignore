@@ -12,11 +12,13 @@ cmake-build-*/
 
 
 *.o
+*.obj
 *.a
 *.pyc
 __pycache__/
 
 *.exe
+*.dll
 *.lib
 *.pdb
 *.ilk

@@ -31,7 +31,7 @@ if [[ "${ROKK_OPENCL:-0}" == "1" ]]; then
     printf ')ROKKCL";\n}\n'
   } > build/generated/kernel_sources.h
 
-  FLAGS+=(-DROKK_ENABLE_OPENCL -Ibuild/generated)
+  FLAGS+=(-DROKK_ENABLE_OPENCL -DCL_TARGET_OPENCL_VERSION=120 -Ibuild/generated)
   SVC+=(src/svc/opencl_worker.cpp)
   LINK+=(-lOpenCL)
   GPU_TEST="build/test_gpu"

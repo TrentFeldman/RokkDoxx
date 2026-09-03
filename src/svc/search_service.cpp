@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -69,8 +70,8 @@ Tile TileScheduler::tile_at(int index) const {
     t.x0 = region_.x0 + static_cast<long long>(tx) * tile_side_;
     t.z0 = region_.z0 + static_cast<long long>(tz) * tile_side_;
     // The last column / row is clipped to the region edge.
-    const long xend = (tx == nx_ - 1) ? region_.x1 : t.x0 + tile_side_ - 1;
-    const long zend = (tz == nz_ - 1) ? region_.z1 : t.z0 + tile_side_ - 1;
+    const std::int64_t xend = (tx == nx_ - 1) ? region_.x1 : t.x0 + tile_side_ - 1;
+    const std::int64_t zend = (tz == nz_ - 1) ? region_.z1 : t.z0 + tile_side_ - 1;
     t.w = static_cast<int>(xend - t.x0 + 1);
     t.h = static_cast<int>(zend - t.z0 + 1);
     return t;
