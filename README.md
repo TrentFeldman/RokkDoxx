@@ -51,12 +51,14 @@ On Windows, use the Visual Studio generator:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
-build\Release\rokksearch.exe --benchmark --backend cpu
+build\Release\rokksearch.exe --benchmark
 ```
 
+That first build skips OpenCL (zero dependencies). For GPU compute, a Defender
+note, and how to check your OpenCL setup, see [Build → Windows](#windows-msvc).
+
 No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
-`ROKK_OPENCL=1 ./build.sh`), then `./build.sh test`. See [Build](#build) for the
-Windows OpenCL setup and details.
+`ROKK_OPENCL=1 ./build.sh`), then `./build.sh test`.
 
 ---
 
@@ -70,7 +72,7 @@ Windows OpenCL setup and details.
 | `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 code ready, pending a build on a Windows box |
+| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 builds on MSVC (CPU path user-confirmed); GPU-on-Windows untested but supported |
 | Windows: `rokktui` | ⬜ later (needs a console backend) |
 | Resumable long runs (`--checkpoint`) | ⬜ revisit |
 | Local-memory tile cache, async tile pipelining | ⬜ later |
@@ -146,26 +148,63 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
-build\Release\rokksearch.exe --benchmark --backend cpu
+build\Release\rokksearch.exe --benchmark        :: add an OpenCL SDK for GPU compute, see below
 ```
 
 The Visual Studio generator is multi-config, so pass `--config Release` at build
-time and `-C Release` to `ctest`. Without an OpenCL SDK the build is CPU-only —
-that is fully supported.
+time and `-C Release` to `ctest`. The command above **skips OpenCL**, so the
+build has zero external dependencies — a quick way to confirm the toolchain
+works. The GPU path is fully supported on Windows and produces the same
+bit-exact results as Linux; it just needs the OpenCL SDK below at build time.
 
-**OpenCL on Windows.** The build needs OpenCL headers + an `OpenCL.lib` import
-stub; `OpenCL.dll` itself ships with every modern GPU driver, so nothing extra is
-needed at runtime. Easiest path:
+**OpenCL on Windows.** Two separate pieces:
+
+- **At runtime** — `OpenCL.dll` (the ICD loader) ships with Windows and every
+  modern GPU driver (AMD Adrenalin, NVIDIA, Intel). Nothing to install.
+- **At build time** — you need the OpenCL **headers** + an `OpenCL.lib` import
+  stub, which MSVC does *not* bundle. Easiest path:
 
 ```bat
 vcpkg install opencl
 cmake -B build -DROKK_ENABLE_OPENCL=ON ^
   -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
 ```
 
 Alternatives: a [Khronos OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)
 release (`-DOpenCL_ROOT=C:/path/to/OpenCL-SDK`), or an installed CUDA Toolkit
 (sets `CUDA_PATH`, which CMake's `find_package(OpenCL)` checks).
+
+**Check it worked:**
+
+1. *Did CMake find the SDK?* The configure step prints one of:
+   ```
+   -- OpenCL found: C:/.../OpenCL.lib
+   -- OpenCL not found -- building CPU worker only
+   ```
+   Re-run `cmake -B build -DROKK_ENABLE_OPENCL=ON ...` and read that line.
+2. *Is a GPU visible at runtime?* After building:
+   ```bat
+   build\Release\rokksearch.exe --list-backends
+   ```
+   Expect an `opencl:0  <device name>  [gpu]` row next to `cpu`. If only `cpu`
+   appears, the GPU driver / ICD isn't being seen — update your GPU driver.
+3. *`OpenCL.dll` present?* `where OpenCL.dll` should hit `C:\Windows\System32`.
+   Vendor ICDs register under `HKLM\SOFTWARE\Khronos\OpenCL\Vendors` (a current
+   GPU driver installs one). For a full device dump, `clinfo` (Khronos) or
+   GPU-Z also work.
+4. *End to end:* `build\Release\rokksearch.exe --benchmark` (no `--backend`)
+   auto-selects the GPU when present — the `device :` header line names it.
+
+> **Windows Defender / SmartScreen.** A freshly built, **unsigned** `.exe` —
+> especially one that pins every CPU core and drives the GPU — commonly trips a
+> SmartScreen "Windows protected your PC" prompt or a Defender heuristic. This is
+> expected for any small tool without a paid code-signing certificate; it is not
+> a detection of anything. RokkDoxx makes **no network connections** and writes
+> only the files you name on the command line — if you built it from this
+> source, trust the binary as much as you trust the source. To proceed: click
+> **More info → Run anyway**, or in PowerShell
+> `Unblock-File .\build\Release\rokksearch.exe`.
 
 ### Fallback (`build.sh`, no build system, not reccomended, Linux / macOS only)
 
