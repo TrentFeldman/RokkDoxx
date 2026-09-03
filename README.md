@@ -162,18 +162,30 @@ bit-exact results as Linux; it just needs the OpenCL SDK below at build time.
 - **At runtime** — `OpenCL.dll` (the ICD loader) ships with Windows and every
   modern GPU driver (AMD Adrenalin, NVIDIA, Intel). Nothing to install.
 - **At build time** — you need the OpenCL **headers** + an `OpenCL.lib` import
-  stub, which MSVC does *not* bundle. Easiest path:
+  stub, which MSVC does *not* bundle. Install your GPU vendor's toolkit:
 
-```bat
-vcpkg install opencl
-cmake -B build -DROKK_ENABLE_OPENCL=ON ^
-  -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
-```
+  - **NVIDIA** — the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+    puts `CL/*.h` + `OpenCL.lib` under `%CUDA_PATH%`, which CMake's
+    `find_package(OpenCL)` finds automatically. Just
+    `cmake -B build -DROKK_ENABLE_OPENCL=ON`.
+  - **AMD** — the [HIP SDK for Windows](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
+    (ROCm on Windows) ships the OpenCL headers + lib. Point CMake at it:
+    `-DOpenCL_ROOT="C:/Program Files/AMD/ROCm/<version>"`. (The Adrenalin driver
+    alone gives you the runtime `OpenCL.dll`, but not the build-time files.)
+  - **Intel** — the [oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html)
+    includes the OpenCL SDK (headers, `OpenCL.lib`, a CPU/GPU runtime) and sets
+    `INTELOCLSDKROOT`, which `find_package(OpenCL)` checks.
 
-Alternatives: a [Khronos OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)
-release (`-DOpenCL_ROOT=C:/path/to/OpenCL-SDK`), or an installed CUDA Toolkit
-(sets `CUDA_PATH`, which CMake's `find_package(OpenCL)` checks).
+  **Fallback** (any vendor, or no toolkit installed) — [vcpkg](https://vcpkg.io):
+
+  ```bat
+  vcpkg install opencl
+  cmake -B build -DROKK_ENABLE_OPENCL=ON ^
+    -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+  ```
+
+  This pulls the Khronos headers + a generic `OpenCL.lib` stub; works regardless
+  of which GPU you have.
 
 **Check it worked:**
 
