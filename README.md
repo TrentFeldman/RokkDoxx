@@ -267,7 +267,8 @@ HOW TO USE ROKKTUI
    drawn.
 
 3. **Results screen.** Live progress bar + rate while the job runs (`c` cancels); then
-   every matching origin `(x, z)` with the orientation bitmask. `S` saves the list.
+   every match `(x, z)` — a block near the middle of the pattern — with the orientation
+   bitmask. `S` saves the list.
 
 The search runs in this process. `--backend opencl:0` picks the GPU (`auto` is the
 default and prefers a GPU if present). `q` quits.
@@ -373,10 +374,11 @@ link `rokksvc` and use `rokkdoxx::svc::make_client(...)`.
    bedrock). Note the layout of bedrock / non-bedrock on one layer.
 2. Run `rokktui`, enter the seed, set the pattern size and Y layer, and paint what you saw.
    Mark cells you're unsure about as unknown; leave `orientations` on `all 8` so you don't
-   have to align the screenshot to north. NOTE: This increases search time drastically
+   have to align the screenshot to north.
 3. Set a search center + radius and run, or use `rokksearch` for a scripted / very large
-   run. You get back every `(x, z)` where the pattern occurs — each is already an in-game
-   coordinate.
+   run. You get back every `(x, z)` where the pattern occurs — a block near the middle of
+   the shape (a rare "anchor" cell), already an in-game coordinate — plus which
+   orientations fit there.
 
 On CPU this covers a region a few thousand blocks<sup>2</sup>  in seconds; a whole-world
 sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`). See
@@ -390,10 +392,16 @@ sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`
 
 | | CPU (6c/12t Ryzen 5 5600) | GPU (RX 7900 XTX) | speedup |
 |---|---|---|---|
-| **exact** orientation | ~0.8 G | **~76 G** | ~95× |
-| **all 8** orientations | ~0.14 G | **~10.5 G** | ~75× |
+| **exact** orientation | ~1.4 G | **~80 G** | ~57× |
+| **all 8** orientations | ~0.6 G | **~16 G** | ~27× |
+| all 8, symmetric pattern | ~1.4 G | **~76 G** | — |
 
-A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~3.5 h** on the GPU (exact
+The search recentres your pattern on a rare "anchor" cell; one bedrock test there rejects
+all 8 orientations at once, and orientations that a symmetric pattern shares are collapsed —
+so a symmetric shape costs the same as a single orientation. A match reports the world
+position of that anchor cell (near the middle of your pattern).
+
+A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~3 h** on the GPU (exact
 orientation), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
 the GPU makes a blind whole-world sweep practical.
 
@@ -404,13 +412,13 @@ build/rokksearch --benchmark              # GPU (or CPU if no GPU / --backend cp
 build/rokksearch --backend cpu --benchmark
 ```
 
-Fixed workload, auto-sized region, warm-up + 5 timed iterations. Takes ~30 s. This is where
-the table above comes from. 
+Fixed workload (a 6×6 asymmetric pattern + a 5×5 symmetric one), auto-sized region,
+warm-up + 5 timed iterations. Takes ~30 s. This is where the table above comes from.
 
-| machine | backend | exact G | all-8 G | notes | date |
-|---|---|---|---|---|---|
-| RX 7900 XTX (gfx1100) | opencl | 76 | 10.5 | ROCm driver 3581, 48 CU | 2026-08 |
-| Ryzen 5 5600 | cpu | 0.80 | 0.14 | 12 threads, gcc | 2026-08 |
+| machine | backend | exact G | all-8 G | all-8 sym G | notes | date |
+|---|---|---|---|---|---|---|
+| RX 7900 XTX (gfx1100) | opencl | 80 | 16 | 76 | ROCm driver 3581, 48 CU | 2026-09 |
+| Ryzen 5 5600 | cpu | 1.4 | 0.6 | 1.4 | 12 threads, gcc | 2026-09 |
 
 ### Why not just use Minecraft to check?
 
