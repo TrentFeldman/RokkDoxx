@@ -72,7 +72,7 @@ No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
 | `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | 🔨 builds on MSVC (CPU path user-confirmed); GPU-on-Windows untested but supported |
+| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | BETA: GPU-on-Windows untested but supported |
 | Windows: `rokktui` | ⬜ later (needs a console backend) |
 | Resumable long runs (`--checkpoint`) | ⬜ revisit |
 | Local-memory tile cache, async tile pipelining | ⬜ later |
