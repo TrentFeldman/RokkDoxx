@@ -392,8 +392,8 @@ sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`
 
 | | CPU (6c/12t Ryzen 5 5600) | GPU (RX 7900 XTX) | speedup |
 |---|---|---|---|
-| **exact** orientation | ~1.4 G | **~80 G** | ~57× |
-| **all 8** orientations | ~0.6 G | **~16 G** | ~27× |
+| **exact** orientation | ~1.4 G | **~80 G** | ~56× |
+| **all 8** orientations | ~0.6 G | **~15.5 G** | ~26× |
 | all 8, symmetric pattern | ~1.4 G | **~76 G** | — |
 
 The search recentres your pattern on a rare "anchor" cell; one bedrock test there rejects
@@ -417,8 +417,8 @@ warm-up + 5 timed iterations. Takes ~30 s. This is where the table above comes f
 
 | machine | backend | exact G | all-8 G | all-8 sym G | notes | date |
 |---|---|---|---|---|---|---|
-| RX 7900 XTX (gfx1100) | opencl | 80 | 16 | 76 | ROCm driver 3581, 48 CU | 2026-09 |
-| Ryzen 5 5600 | cpu | 1.4 | 0.6 | 1.4 | 12 threads, gcc | 2026-09 |
+| RX 7900 XTX (gfx1100) | opencl | 80.4 | 15.5 | 76.1 | ROCm driver 3581, 48 CU | 2026-09 |
+| Ryzen 5 5600 | cpu | 1.44 | 0.59 | 1.40 | 12 threads, gcc 16 | 2026-09 |
 
 ### Why not just use Minecraft to check?
 
