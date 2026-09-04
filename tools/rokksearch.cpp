@@ -70,13 +70,14 @@ namespace bmark {
 
 constexpr std::int64_t kSeed = 0;
 constexpr int kPlaneY = -60;
-constexpr int kBenchVersion = 1;
+constexpr int kBenchVersion = 2;
 constexpr long long kMaxCandidates = 500'000'000'000LL;  // clamp per phase
 
 // The fixed workload pattern: a 6x6 patch (a typical real size) filled from the
 // generator at a fixed origin, so it is a genuine bedrock configuration for
 // `kSeed`. It matches ~once in the whole benchmark region, so result collection
-// is free and the search does representative work.
+// is free and the search does representative work. This shape has 8 distinct D4
+// orientations -- the all-8 worst case.
 constexpr int kPatW = 6, kPatH = 6, kFillX = 137, kFillZ = -251;
 
 inline Pattern standard_pattern() {
@@ -90,6 +91,26 @@ inline Pattern standard_pattern() {
             p.cells[static_cast<std::size_t>(j) * kPatW + i] =
                 gen.is_bedrock_floor(kFillX + i, kPlaneY, kFillZ + j) ? Cell::bedrock
                                                                       : Cell::not_bedrock;
+    return p;
+}
+
+// A deliberately D4-symmetric 7x7 pattern: its constraint set maps to itself
+// under every rotation and mirror, so it has just ONE distinct orientation. The
+// all-8 best case -- with duplicate-orientation collapse it should run at the
+// exact-orientation rate. `want`s are fixed (not generator-derived) so the
+// symmetry is exact; the axis cells (bedrock, ~20% at y=-60) are the rare anchor.
+inline Pattern symmetric_pattern() {
+    constexpr int n = 7;
+    Pattern p;
+    p.w = n;
+    p.h = n;
+    p.cells.assign(static_cast<std::size_t>(n) * n, Cell::unknown);
+    auto set = [&](int i, int j, Cell c) { p.cells[static_cast<std::size_t>(j) * n + i] = c; };
+    set(3, 3, Cell::not_bedrock);                                             // centre
+    set(3, 1, Cell::bedrock); set(3, 5, Cell::bedrock);                       // axis arms
+    set(1, 3, Cell::bedrock); set(5, 3, Cell::bedrock);
+    set(1, 1, Cell::not_bedrock); set(5, 5, Cell::not_bedrock);               // diagonal
+    set(1, 5, Cell::not_bedrock); set(5, 1, Cell::not_bedrock);
     return p;
 }
 
@@ -131,9 +152,11 @@ struct PhaseResult {
     int iters;
 };
 
-inline PhaseResult run_phase(Worker& w, const char* name, bool all_orient, int tile_side,
-                             const WorkerConfig& base, double target_s, int iters) {
+inline PhaseResult run_phase(Worker& w, const char* name, const std::vector<KnownCell>& knowns,
+                             bool all_orient, int tile_side, const WorkerConfig& base,
+                             double target_s, int iters) {
     WorkerConfig cfg = base;
+    cfg.knowns = knowns;
     cfg.all_orientations = all_orient;
     w.configure(cfg);
 
@@ -250,20 +273,23 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
     }
 
     rokkdoxx::BedrockGenerator gen(kSeed);
-    const Pattern pattern = standard_pattern();
+    const std::vector<KnownCell> asym = standard_pattern().knowns();
+    const std::vector<KnownCell> sym = symmetric_pattern().knowns();
     WorkerConfig base;
     base.derived_lo = gen.derived_lo();
     base.derived_hi = gen.derived_hi();
     base.plane_y = kPlaneY;
     base.threshold = gen.threshold(kPlaneY);
-    base.knowns = pattern.knowns();
     base.match_cap = 1u << 20;
 
     const int tile_side = std::max(4096, worker->preferred_tile_side());
 
-    const PhaseResult ex = run_phase(*worker, "exact", false, tile_side, base, target_s, iters);
-    const PhaseResult a8 = run_phase(*worker, "all-8", true, tile_side, base, target_s, iters);
-    const PhaseResult phases[2] = {ex, a8};
+    const PhaseResult ex = run_phase(*worker, "exact", asym, false, tile_side, base, target_s, iters);
+    const PhaseResult a8 = run_phase(*worker, "all-8", asym, true, tile_side, base, target_s, iters);
+    const PhaseResult a8s =
+        run_phase(*worker, "all-8-sym", sym, true, tile_side, base, target_s, iters);
+    const PhaseResult phases[3] = {ex, a8, a8s};
+    constexpr int kNumPhases = 3;
 
     const unsigned threads = std::thread::hardware_concurrency();
 
@@ -278,7 +304,7 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
         std::printf("\"pattern\":{\"w\":%d,\"h\":%d,\"seed\":%lld,\"y\":%d},", kPatW, kPatH,
                     static_cast<long long>(kSeed), kPlaneY);
         std::printf("\"phases\":[");
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < kNumPhases; ++i) {
             const PhaseResult& p = phases[i];
             std::printf("%s{\"name\":\"%s\",\"orientations\":%d,\"candidates\":%lld,"
                         "\"elapsed_s\":%.4f,\"gcand_s_median\":%.4f,\"gcand_s_min\":%.4f,"
@@ -298,10 +324,10 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
                     chosen.driver.empty() ? "?" : chosen.driver.c_str(), chosen.units);
     std::printf("host      : %s %s  |  %u threads  |  %s\n", host_os(), host_arch(), threads,
                 host_compiler().c_str());
-    std::printf("pattern   : %dx%d from seed %lld at y %d   (fixed workload)\n\n", kPatW, kPatH,
-                static_cast<long long>(kSeed), kPlaneY);
+    std::printf("pattern   : %dx%d (8 orientations) + 7x7 symmetric, seed %lld at y %d\n\n", kPatW,
+                kPatH, static_cast<long long>(kSeed), kPlaneY);
     for (const PhaseResult& p : phases) {
-        std::printf("%-6s : %7.2f Gcand/s  (median of %d; min %.2f, max %.2f)   "
+        std::printf("%-9s : %7.2f Gcand/s  (median of %d; min %.2f, max %.2f)   "
                     "r=%ld, %.2e cand, %.2f s\n",
                     p.name, p.g_median, p.iters, p.g_min, p.g_max, p.radius,
                     static_cast<double>(p.candidates), p.elapsed_s);
