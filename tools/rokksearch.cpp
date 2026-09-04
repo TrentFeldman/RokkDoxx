@@ -94,23 +94,20 @@ inline Pattern standard_pattern() {
     return p;
 }
 
-// A deliberately D4-symmetric 7x7 pattern: its constraint set maps to itself
-// under every rotation and mirror, so it has just ONE distinct orientation. The
-// all-8 best case -- with duplicate-orientation collapse it should run at the
-// exact-orientation rate. `want`s are fixed (not generator-derived) so the
-// symmetry is exact; the axis cells (bedrock, ~20% at y=-60) are the rare anchor.
+// A deliberately D4-symmetric pattern: a bedrock "plus" centred in a 5x5 grid.
+// Recentred on its middle cell (the rare anchor) the constraint set maps to
+// itself under every rotation and mirror, so all 8 orientations collapse to
+// one -- the all-8 best case. With duplicate-orientation collapse it should run
+// at the exact-orientation rate.
 inline Pattern symmetric_pattern() {
-    constexpr int n = 7;
+    constexpr int n = 5;
     Pattern p;
     p.w = n;
     p.h = n;
     p.cells.assign(static_cast<std::size_t>(n) * n, Cell::unknown);
-    auto set = [&](int i, int j, Cell c) { p.cells[static_cast<std::size_t>(j) * n + i] = c; };
-    set(3, 3, Cell::not_bedrock);                                             // centre
-    set(3, 1, Cell::bedrock); set(3, 5, Cell::bedrock);                       // axis arms
-    set(1, 3, Cell::bedrock); set(5, 3, Cell::bedrock);
-    set(1, 1, Cell::not_bedrock); set(5, 5, Cell::not_bedrock);               // diagonal
-    set(1, 5, Cell::not_bedrock); set(5, 1, Cell::not_bedrock);
+    auto set = [&](int i, int j) { p.cells[static_cast<std::size_t>(j) * n + i] = Cell::bedrock; };
+    set(2, 2);                                  // centre
+    set(2, 0); set(2, 4); set(0, 2); set(4, 2); // arms
     return p;
 }
 
@@ -324,7 +321,7 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
                     chosen.driver.empty() ? "?" : chosen.driver.c_str(), chosen.units);
     std::printf("host      : %s %s  |  %u threads  |  %s\n", host_os(), host_arch(), threads,
                 host_compiler().c_str());
-    std::printf("pattern   : %dx%d (8 orientations) + 7x7 symmetric, seed %lld at y %d\n\n", kPatW,
+    std::printf("pattern   : %dx%d asymmetric + 5x5 symmetric plus, seed %lld at y %d\n\n", kPatW,
                 kPatH, static_cast<long long>(kSeed), kPlaneY);
     for (const PhaseResult& p : phases) {
         std::printf("%-9s : %7.2f Gcand/s  (median of %d; min %.2f, max %.2f)   "

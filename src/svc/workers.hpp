@@ -29,7 +29,7 @@ public:
 private:
     unsigned threads_;
     WorkerConfig cfg_;
-    std::vector<KnownCell> ordered_;  // known cells in fail-fast order
+    SearchPlan plan_;  // shared anchor + per-variant offsets (build_search_plan)
     std::atomic<bool> truncated_{false};
     std::atomic<std::uint64_t> emitted_{0};
 };

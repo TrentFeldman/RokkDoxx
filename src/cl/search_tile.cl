@@ -2,47 +2,44 @@
 // PREPENDED to this file by the host loader (opencl_worker.cpp) -- do not
 // #include it here.
 //
-// Pure integer work: one work-item per candidate origin, `rk_bits24_at` per
-// pattern cell it has to check, early-out on the first mismatch. The float
-// compare vanilla does is a host-precomputed `bits < threshold` (see
+// One work-item per candidate origin. The host (build_search_plan) has already
+// done the D4 work: `var_off` holds, per orientation-variant, every pattern
+// cell's world offset *relative to a rare anchor cell*. Cell 0 is that anchor,
+// at offset (0,0) for every variant -- so one bedrock test at the candidate
+// rejects all orientations at once. A match reports the anchor's world position.
+// The float compare vanilla does is a host-precomputed `bits < threshold` (see
 // bedrock_core.h) so results are bit-identical to the CPU on any device.
-
-// D4: the 8 orientations. (du, dv) = (m.x*i + m.y*j, m.z*i + m.w*j).
-// Must match rokkdoxx::svc::kOrientations.
-__constant int4 RK_D4[8] = {
-    (int4)(1, 0, 0, 1),   (int4)(0, -1, 1, 0),  (int4)(-1, 0, 0, -1), (int4)(0, 1, -1, 0),
-    (int4)(-1, 0, 0, 1),  (int4)(0, 1, 1, 0),   (int4)(1, 0, 0, -1),  (int4)(0, -1, -1, 0),
-};
 
 __kernel void search_tile(const ulong derived_lo, const ulong derived_hi, const int plane_y,
                           const uint threshold, const int origin_x, const int origin_z,
                           const int tile_w, const int tile_h, const int n_cells,
-                          const int n_orient, __constant const int2 *cell_rel,
-                          __constant const uchar *cell_want, const uint match_cap,
-                          __global volatile uint *match_count, __global int2 *match_xz,
-                          __global uchar *match_orient) {
+                          const int n_variants, __constant const int2 *var_off,
+                          __constant const uchar *want, __constant const uchar *var_mask,
+                          const uint match_cap, __global volatile uint *match_count,
+                          __global int2 *match_xz, __global uchar *match_orient) {
     const int gx = get_global_id(0);
     const int gz = get_global_id(1);
     if (gx >= tile_w || gz >= tile_h) return;
     const int x = origin_x + gx;
     const int z = origin_z + gz;
 
+    // Shared anchor: cell 0 sits at (x, z) for every variant.
+    const uint abits = rk_bits24_at(derived_lo, derived_hi, x, plane_y, z);
+    if (((abits < threshold) ? 1 : 0) != (int)want[0]) return;
+
     uchar mask = 0;
-    for (int g = 0; g < n_orient; ++g) {
-        const int4 m = RK_D4[g];
+    for (int v = 0; v < n_variants; ++v) {
+        __constant const int2 *off = var_off + (size_t)v * n_cells;
         bool ok = true;
-        for (int c = 0; c < n_cells; ++c) {
-            const int2 r = cell_rel[c];
-            const int du = m.x * r.x + m.y * r.y;
-            const int dv = m.z * r.x + m.w * r.y;
-            const uint bits = rk_bits24_at(derived_lo, derived_hi, x + du, plane_y, z + dv);
-            const int bed = (bits < threshold) ? 1 : 0;
-            if (bed != (int)cell_want[c]) {
+        for (int c = 1; c < n_cells; ++c) {
+            const uint bits =
+                rk_bits24_at(derived_lo, derived_hi, x + off[c].x, plane_y, z + off[c].y);
+            if (((bits < threshold) ? 1 : 0) != (int)want[c]) {
                 ok = false;
                 break;
             }
         }
-        if (ok) mask |= (uchar)(1u << g);
+        if (ok) mask |= var_mask[v];
     }
 
     if (mask) {

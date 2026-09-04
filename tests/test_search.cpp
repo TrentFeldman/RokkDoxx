@@ -43,10 +43,16 @@ std::vector<Match> run(SearchService& svc, const SearchRequest& req) {
     return svc.results(id);
 }
 
-// Brute-force reference: every origin in the region, every requested orientation.
+// Brute-force reference. Independent of build_search_plan's variant/offset
+// tables: it takes only the anchor cell offset from the plan (trivially
+// checkable) and does a plain 8-orientation scan, keyed to the anchor's world
+// position -- the worker's output contract.
 std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
     rokkdoxx::BedrockGenerator gen(req.seed);
     const auto knowns = req.pattern.knowns();
+    const std::uint32_t thr = gen.threshold(req.plane_y);
+    const SearchPlan plan = build_search_plan(knowns, thr, req.all_orientations);
+    const int ai = plan.anchor_i, aj = plan.anchor_j;
     const int gN = req.all_orientations ? 8 : 1;
     std::map<std::pair<int, int>, std::uint8_t> out;
     for (std::int64_t z = req.region.z0; z <= req.region.z1; ++z)
@@ -56,8 +62,9 @@ std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
                 Transform tf = kOrientations[static_cast<std::size_t>(g)];
                 bool ok = true;
                 for (const auto& kc : knowns) {
-                    int du = tf.a * kc.i + tf.b * kc.j;
-                    int dv = tf.c * kc.i + tf.d * kc.j;
+                    const int di = kc.i - ai, dj = kc.j - aj;
+                    const int du = tf.a * di + tf.b * dj;
+                    const int dv = tf.c * di + tf.d * dj;
                     bool bedrock = gen.is_bedrock_floor(static_cast<int>(x + du), req.plane_y,
                                                         static_cast<int>(z + dv));
                     if (bedrock != static_cast<bool>(kc.want)) {
@@ -108,9 +115,14 @@ void test_roundtrip_and_equiv() {
     for (auto& m : got) gm[{m.x, m.z}] = m.orient_mask;
     check(gm == want, "match sets identical");
 
+    // The fill origin under identity: the anchor cell sits at (cx, cz) + anchor
+    // offset (matches report the anchor's world position).
+    rokkdoxx::BedrockGenerator g2(seed);
+    const SearchPlan plan = build_search_plan(req.pattern.knowns(), g2.threshold(y), true);
     bool found_origin = false;
     for (auto& m : got)
-        if (m.x == cx && m.z == cz && (m.orient_mask & 1)) found_origin = true;
+        if (m.x == cx + plan.anchor_i && m.z == cz + plan.anchor_j && (m.orient_mask & 1))
+            found_origin = true;
     check(found_origin, "identity orientation found at the fill origin");
 }
 
@@ -212,11 +224,74 @@ void test_pattern_io_roundtrip() {
     std::remove(path.c_str());
 }
 
+// build_search_plan: anchor choice + duplicate-orientation collapse, plus an
+// end-to-end check that a symmetric pattern still returns exactly what a plain
+// 8-orientation brute force does (keyed to the anchor).
+void test_search_plan() {
+    std::printf("test_search_plan\n");
+
+    // A bedrock "plus" recentres to a fully D4-symmetric set -> 1 variant, all
+    // 8 orientation bits.
+    Pattern plus;
+    plus.w = plus.h = 5;
+    plus.cells.assign(25, Cell::unknown);
+    auto b = [&](int i, int j) { plus.cells[static_cast<std::size_t>(j) * 5 + i] = Cell::bedrock; };
+    b(2, 2);
+    b(2, 0);
+    b(2, 4);
+    b(0, 2);
+    b(4, 2);
+    const std::uint32_t thr = rokkdoxx::BedrockGenerator(0).threshold(-60);
+    SearchPlan pp = build_search_plan(plus.knowns(), thr, true);
+    check(pp.n_variants == 1, "symmetric plus -> 1 variant (got " + std::to_string(pp.n_variants) + ")");
+    check(pp.variant_mask.size() == 1 && pp.variant_mask[0] == 0xFF, "variant covers all 8 bits");
+    check(pp.anchor_i == 2 && pp.anchor_j == 2, "anchor is the centre cell");
+    check(pp.want[0] == 1 && pp.off_x[0] == 0 && pp.off_z[0] == 0, "cell 0 is the anchor at (0,0)");
+
+    // A scalene right triangle (no symmetry) -> 8 distinct orientations.
+    Pattern tri;
+    tri.w = 3;
+    tri.h = 2;
+    tri.cells.assign(6, Cell::unknown);
+    tri.cells[0] = Cell::bedrock;  // (0,0)
+    tri.cells[2] = Cell::bedrock;  // (2,0)
+    tri.cells[3] = Cell::bedrock;  // (0,1)
+    SearchPlan lp = build_search_plan(tri.knowns(), thr, true);
+    check(lp.n_variants == 8, "scalene shape -> 8 variants (got " + std::to_string(lp.n_variants) + ")");
+    std::uint8_t all = 0;
+    int bits = 0;
+    for (auto m : lp.variant_mask) {
+        all |= m;
+        for (int k = 0; k < 8; ++k) bits += (m >> k) & 1;
+    }
+    check(all == 0xFF && bits == 8, "8 variant masks partition the 8 orientations");
+
+    // End-to-end: symmetric plus, seed with real bedrock, brute vs service.
+    auto svc = make_service();
+    rokkdoxx::BedrockGenerator gen(555);
+    const int y = -60, cx = -700, cz = 900;
+    Pattern fp = fill_pattern(555, y, cx, cz, 5, 5);  // 5x5 real config (asymmetric)
+    SearchRequest req;
+    req.seed = 555;
+    req.plane_y = y;
+    req.pattern = fp;
+    req.region = Region::centered(cx + 2, cz + 2, 350);
+    req.all_orientations = true;
+    auto got = run(svc, req);
+    auto want = brute(req);
+    std::map<std::pair<int, int>, std::uint8_t> gm;
+    for (auto& m : got) gm[{m.x, m.z}] = m.orient_mask;
+    check(gm == want, "plan search == brute (" + std::to_string(gm.size()) + " vs " +
+                          std::to_string(want.size()) + ")");
+    (void)gen;
+}
+
 }  // namespace
 
 int main() {
     test_roundtrip_and_equiv();
     test_tiling_invariant();
+    test_search_plan();
     test_cancel();
     test_scheduler_checkpoint();
     test_pattern_io_roundtrip();

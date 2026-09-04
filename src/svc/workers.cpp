@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
+#include <utility>
 
 #include "gen/bedrock_core.h"
 
@@ -12,6 +14,104 @@
 #endif
 
 namespace rokkdoxx::svc {
+
+// --- search plan ----------------------------------------------------------
+
+SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
+                             bool all_orientations) {
+    SearchPlan plan;
+    const bool bedrock_rare = threshold <= (1u << 23);
+    const std::uint8_t rare_want = bedrock_rare ? 1 : 0;
+
+    // Nothing constrains the search -> "match any bedrock block".
+    if (knowns.empty()) {
+        plan.n_cells = 1;
+        plan.n_variants = 1;
+        plan.want = {1};
+        plan.off_x = {0};
+        plan.off_z = {0};
+        plan.variant_mask = {static_cast<std::uint8_t>(all_orientations ? 0xFF : 0x01)};
+        return plan;
+    }
+
+    // Fail-fast order: rarer cell type first, so a wrong candidate is usually
+    // rejected on cell 1 (of each variant).
+    std::stable_sort(knowns.begin(), knowns.end(), [&](const KnownCell& a, const KnownCell& b) {
+        return ((a.want == 1) == bedrock_rare) && ((b.want == 1) != bedrock_rare);
+    });
+
+    // Anchor = the rare-type cell nearest the centroid of all knowns, so the
+    // match coordinate lands roughly in the middle of the shape. Falls back to
+    // the overall-nearest cell when the pattern has no rare-type cell.
+    double cx = 0, cz = 0;
+    for (const KnownCell& k : knowns) {
+        cx += k.i;
+        cz += k.j;
+    }
+    cx /= static_cast<double>(knowns.size());
+    cz /= static_cast<double>(knowns.size());
+    auto dist2 = [&](const KnownCell& k) {
+        return (k.i - cx) * (k.i - cx) + (k.j - cz) * (k.j - cz);
+    };
+    KnownCell anchor = knowns.front();
+    for (const KnownCell& k : knowns) {
+        const bool kr = k.want == rare_want, ar = anchor.want == rare_want;
+        if (kr != ar) {
+            if (kr) anchor = k;
+            continue;
+        }
+        const double kd = dist2(k), ad = dist2(anchor);
+        if (kd < ad || (kd == ad && std::tie(k.j, k.i) < std::tie(anchor.j, anchor.i))) anchor = k;
+    }
+    plan.anchor_i = anchor.i;
+    plan.anchor_j = anchor.j;
+
+    // Cell order: anchor first, then the rest in the fail-fast order above.
+    std::vector<KnownCell> cells;
+    cells.reserve(knowns.size());
+    cells.push_back(anchor);
+    for (const KnownCell& k : knowns)
+        if (!(k.i == anchor.i && k.j == anchor.j)) cells.push_back(k);
+
+    plan.n_cells = static_cast<int>(cells.size());
+    plan.want.resize(cells.size());
+    for (std::size_t c = 0; c < cells.size(); ++c) plan.want[c] = cells[c].want;
+
+    // Recentre each cell on the anchor, apply every orientation, and collapse
+    // orientations whose transformed (offset, want) set is identical.
+    const int gN = all_orientations ? 8 : 1;
+    std::vector<std::vector<std::tuple<int, int, int>>> canon;
+    for (int g = 0; g < gN; ++g) {
+        const Transform tf = kOrientations[static_cast<std::size_t>(g)];
+        std::vector<std::int32_t> ox(cells.size()), oz(cells.size());
+        std::vector<std::tuple<int, int, int>> key(cells.size());
+        for (std::size_t c = 0; c < cells.size(); ++c) {
+            const int di = cells[c].i - anchor.i;
+            const int dj = cells[c].j - anchor.j;
+            ox[c] = tf.a * di + tf.b * dj;
+            oz[c] = tf.c * di + tf.d * dj;
+            key[c] = {ox[c], oz[c], cells[c].want};
+        }
+        std::sort(key.begin(), key.end());
+
+        int found = -1;
+        for (std::size_t v = 0; v < canon.size(); ++v)
+            if (canon[v] == key) {
+                found = static_cast<int>(v);
+                break;
+            }
+        if (found >= 0) {
+            plan.variant_mask[static_cast<std::size_t>(found)] |= static_cast<std::uint8_t>(1u << g);
+        } else {
+            canon.push_back(std::move(key));
+            plan.variant_mask.push_back(static_cast<std::uint8_t>(1u << g));
+            plan.off_x.insert(plan.off_x.end(), ox.begin(), ox.end());
+            plan.off_z.insert(plan.off_z.end(), oz.begin(), oz.end());
+        }
+    }
+    plan.n_variants = static_cast<int>(plan.variant_mask.size());
+    return plan;
+}
 
 // --- CpuWorker --------------------------------------------------------------
 
@@ -24,17 +124,7 @@ std::string CpuWorker::name() const { return "cpu (" + std::to_string(threads_) 
 
 void CpuWorker::configure(const WorkerConfig& cfg) {
     cfg_ = cfg;
-    ordered_ = cfg.knowns;
-    // Fail-fast ordering: check the rarer cell type first, so a non-matching
-    // origin is usually rejected on its first cell. Bedrock is the minority
-    // when the threshold sits below the half-way mark (2^23).
-    const bool bedrock_rare = cfg.threshold <= (1u << 23);
-    std::stable_sort(ordered_.begin(), ordered_.end(),
-                     [&](const KnownCell& a, const KnownCell& b) {
-                         const bool ar = (a.want == 1) == bedrock_rare;
-                         const bool br = (b.want == 1) == bedrock_rare;
-                         return ar && !br;
-                     });
+    plan_ = build_search_plan(cfg.knowns, cfg.threshold, cfg.all_orientations);
     truncated_.store(false);
     emitted_.store(0);
 }
@@ -48,30 +138,37 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     const std::uint64_t dlo = cfg_.derived_lo, dhi = cfg_.derived_hi;
     const int y = cfg_.plane_y;
     const std::uint32_t thr = cfg_.threshold;
-    const int gN = cfg_.all_orientations ? 8 : 1;
+    const SearchPlan& p = plan_;
+    const int nc = p.n_cells;
 
     // Thread t handles every T-th row of the tile (z = t, t+T, t+2T, ...).
+    // (x, z) is the candidate world position of the anchor cell (plan cell 0).
     auto work = [&](int t) {
         auto& out = buckets[static_cast<std::size_t>(t)];
         for (int dz = t; dz < tile.h; dz += T) {
             const std::int64_t z = tile.z0 + dz;
             for (int dx = 0; dx < tile.w; ++dx) {
                 const std::int64_t x = tile.x0 + dx;
+
+                // Shared anchor: one test rejects every orientation at once.
+                const int abed = rk_bits24_at(dlo, dhi, static_cast<int>(x), y,
+                                              static_cast<int>(z)) < thr;
+                if (abed != static_cast<int>(p.want[0])) continue;
+
                 std::uint8_t mask = 0;
-                for (int g = 0; g < gN; ++g) {
-                    const Transform tf = kOrientations[static_cast<std::size_t>(g)];
+                for (int v = 0; v < p.n_variants; ++v) {
+                    const std::int32_t* ox = &p.off_x[static_cast<std::size_t>(v) * nc];
+                    const std::int32_t* oz = &p.off_z[static_cast<std::size_t>(v) * nc];
                     bool ok = true;
-                    for (const KnownCell& kc : ordered_) {
-                        const int du = tf.a * kc.i + tf.b * kc.j;
-                        const int dv = tf.c * kc.i + tf.d * kc.j;
-                        const int bed = rk_bits24_at(dlo, dhi, static_cast<int>(x + du), y,
-                                                     static_cast<int>(z + dv)) < thr;
-                        if (bed != static_cast<int>(kc.want)) {
+                    for (int c = 1; c < nc; ++c) {
+                        const int bed = rk_bits24_at(dlo, dhi, static_cast<int>(x + ox[c]), y,
+                                                     static_cast<int>(z + oz[c])) < thr;
+                        if (bed != static_cast<int>(p.want[c])) {
                             ok = false;
-                            break;  // first mismatch -> this orientation fails
+                            break;  // first mismatch -> this variant fails
                         }
                     }
-                    if (ok) mask |= static_cast<std::uint8_t>(1u << g);
+                    if (ok) mask |= p.variant_mask[static_cast<std::size_t>(v)];
                 }
                 if (mask) {
                     if (emitted_.fetch_add(1) < cfg_.match_cap)

@@ -160,6 +160,36 @@ struct WorkerConfig {
     std::uint32_t match_cap = 1u << 20;
 };
 
+// --- search plan (shared prep for both workers) ---------------------------
+//
+// Turns the user's known cells into the exact per-candidate test both workers
+// run, so the CPU and the GPU cannot disagree. Built once per job in
+// build_search_plan() (workers.cpp).
+//
+// The key move ("shared anchor"): cell 0 is a rare pattern cell, and every
+// other cell is stored *relative to it*. D4 rotations/mirrors fix the origin,
+// so cell 0 lands at the candidate coordinate for all 8 orientations -- one
+// bedrock test there rejects every orientation at once. A match is therefore
+// reported at the world position of that anchor cell (anchor_i / anchor_j give
+// its offset inside the pattern, if a caller needs to translate back).
+//
+// Orientations whose transformed cell set is identical are collapsed into one
+// "variant"; variant_mask[v] carries the original orientation bits so the
+// output is unchanged.
+struct SearchPlan {
+    int n_cells = 0;     // includes the anchor at index 0
+    int n_variants = 0;  // 1..8 (fewer than 8 for symmetric patterns)
+    int anchor_i = 0, anchor_j = 0;
+    std::vector<std::uint8_t> want;         // [n_cells]  1 = bedrock
+    std::vector<std::int32_t> off_x;        // [n_variants * n_cells]  world dx from the anchor
+    std::vector<std::int32_t> off_z;        // [n_variants * n_cells]
+    std::vector<std::uint8_t> variant_mask; // [n_variants]  OR of (1u << g)
+};
+
+// `all_orientations == false` -> a single variant (identity only).
+SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
+                             bool all_orientations);
+
 // The compute tier. The orchestrator configures it once, then feeds it tiles.
 // Implementations: CpuWorker (workers.*) and OpenclWorker (opencl_worker.*).
 class Worker {

@@ -109,9 +109,13 @@ void test_search_parity() {
         auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
         check(cpu == gpu, "seed " + std::to_string(p.seed) + " parity (" + std::to_string(cpu.size()) +
                               " cpu vs " + std::to_string(gpu.size()) + " gpu)");
+        // Matches report the anchor cell's world position, so the identity
+        // orientation lands at the fill origin + the anchor offset.
+        const SearchPlan plan = build_search_plan(req.pattern.knowns(), gen.threshold(p.y), true);
         bool origin = false;
         for (auto& [k, v] : gpu)
-            if (k.first == p.cx && k.second == p.cz && (v & 1)) origin = true;
+            if (k.first == p.cx + plan.anchor_i && k.second == p.cz + plan.anchor_j && (v & 1))
+                origin = true;
         check(origin, "seed " + std::to_string(p.seed) + " fill origin found on GPU");
     }
 }

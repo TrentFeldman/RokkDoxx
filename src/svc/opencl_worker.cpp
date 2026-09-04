@@ -118,9 +118,11 @@ struct OpenclWorker::Impl {
     std::string label;
 
     WorkerConfig cfg;
-    int n_orient = 1;
-    cl::Buffer buf_rel;
+    int n_cells = 1;
+    int n_variants = 1;
+    cl::Buffer buf_var_off;
     cl::Buffer buf_want;
+    cl::Buffer buf_var_mask;
     cl::Buffer buf_count;
     cl::Buffer buf_xz;
     cl::Buffer buf_orient;
@@ -163,36 +165,28 @@ bool OpenclWorker::truncated() const { return impl_->trunc.load(); }
 
 void OpenclWorker::configure(const WorkerConfig& cfg) {
     impl_->cfg = cfg;
-    impl_->n_orient = cfg.all_orientations ? 8 : 1;
     impl_->trunc.store(false);
 
-    std::vector<cl_int2> rel;
-    std::vector<cl_uchar> want;
-    // Fail-fast ordering, same rule as CpuWorker.
-    auto ks = cfg.knowns;
-    const bool bedrock_rare = cfg.threshold <= (1u << 23);
-    std::stable_sort(ks.begin(), ks.end(), [&](const KnownCell& a, const KnownCell& b) {
-        return ((a.want == 1) == bedrock_rare) && ((b.want == 1) != bedrock_rare);
-    });
-    for (const auto& kc : ks) {
-        cl_int2 v;
-        v.s[0] = kc.i;
-        v.s[1] = kc.j;
-        rel.push_back(v);
-        want.push_back(static_cast<cl_uchar>(kc.want));
-    }
-    if (rel.empty()) {
-        cl_int2 v;
-        v.s[0] = 0;
-        v.s[1] = 0;
-        rel.push_back(v);
-        want.push_back(1);
-    }
+    // Shared prep with CpuWorker: anchor pick, recentring, per-variant offset
+    // tables, duplicate-orientation collapse. See build_search_plan.
+    const SearchPlan plan = build_search_plan(cfg.knowns, cfg.threshold, cfg.all_orientations);
+    impl_->n_cells = plan.n_cells;
+    impl_->n_variants = plan.n_variants;
 
-    impl_->buf_rel = cl::Buffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                rel.size() * sizeof(cl_int2), rel.data());
+    std::vector<cl_int2> var_off(static_cast<std::size_t>(plan.n_variants) * plan.n_cells);
+    for (std::size_t i = 0; i < var_off.size(); ++i) {
+        var_off[i].s[0] = plan.off_x[i];
+        var_off[i].s[1] = plan.off_z[i];
+    }
+    std::vector<cl_uchar> want(plan.want.begin(), plan.want.end());
+    std::vector<cl_uchar> vmask(plan.variant_mask.begin(), plan.variant_mask.end());
+
+    impl_->buf_var_off = cl::Buffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    var_off.size() * sizeof(cl_int2), var_off.data());
     impl_->buf_want = cl::Buffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                  want.size() * sizeof(cl_uchar), want.data());
+    impl_->buf_var_mask = cl::Buffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     vmask.size() * sizeof(cl_uchar), vmask.data());
 
     impl_->cap = std::min<std::uint32_t>(cfg.match_cap, 1u << 20);
     impl_->buf_count = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, sizeof(cl_uint));
@@ -214,10 +208,11 @@ std::vector<Match> OpenclWorker::run_tile(const Tile& tile) {
     k.setArg(a++, static_cast<cl_int>(tile.z0));
     k.setArg(a++, static_cast<cl_int>(tile.w));
     k.setArg(a++, static_cast<cl_int>(tile.h));
-    k.setArg(a++, static_cast<cl_int>(impl_->cfg.knowns.size()));
-    k.setArg(a++, static_cast<cl_int>(impl_->n_orient));
-    k.setArg(a++, impl_->buf_rel);
+    k.setArg(a++, static_cast<cl_int>(impl_->n_cells));
+    k.setArg(a++, static_cast<cl_int>(impl_->n_variants));
+    k.setArg(a++, impl_->buf_var_off);
     k.setArg(a++, impl_->buf_want);
+    k.setArg(a++, impl_->buf_var_mask);
     k.setArg(a++, static_cast<cl_uint>(impl_->cap));
     k.setArg(a++, impl_->buf_count);
     k.setArg(a++, impl_->buf_xz);
