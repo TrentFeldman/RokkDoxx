@@ -120,6 +120,43 @@ void test_search_parity() {
     }
 }
 
+// Three known cells spread ~200 blocks apart inside an otherwise-unknown
+// 401x401 pattern grid -- forces OpenclWorker::configure()'s halo well past
+// any local-memory budget (Step 10b), exercising the cached-kernel fallback
+// to plain search_tile for real, not just as a comment.
+void test_large_halo_fallback() {
+    std::printf("test_large_halo_fallback\n");
+    const std::int64_t seed = 999;
+    rokkdoxx::BedrockGenerator gen(seed);
+    const int y = -60;
+    const int cx = 300, cz = -200;
+    const int n = 401;  // grid spans 0..400, centre at (200,200)
+
+    Pattern pat;
+    pat.w = n;
+    pat.h = n;
+    pat.cells.assign(static_cast<std::size_t>(n) * n, Cell::unknown);
+    auto set = [&](int i, int j) {
+        pat.cells[static_cast<std::size_t>(j) * n + i] =
+            gen.is_bedrock_floor(cx + i, y, cz + j) ? Cell::bedrock : Cell::not_bedrock;
+    };
+    set(200, 200);  // centre
+    set(0, 200);    // 200 blocks west
+    set(400, 200);  // 200 blocks east
+
+    SearchRequest req;
+    req.seed = seed;
+    req.plane_y = y;
+    req.pattern = pat;
+    req.region = Region::centered(cx + 1, cz + 1, 500);
+    req.all_orientations = true;
+
+    auto cpu = run(make_worker_factory("cpu"), req);
+    auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
+    check(cpu == gpu, "large-halo fallback parity (" + std::to_string(cpu.size()) + " cpu vs " +
+                           std::to_string(gpu.size()) + " gpu)");
+}
+
 }  // namespace
 
 int main() {
@@ -137,6 +174,7 @@ int main() {
         ++g_fail;
     }
     test_search_parity();
+    test_large_halo_fallback();
 
     if (g_fail == 0) {
         std::printf("\nALL PASS\n");

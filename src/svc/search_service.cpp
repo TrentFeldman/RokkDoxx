@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -335,29 +336,36 @@ void SearchService::run(Job* job) noexcept {
             job->status.state = JobState::running;
         }
 
-        // The pump: one tile at a time until the region is covered or the job
-        // is cancelled. Status is refreshed after every tile so a poller sees
-        // live progress.
+        // The pump: tiles are handed to the worker until the region is
+        // covered or the job is cancelled. Status is refreshed after every
+        // completed tile so a poller sees live progress. A worker that
+        // supports async pipelining (OpenclWorker) gets up to two tiles in
+        // flight -- begin_tile()/end_tile() let its dispatch for tile N
+        // overlap read-back for tile N-1, instead of run_tile()'s strict
+        // dispatch-then-block-then-next.
         auto last_ckpt = clock::now();
-        Tile tile;
-        while (!job->cancel.load() && sched.next(tile)) {
-            std::vector<Match> m = worker->run_tile(tile);
+
+        // Bookkeeping for one *completed* tile -- called at drain time, which
+        // for the pipelined path lags dispatch order by up to one tile. That
+        // lag is fine: TileScheduler::mark_done/ResultSink::add are already
+        // idempotent/order-independent, and progress stays monotonic.
+        auto on_tile_done = [&](const Tile& done, const std::vector<Match>& m) {
             sink.add(m);
-            sched.mark_done(tile);
+            sched.mark_done(done);
 
             const auto now = clock::now();
             const double elapsed = std::chrono::duration<double>(now - t0).count();
-            const long long done = sched.candidates_done();
+            const long long cdone = sched.candidates_done();
             {
                 std::lock_guard<std::mutex> jl(job->mu);
-                job->status.candidates_done = done;
+                job->status.candidates_done = cdone;
                 job->status.progress =
                     job->status.candidates_total > 0
-                        ? static_cast<double>(done) / static_cast<double>(job->status.candidates_total)
+                        ? static_cast<double>(cdone) / static_cast<double>(job->status.candidates_total)
                         : 1.0;
                 job->status.matches = sink.count();
                 job->status.elapsed_s = elapsed;
-                job->status.rate = elapsed > 0 ? static_cast<double>(done) / elapsed : 0.0;
+                job->status.rate = elapsed > 0 ? static_cast<double>(cdone) / elapsed : 0.0;
                 job->status.truncated = sink.truncated() || worker->truncated();
             }
 
@@ -365,6 +373,38 @@ void SearchService::run(Job* job) noexcept {
                 std::chrono::duration<double>(now - last_ckpt).count() > 5.0) {
                 sched.save_checkpoint(req.checkpoint_path, fp);
                 last_ckpt = now;
+            }
+        };
+
+        if (worker->supports_pipelining()) {
+            constexpr int kDepth = 2;
+            std::deque<Tile> inflight;
+            Tile t;
+            bool more = true;
+            while (true) {
+                // Admit new tiles up to the pipeline depth. Cancellation only
+                // stops *new* admissions -- anything already begun always
+                // gets drained below, so the loop never exits with GPU work
+                // still outstanding.
+                while (more && !job->cancel.load() && static_cast<int>(inflight.size()) < kDepth) {
+                    if (!sched.next(t)) {
+                        more = false;
+                        break;
+                    }
+                    worker->begin_tile(t);
+                    inflight.push_back(t);
+                }
+                if (inflight.empty()) break;
+                std::vector<Match> m = worker->end_tile();
+                Tile done = inflight.front();
+                inflight.pop_front();
+                on_tile_done(done, m);
+            }
+        } else {
+            Tile tile;
+            while (!job->cancel.load() && sched.next(tile)) {
+                std::vector<Match> m = worker->run_tile(tile);
+                on_tile_done(tile, m);
             }
         }
 

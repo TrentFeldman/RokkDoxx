@@ -207,6 +207,17 @@ public:
     // big tiles so the fixed per-dispatch cost is amortised; the CPU wants
     // smaller tiles so progress and cancellation stay responsive.
     virtual int preferred_tile_side() const { return 0; }
+
+    // Optional async pipelining: a worker that can overlap on-device dispatch
+    // for one tile with host read-back of another advertises this and
+    // implements begin_tile/end_tile; everyone else inherits these no-op
+    // defaults and callers just keep using run_tile(). begin_tile() enqueues
+    // `tile` without blocking; end_tile() blocks for and returns the matches
+    // of the OLDEST not-yet-collected begin_tile() call (strict FIFO pairing).
+    virtual bool supports_pipelining() const { return false; }
+    virtual void begin_tile(const Tile& /*tile*/) {}
+    virtual std::vector<Match> end_tile() { return {}; }
+    virtual int pending_tiles() const { return 0; }
 };
 
 using WorkerFactory = std::function<std::unique_ptr<Worker>()>;

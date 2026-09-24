@@ -111,12 +111,35 @@ inline Pattern symmetric_pattern() {
     return p;
 }
 
-// One timed sweep of `region` through an already-configured worker.
+// One timed sweep of `region` through an already-configured worker. Mirrors
+// SearchService::run()'s pump loop: a pipelining-capable worker (OpenclWorker)
+// gets two tiles in flight so the benchmark actually measures the overlapped
+// path it ships with, rather than silently falling back to run_tile()'s
+// strictly-synchronous per-tile dispatch.
 inline double sweep(Worker& w, const Region& region, int tile_side) {
     TileScheduler sched(region, tile_side);
     Tile t;
     const auto t0 = std::chrono::steady_clock::now();
-    while (sched.next(t)) (void)w.run_tile(t);
+    if (w.supports_pipelining()) {
+        constexpr int kDepth = 2;
+        int inflight = 0;
+        bool more = true;
+        while (true) {
+            while (more && inflight < kDepth) {
+                if (!sched.next(t)) {
+                    more = false;
+                    break;
+                }
+                w.begin_tile(t);
+                ++inflight;
+            }
+            if (inflight == 0) break;
+            (void)w.end_tile();
+            --inflight;
+        }
+    } else {
+        while (sched.next(t)) (void)w.run_tile(t);
+    }
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
