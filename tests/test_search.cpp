@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <string>
 #include <thread>
@@ -182,6 +183,7 @@ void test_scheduler_checkpoint() {
     req.tile_side = 1024;
     const std::uint64_t fp = request_fingerprint(req);
     const std::string path = "test_ckpt.tmp";
+    const std::vector<Match> saved_matches = {{10, 20, 1}, {-5, 300, 0x83}};
 
     TileScheduler s1(req.region, req.tile_side);
     Tile t;
@@ -190,14 +192,36 @@ void test_scheduler_checkpoint() {
         s1.mark_done(t);
         ++marked;
     }
-    s1.save_checkpoint(path, fp);
+    s1.save_checkpoint(path, fp, saved_matches);
 
+    // The whole point of persisting matches: a resumed run must not lose (or
+    // need to re-find) matches from tiles it's about to skip as already-done.
     TileScheduler s2(req.region, req.tile_side);
-    check(s2.load_checkpoint(path, fp), "checkpoint loads with matching fingerprint");
+    std::vector<Match> restored;
+    check(s2.load_checkpoint(path, fp, restored), "checkpoint loads with matching fingerprint");
     check(s2.done_count() == marked, "resumed with the right tile count");
+    check(restored.size() == saved_matches.size(), "resumed with the right match count");
+    bool matches_equal = restored.size() == saved_matches.size();
+    for (std::size_t i = 0; matches_equal && i < restored.size(); ++i)
+        matches_equal = restored[i].x == saved_matches[i].x && restored[i].z == saved_matches[i].z &&
+                         restored[i].orient_mask == saved_matches[i].orient_mask;
+    check(matches_equal, "resumed matches are byte-identical to what was saved");
 
     TileScheduler s3(req.region, req.tile_side);
-    check(!s3.load_checkpoint(path, fp ^ 1), "checkpoint rejected on fingerprint mismatch");
+    std::vector<Match> ignored;
+    check(!s3.load_checkpoint(path, fp ^ 1, ignored), "checkpoint rejected on fingerprint mismatch");
+
+    // A version-1 file (written before matches were persisted) still loads --
+    // just with no matches to restore, not a failure.
+    {
+        std::ofstream old(path, std::ios::trunc);
+        old << "rokkdoxx-checkpoint 1 " << fp << "\ndone 0-" << (marked - 1) << "\n";
+    }
+    TileScheduler s4(req.region, req.tile_side);
+    std::vector<Match> none;
+    check(s4.load_checkpoint(path, fp, none), "version-1 checkpoint (no matches section) still loads");
+    check(none.empty(), "version-1 checkpoint restores zero matches, not a failure");
+
     std::remove(path.c_str());
 }
 

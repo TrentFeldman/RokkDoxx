@@ -45,8 +45,15 @@ public:
 
     // Checkpoint I/O. `fingerprint` guards against loading a checkpoint that
     // was written for a different request (see request_fingerprint).
-    bool load_checkpoint(const std::string& path, std::uint64_t fingerprint);
-    void save_checkpoint(const std::string& path, std::uint64_t fingerprint) const;
+    // `out_matches`/`matches` carry the matches found before the checkpoint
+    // was written, so a resumed run doesn't lose or need to re-find them for
+    // tiles it's about to skip as already-done. A checkpoint written before
+    // this carried matches (version 1) still loads -- out_matches is simply
+    // left empty for it.
+    bool load_checkpoint(const std::string& path, std::uint64_t fingerprint,
+                         std::vector<Match>& out_matches);
+    void save_checkpoint(const std::string& path, std::uint64_t fingerprint,
+                         const std::vector<Match>& matches) const;
 
 private:
     Tile tile_at(int index) const;

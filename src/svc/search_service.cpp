@@ -107,48 +107,84 @@ long long TileScheduler::candidates_done() const {
     return candidates_done_;
 }
 
-// Checkpoint file format (one line of header, one line of data):
-//   rokkdoxx-checkpoint 1 <fingerprint>
+// Checkpoint file format (one header line, one tile-progress line, and --
+// from version 2 on -- a matches section):
+//   rokkdoxx-checkpoint <version> <fingerprint>
 //   done 0-15 17 40-1200 ...
-// The data line is a run-length list of finished tile indices.
-bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t fingerprint) {
+//   matches <count>              (version 2 only)
+//   <x> <z> <orient_mask>        (repeated <count> times)
+// The done line is a run-length list of finished tile indices. The matches
+// section carries whatever ResultSink held at save time, so a resumed run
+// doesn't lose (or need to re-find) matches from tiles it's about to skip as
+// already-done. Version 1 files (written before matches were persisted)
+// still load -- out_matches is simply left empty for them. New saves always
+// write version 2; a version-1 *reader* (an older build) rejects a version-2
+// file outright via the version check below, rather than misinterpreting
+// the matches section as more tile ranges.
+bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t fingerprint,
+                                    std::vector<Match>& out_matches) {
+    out_matches.clear();
     std::ifstream f(path);
     if (!f) return false;
     std::string tag;
     int version = 0;
     std::uint64_t fp = 0;
     f >> tag >> version >> fp;
-    if (tag != "rokkdoxx-checkpoint" || version != 1 || fp != fingerprint) return false;
-    std::string kw;
-    f >> kw;  // "done"
-    if (kw != "done") return false;
-    std::lock_guard<std::mutex> lk(mu_);
-    std::string tok;
-    while (f >> tok) {
-        auto dash = tok.find('-');
-        int a, b;
-        if (dash == std::string::npos) {
-            a = b = std::atoi(tok.c_str());
-        } else {
-            a = std::atoi(tok.substr(0, dash).c_str());
-            b = std::atoi(tok.substr(dash + 1).c_str());
-        }
-        for (int i = a; i <= b && i < n_; ++i)
-            if (i >= 0 && !done_[static_cast<std::size_t>(i)]) {
-                done_[static_cast<std::size_t>(i)] = 1;
-                ++done_count_;
-                const Tile t = tile_at(i);
-                candidates_done_ += static_cast<long long>(t.w) * t.h;
+    if (tag != "rokkdoxx-checkpoint" || (version != 1 && version != 2) || fp != fingerprint)
+        return false;
+
+    std::string line;
+    std::getline(f, line);              // rest of the header line
+    if (!std::getline(f, line)) return false;
+    {
+        std::istringstream ls(line);
+        std::string kw;
+        ls >> kw;
+        if (kw != "done") return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string tok;
+        while (ls >> tok) {
+            auto dash = tok.find('-');
+            int a, b;
+            if (dash == std::string::npos) {
+                a = b = std::atoi(tok.c_str());
+            } else {
+                a = std::atoi(tok.substr(0, dash).c_str());
+                b = std::atoi(tok.substr(dash + 1).c_str());
             }
+            for (int i = a; i <= b && i < n_; ++i)
+                if (i >= 0 && !done_[static_cast<std::size_t>(i)]) {
+                    done_[static_cast<std::size_t>(i)] = 1;
+                    ++done_count_;
+                    const Tile t = tile_at(i);
+                    candidates_done_ += static_cast<long long>(t.w) * t.h;
+                }
+        }
+    }
+
+    if (version >= 2 && std::getline(f, line)) {
+        std::istringstream ms(line);
+        std::string kw;
+        long long count = 0;
+        ms >> kw >> count;
+        if (kw == "matches" && count > 0) {
+            for (long long i = 0; i < count && std::getline(f, line); ++i) {
+                std::istringstream ls(line);
+                int x = 0, z = 0, mask = 0;
+                if (ls >> x >> z >> mask)
+                    out_matches.push_back({x, z, static_cast<std::uint8_t>(mask)});
+            }
+        }
     }
     return true;
 }
 
-void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t fingerprint) const {
+void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t fingerprint,
+                                    const std::vector<Match>& matches) const {
     std::lock_guard<std::mutex> lk(mu_);
     std::ofstream f(path, std::ios::trunc);
     if (!f) return;
-    f << "rokkdoxx-checkpoint 1 " << fingerprint << "\ndone";
+    f << "rokkdoxx-checkpoint 2 " << fingerprint << "\ndone";
     int i = 0;
     while (i < n_) {
         if (!done_[static_cast<std::size_t>(i)]) {
@@ -161,7 +197,9 @@ void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t finge
         else f << " " << i << "-" << j;
         i = j + 1;
     }
-    f << "\n";
+    f << "\nmatches " << matches.size() << "\n";
+    for (const Match& m : matches)
+        f << m.x << " " << m.z << " " << static_cast<int>(m.orient_mask) << "\n";
 }
 
 // ==========================================================================
@@ -326,9 +364,12 @@ void SearchService::run(Job* job) noexcept {
 
         TileScheduler sched(req.region, tile_side);
         const std::uint64_t fp = request_fingerprint(req);
-        if (!req.checkpoint_path.empty()) sched.load_checkpoint(req.checkpoint_path, fp);
-
         ResultSink sink(req.match_cap);
+        if (!req.checkpoint_path.empty()) {
+            std::vector<Match> restored;
+            if (sched.load_checkpoint(req.checkpoint_path, fp, restored)) sink.add(restored);
+        }
+
         worker->configure(cfg);
 
         {
@@ -371,7 +412,7 @@ void SearchService::run(Job* job) noexcept {
 
             if (!req.checkpoint_path.empty() &&
                 std::chrono::duration<double>(now - last_ckpt).count() > 5.0) {
-                sched.save_checkpoint(req.checkpoint_path, fp);
+                sched.save_checkpoint(req.checkpoint_path, fp, sink.snapshot());
                 last_ckpt = now;
             }
         };
@@ -408,9 +449,9 @@ void SearchService::run(Job* job) noexcept {
             }
         }
 
-        if (!req.checkpoint_path.empty()) sched.save_checkpoint(req.checkpoint_path, fp);
-
         std::vector<Match> final_matches = sink.snapshot();
+        if (!req.checkpoint_path.empty()) sched.save_checkpoint(req.checkpoint_path, fp, final_matches);
+
         std::lock_guard<std::mutex> jl(job->mu);
         job->results = std::move(final_matches);
         job->status.matches = job->results.size();

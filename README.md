@@ -73,13 +73,13 @@ No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
 | CPU worker (multi-threaded) | ✅ |
 | OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
 | Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | BETA: GPU-on-Windows untested but supported |
-| Windows: `rokktui` | ⬜ later (needs a console backend) |
-| Resumable long runs (`--checkpoint`) | ⬜ revisit |
-| Local-memory tile cache, async tile pipelining | ⬜ later |
+| Windows: `rokktui` | BETA: console backend written, untested on a Windows box |
+| Resumable long runs (`--checkpoint`) | ✅ |
+| Local-memory tile cache, async tile pipelining | ✅ |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
-| `rokktui` redo | ⬜ later |
+| `rokktui` redo (flicker-free, resize, backend picker, resume) | ✅ |
 | Further optimizations, early test rejections | ⬜ later |
-| Work on optimizing 8 direction search slowdowns | ⬜ later |
+| Work on optimizing 8 direction search slowdowns | ⬜ later (2.6× narrower than before, still slower than exact) |
 | Reattach to a running / detached search | ⬜ later |
 
 How the generation works, short version:
@@ -102,7 +102,8 @@ How the generation works, short version:
 Three tiers, so the compute scales independently of the UI:
 
 - **Front-ends** (`rokktui`, `rokksearch`) — thin. They build a search request and poll for
-  progress; no search logic of their own.
+  progress; no search logic of their own. `rokktui` keeps all OS-specific code in one
+  terminal file per platform (`tools/tui/term_posix.cpp`, `term_win.cpp`).
 - **`SearchService`** (CPU) — cuts the region into tiles, schedules them, deduplicates
   matches (a symmetric pattern can hit under several orientations at one origin), tracks
   progress, and supports cancel.
@@ -138,8 +139,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Produces `build/{dump_bedrock, rokksearch, test_*}` (plus `rokktui` on
-Linux/macOS — it uses a POSIX raw-terminal backend and is not built on Windows).
+Produces `build/{dump_bedrock, rokksearch, rokktui, test_*}`. `rokktui` picks its
+terminal backend at build time (termios on Linux/macOS, the console API on Windows 10+).
 
 ### Windows (MSVC)
 
@@ -236,12 +237,13 @@ project builds on a box with a compiler but no `make`/`ninja`.
 ### `rokktui` — interactive pattern search
 
 ```sh
-build/rokktui              # or: build/rokktui --load pattern.txt
+build/rokktui              # or: build/rokktui --load pattern.txt --backend opencl:0 --checkpoint run.ckpt
 ```
 
 HOW TO USE ROKKTUI
 
-1. **Parameters screen.** Up/Down (or Tab) to move between fields, type to edit.
+1. **Parameters screen.** Up/Down (or Tab) to move between fields, Home/End to jump to the
+   first/last, type to edit, `Del` clears a text field.
    - `seed` — numeric (may be negative), or any text string (hashed the way Minecraft
      hashes non-numeric seeds).
    - `width` / `height` — the size of the bedrock pattern you're going to enter, up to
@@ -249,11 +251,19 @@ HOW TO USE ROKKTUI
    - `Y layer` — which bedrock layer the pattern is on, `-64 … -59` (Left/Right). `-60` is
      the default and the most useful — it has the most detail per cell. The screen shows
      `P(bedrock)` for the chosen layer and warns if you pick `-64` (solid) or `-59` (empty).
-   -center X / center Z and radius — defines the square area to search around the center point. 
-    The radius controls how far the search extends in each direction.
+   - `center X` / `center Z` and `radius` — the square area to search around the center
+     point. The radius controls how far the search extends in each direction.
+   - `backend` — Left/Right cycles `auto` and every device this build can use (CPU, each
+     OpenCL GPU).
+   - `checkpoint file` — optional. Progress (and matches found so far) is saved there every
+     few seconds and when the run ends or is cancelled; running the same search again with
+     the same file resumes where it left off. A file written for a different search is
+     ignored.
    - `Enter` opens the pattern editor.
 
-2. **Pattern editor.** A grid of the size you chose. Arrow keys / `hjkl` move the cursor.
+2. **Pattern editor.** A grid of the size you chose. Arrow keys / `hjkl` move the cursor;
+   Home/End jump to the row's ends, PgUp/PgDn to the column's. If the window is too small
+   for the grid, it scrolls to follow the cursor.
    - `space` cycles a cell: unknown → **bedrock** (`#`) → **not-bedrock** (`o`) → unknown.
      (`1` / `0` / `.` set them directly.)
    - Unknown cells are wildcards — not checked.
@@ -267,11 +277,14 @@ HOW TO USE ROKKTUI
    drawn.
 
 3. **Results screen.** Live progress bar + rate while the job runs (`c` cancels); then
-   every match `(x, z)` — a block near the middle of the pattern — with the orientation
-   bitmask. `S` saves the list.
+   every match `(x, z)` — the pattern's anchor cell, a block near its middle — with the
+   orientations that matched. Up/Down/PgUp/PgDn/Home/End scroll. `S` saves the list in
+   the same `x z orient_mask` format `rokksearch` prints (plus one `#` header line).
 
-The search runs in this process. `--backend opencl:0` picks the GPU (`auto` is the
-default and prefers a GPU if present). `q` quits.
+The search runs in this process. `--backend opencl:0` picks the GPU at startup (`auto` is
+the default and prefers a GPU if present). `q` quits (outside text fields). The screen
+redraws only what changed and follows terminal resizes. On Windows it needs Windows 10 or
+later (Windows Terminal or the classic console).
 
 ### `rokksearch` — headless search
 
@@ -439,6 +452,8 @@ As expected, the speedup vs in-engine usage is drastically increased.
   orientations) and proven independent of tile size (`test_search`).
 - **The GPU kernel** is diffed byte-for-byte against the CPU and checked for CPU/GPU search
   parity (`test_gpu`, needs a device).
+- **The TUI's logic** (pattern ↔ file, request building, a fill-from-world → search round
+  trip, the matches file format, the screen diff) is tested without a terminal (`test_tui`).
 
 
 ---

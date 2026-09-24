@@ -40,10 +40,12 @@ fi
 CORE=(src/gen/bedrock.cpp "${SVC[@]}")
 
 "$CXX" "${FLAGS[@]}" tools/dump_bedrock.cpp src/gen/bedrock.cpp -o build/dump_bedrock
-"$CXX" "${FLAGS[@]}" tools/rokktui.cpp    "${CORE[@]}" "${LINK[@]}" -o build/rokktui
+TUI=(tools/tui/model.cpp tools/tui/frame.cpp tools/tui/screens.cpp)
+"$CXX" "${FLAGS[@]}" -Itools tools/rokktui.cpp tools/tui/term_posix.cpp "${TUI[@]}" "${CORE[@]}" "${LINK[@]}" -o build/rokktui
 "$CXX" "${FLAGS[@]}" tools/rokksearch.cpp "${CORE[@]}" "${LINK[@]}" -o build/rokksearch
 "$CXX" "${FLAGS[@]}" tests/test_bedrock.cpp src/gen/bedrock.cpp -o build/test_bedrock
 "$CXX" "${FLAGS[@]}" tests/test_search.cpp "${CORE[@]}" "${LINK[@]}" -o build/test_search
+"$CXX" "${FLAGS[@]}" -Itools tests/test_tui.cpp "${TUI[@]}" "${CORE[@]}" "${LINK[@]}" -o build/test_tui
 if [[ -n "$GPU_TEST" ]]; then
   "$CXX" "${FLAGS[@]}" tests/test_gpu.cpp "${CORE[@]}" "${LINK[@]}" -o build/test_gpu
 fi
@@ -53,6 +55,7 @@ echo "built: build/{dump_bedrock,rokktui,rokksearch,test_*}"
 if [[ "${1:-}" == "test" ]]; then
   ./build/test_bedrock
   ./build/test_search
+  ./build/test_tui
   [[ -n "$GPU_TEST" ]] && ./build/test_gpu
   python3 tests/diff_test.py ./build/dump_bedrock
 fi

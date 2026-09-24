@@ -70,11 +70,21 @@ target_link_libraries(dump_bedrock PRIVATE rokkdoxx_gen)
 add_executable(rokksearch tools/rokksearch.cpp)
 target_link_libraries(rokksearch PRIVATE rokksvc)
 
-# rokktui uses a POSIX raw-terminal backend (<termios.h>); no Windows build yet.
-if(NOT WIN32)
-  add_executable(rokktui tools/rokktui.cpp)
-  target_link_libraries(rokktui PRIVATE rokksvc)
+# rokktui: everything but the terminal backend is shared; the build picks
+# term_win.cpp (Windows console API) or term_posix.cpp (termios).
+add_library(rokktui_core STATIC
+  tools/tui/model.cpp
+  tools/tui/frame.cpp
+  tools/tui/screens.cpp)
+target_include_directories(rokktui_core PUBLIC tools)
+target_link_libraries(rokktui_core PUBLIC rokksvc)
+if(WIN32)
+  set(ROKKTUI_TERM tools/tui/term_win.cpp)
+else()
+  set(ROKKTUI_TERM tools/tui/term_posix.cpp)
 endif()
+add_executable(rokktui tools/rokktui.cpp ${ROKKTUI_TERM})
+target_link_libraries(rokktui PRIVATE rokktui_core)
 
 # --- tests -------------------------------------------------------------
 enable_testing()
@@ -86,6 +96,10 @@ add_test(NAME unit COMMAND test_bedrock)
 add_executable(test_search tests/test_search.cpp)
 target_link_libraries(test_search PRIVATE rokksvc)
 add_test(NAME search COMMAND test_search)
+
+add_executable(test_tui tests/test_tui.cpp)
+target_link_libraries(test_tui PRIVATE rokktui_core)
+add_test(NAME tui COMMAND test_tui)
 
 if(ROKK_HAVE_OPENCL)
   add_executable(test_gpu tests/test_gpu.cpp)
