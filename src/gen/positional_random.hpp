@@ -27,12 +27,6 @@ struct PositionalRandom {
         return PositionalRandom{a, b};
     }
 
-    // PositionalRandomFactory.at(x, y, z): new Xoroshiro(getSeed ^ seedLo, seedHi).
-    Xoroshiro128PP at(int x, int y, int z) const noexcept {
-        const std::uint64_t h = static_cast<std::uint64_t>(rk_block_pos_seed(x, y, z));
-        return Xoroshiro128PP::from_raw(h ^ seed_lo, seed_hi);
-    }
-
     // Top 24 bits of the draw at (x, y, z) -- the value compared against the
     // bedrock threshold. Shares rk_bits24_at with the OpenCL kernel.
     std::uint32_t bits24_at(int x, int y, int z) const noexcept {

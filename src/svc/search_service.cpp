@@ -43,8 +43,9 @@ std::uint64_t request_fingerprint(const SearchRequest& req) {
     return h;
 }
 
-TileScheduler::TileScheduler(Region region, int tile_side, int max_tiles)
+TileScheduler::TileScheduler(Region region, int tile_side)
     : region_(region), tile_side_(tile_side < 1 ? 1 : tile_side) {
+    constexpr long long kMaxTiles = 2'000'000;
     const long long spanx = region_.x1 - region_.x0 + 1;
     const long long spanz = region_.z1 - region_.z0 + 1;
     // Grow the tile until nx*nz fits under the cap (or the tile is absurdly
@@ -52,7 +53,7 @@ TileScheduler::TileScheduler(Region region, int tile_side, int max_tiles)
     for (;;) {
         const long long gx = (spanx + tile_side_ - 1) / tile_side_;
         const long long gz = (spanz + tile_side_ - 1) / tile_side_;
-        if (gx * gz <= max_tiles || tile_side_ >= (1 << 26)) {
+        if (gx * gz <= kMaxTiles || tile_side_ >= (1 << 26)) {
             nx_ = static_cast<int>(gx < 1 ? 1 : gx);
             nz_ = static_cast<int>(gz < 1 ? 1 : gz);
             break;
@@ -79,7 +80,6 @@ Tile TileScheduler::tile_at(int index) const {
 }
 
 bool TileScheduler::next(Tile& out) {
-    std::lock_guard<std::mutex> lk(mu_);
     while (cursor_ < n_ && done_[static_cast<std::size_t>(cursor_)]) ++cursor_;
     if (cursor_ >= n_) return false;
     out = tile_at(cursor_);
@@ -88,7 +88,6 @@ bool TileScheduler::next(Tile& out) {
 }
 
 void TileScheduler::mark_done(const Tile& tile) {
-    std::lock_guard<std::mutex> lk(mu_);
     const int index = tile.index;
     if (index >= 0 && index < n_ && !done_[static_cast<std::size_t>(index)]) {
         done_[static_cast<std::size_t>(index)] = 1;
@@ -97,30 +96,15 @@ void TileScheduler::mark_done(const Tile& tile) {
     }
 }
 
-int TileScheduler::done_count() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return done_count_;
-}
-
-long long TileScheduler::candidates_done() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return candidates_done_;
-}
-
-// Checkpoint file format (one header line, one tile-progress line, and --
-// from version 2 on -- a matches section):
-//   rokkdoxx-checkpoint <version> <fingerprint>
+// Checkpoint file format:
+//   rokkdoxx-checkpoint 2 <fingerprint>
 //   done 0-15 17 40-1200 ...
-//   matches <count>              (version 2 only)
+//   matches <count>
 //   <x> <z> <orient_mask>        (repeated <count> times)
 // The done line is a run-length list of finished tile indices. The matches
 // section carries whatever ResultSink held at save time, so a resumed run
 // doesn't lose (or need to re-find) matches from tiles it's about to skip as
-// already-done. Version 1 files (written before matches were persisted)
-// still load -- out_matches is simply left empty for them. New saves always
-// write version 2; a version-1 *reader* (an older build) rejects a version-2
-// file outright via the version check below, rather than misinterpreting
-// the matches section as more tile ranges.
+// already-done. Any other version is rejected.
 bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t fingerprint,
                                     std::vector<Match>& out_matches) {
     out_matches.clear();
@@ -130,7 +114,7 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
     int version = 0;
     std::uint64_t fp = 0;
     f >> tag >> version >> fp;
-    if (tag != "rokkdoxx-checkpoint" || (version != 1 && version != 2) || fp != fingerprint)
+    if (tag != "rokkdoxx-checkpoint" || version != 2 || fp != fingerprint)
         return false;
 
     std::string line;
@@ -141,7 +125,6 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
         std::string kw;
         ls >> kw;
         if (kw != "done") return false;
-        std::lock_guard<std::mutex> lk(mu_);
         std::string tok;
         while (ls >> tok) {
             auto dash = tok.find('-');
@@ -162,7 +145,7 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
         }
     }
 
-    if (version >= 2 && std::getline(f, line)) {
+    if (std::getline(f, line)) {
         std::istringstream ms(line);
         std::string kw;
         long long count = 0;
@@ -181,7 +164,6 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
 
 void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t fingerprint,
                                     const std::vector<Match>& matches) const {
-    std::lock_guard<std::mutex> lk(mu_);
     std::ofstream f(path, std::ios::trunc);
     if (!f) return;
     f << "rokkdoxx-checkpoint 2 " << fingerprint << "\ndone";
@@ -207,7 +189,6 @@ void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t finge
 // ==========================================================================
 
 void ResultSink::add(const std::vector<Match>& tile_matches) {
-    std::lock_guard<std::mutex> lk(mu_);
     for (const Match& m : tile_matches) {
         // Same origin from another tile/orientation: merge the masks.
         auto [it, inserted] = by_pos_.try_emplace(key(m.x, m.z), m.orient_mask);
@@ -220,18 +201,7 @@ void ResultSink::add(const std::vector<Match>& tile_matches) {
     }
 }
 
-std::uint64_t ResultSink::count() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return by_pos_.size();
-}
-
-bool ResultSink::truncated() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return truncated_;
-}
-
 std::vector<Match> ResultSink::snapshot() const {
-    std::lock_guard<std::mutex> lk(mu_);
     std::vector<Match> out;
     out.reserve(by_pos_.size());
     for (const auto& [k, mask] : by_pos_) {
@@ -379,15 +349,13 @@ void SearchService::run(Job* job) noexcept {
 
         // The pump: tiles are handed to the worker until the region is
         // covered or the job is cancelled. Status is refreshed after every
-        // completed tile so a poller sees live progress. A worker that
-        // supports async pipelining (OpenclWorker) gets up to two tiles in
-        // flight -- begin_tile()/end_tile() let its dispatch for tile N
-        // overlap read-back for tile N-1, instead of run_tile()'s strict
-        // dispatch-then-block-then-next.
+        // completed tile so a poller sees live progress. Up to two tiles are
+        // in flight, so OpenclWorker's dispatch for tile N overlaps its
+        // read-back for tile N-1 (other workers run each tile in begin_tile()).
         auto last_ckpt = clock::now();
 
         // Bookkeeping for one *completed* tile -- called at drain time, which
-        // for the pipelined path lags dispatch order by up to one tile. That
+        // lags dispatch order by up to one tile. That
         // lag is fine: TileScheduler::mark_done/ResultSink::add are already
         // idempotent/order-independent, and progress stays monotonic.
         auto on_tile_done = [&](const Tile& done, const std::vector<Match>& m) {
@@ -417,36 +385,27 @@ void SearchService::run(Job* job) noexcept {
             }
         };
 
-        if (worker->supports_pipelining()) {
-            constexpr int kDepth = 2;
-            std::deque<Tile> inflight;
-            Tile t;
-            bool more = true;
-            while (true) {
-                // Admit new tiles up to the pipeline depth. Cancellation only
-                // stops *new* admissions -- anything already begun always
-                // gets drained below, so the loop never exits with GPU work
-                // still outstanding.
-                while (more && !job->cancel.load() && static_cast<int>(inflight.size()) < kDepth) {
-                    if (!sched.next(t)) {
-                        more = false;
-                        break;
-                    }
-                    worker->begin_tile(t);
-                    inflight.push_back(t);
+        constexpr int kDepth = 2;
+        std::deque<Tile> inflight;
+        Tile t;
+        bool more = true;
+        while (true) {
+            // Admit new tiles up to the pipeline depth. Cancellation only
+            // stops *new* admissions -- anything already begun always gets
+            // drained below, so the loop never exits with GPU work still
+            // outstanding.
+            while (more && !job->cancel.load() && static_cast<int>(inflight.size()) < kDepth) {
+                if (!sched.next(t)) {
+                    more = false;
+                    break;
                 }
-                if (inflight.empty()) break;
-                std::vector<Match> m = worker->end_tile();
-                Tile done = inflight.front();
-                inflight.pop_front();
-                on_tile_done(done, m);
+                worker->begin_tile(t);
+                inflight.push_back(t);
             }
-        } else {
-            Tile tile;
-            while (!job->cancel.load() && sched.next(tile)) {
-                std::vector<Match> m = worker->run_tile(tile);
-                on_tile_done(tile, m);
-            }
+            if (inflight.empty()) break;
+            std::vector<Match> m = worker->end_tile();
+            on_tile_done(inflight.front(), m);
+            inflight.pop_front();
         }
 
         std::vector<Match> final_matches = sink.snapshot();

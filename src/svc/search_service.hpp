@@ -25,12 +25,14 @@
 namespace rokkdoxx::svc {
 
 // --- TileScheduler ---------------------------------------------------------
+// TileScheduler and ResultSink are not thread-safe: each is owned by one job's
+// pump thread (ponytail: add a lock if a multi-threaded pump ever lands).
 
 class TileScheduler {
 public:
     // `tile_side` is a floor. It is doubled until the tile count is manageable,
     // so the full 30M x 30M world border does not create billions of tiles.
-    TileScheduler(Region region, int tile_side, int max_tiles = 2'000'000);
+    TileScheduler(Region region, int tile_side);
 
     int tile_count() const { return n_; }
     int effective_tile_side() const { return tile_side_; }
@@ -40,16 +42,14 @@ public:
     bool next(Tile& out);
     void mark_done(const Tile& tile);
 
-    int done_count() const;
-    long long candidates_done() const;
+    int done_count() const { return done_count_; }
+    long long candidates_done() const { return candidates_done_; }
 
     // Checkpoint I/O. `fingerprint` guards against loading a checkpoint that
     // was written for a different request (see request_fingerprint).
     // `out_matches`/`matches` carry the matches found before the checkpoint
     // was written, so a resumed run doesn't lose or need to re-find them for
-    // tiles it's about to skip as already-done. A checkpoint written before
-    // this carried matches (version 1) still loads -- out_matches is simply
-    // left empty for it.
+    // tiles it's about to skip as already-done.
     bool load_checkpoint(const std::string& path, std::uint64_t fingerprint,
                          std::vector<Match>& out_matches);
     void save_checkpoint(const std::string& path, std::uint64_t fingerprint,
@@ -65,7 +65,6 @@ private:
     int cursor_ = 0;
     int done_count_ = 0;
     long long candidates_done_ = 0;
-    mutable std::mutex mu_;
 };
 
 // Stable hash of the parts of a request that must match for a checkpoint to
@@ -80,8 +79,8 @@ public:
 
     void add(const std::vector<Match>& tile_matches);
 
-    std::uint64_t count() const;
-    bool truncated() const;
+    std::uint64_t count() const { return by_pos_.size(); }
+    bool truncated() const { return truncated_; }
 
     // Deduplicated, sorted by (z, then x).
     std::vector<Match> snapshot() const;
@@ -92,7 +91,6 @@ private:
         return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
                static_cast<std::uint32_t>(z);
     }
-    mutable std::mutex mu_;
     std::unordered_map<std::uint64_t, std::uint8_t> by_pos_;  // key -> OR of orient masks
     std::uint32_t cap_;
     bool truncated_ = false;

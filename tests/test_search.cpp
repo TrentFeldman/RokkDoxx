@@ -211,17 +211,6 @@ void test_scheduler_checkpoint() {
     std::vector<Match> ignored;
     check(!s3.load_checkpoint(path, fp ^ 1, ignored), "checkpoint rejected on fingerprint mismatch");
 
-    // A version-1 file (written before matches were persisted) still loads --
-    // just with no matches to restore, not a failure.
-    {
-        std::ofstream old(path, std::ios::trunc);
-        old << "rokkdoxx-checkpoint 1 " << fp << "\ndone 0-" << (marked - 1) << "\n";
-    }
-    TileScheduler s4(req.region, req.tile_side);
-    std::vector<Match> none;
-    check(s4.load_checkpoint(path, fp, none), "version-1 checkpoint (no matches section) still loads");
-    check(none.empty(), "version-1 checkpoint restores zero matches, not a failure");
-
     std::remove(path.c_str());
 }
 

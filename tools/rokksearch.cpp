@@ -112,33 +112,27 @@ inline Pattern symmetric_pattern() {
 }
 
 // One timed sweep of `region` through an already-configured worker. Mirrors
-// SearchService::run()'s pump loop: a pipelining-capable worker (OpenclWorker)
-// gets two tiles in flight so the benchmark actually measures the overlapped
-// path it ships with, rather than silently falling back to run_tile()'s
-// strictly-synchronous per-tile dispatch.
+// SearchService::run()'s pump loop (two tiles in flight) so the benchmark
+// measures the overlapped path the service ships with.
 inline double sweep(Worker& w, const Region& region, int tile_side) {
     TileScheduler sched(region, tile_side);
     Tile t;
     const auto t0 = std::chrono::steady_clock::now();
-    if (w.supports_pipelining()) {
-        constexpr int kDepth = 2;
-        int inflight = 0;
-        bool more = true;
-        while (true) {
-            while (more && inflight < kDepth) {
-                if (!sched.next(t)) {
-                    more = false;
-                    break;
-                }
-                w.begin_tile(t);
-                ++inflight;
+    constexpr int kDepth = 2;
+    int inflight = 0;
+    bool more = true;
+    while (true) {
+        while (more && inflight < kDepth) {
+            if (!sched.next(t)) {
+                more = false;
+                break;
             }
-            if (inflight == 0) break;
-            (void)w.end_tile();
-            --inflight;
+            w.begin_tile(t);
+            ++inflight;
         }
-    } else {
-        while (sched.next(t)) (void)w.run_tile(t);
+        if (inflight == 0) break;
+        (void)w.end_tile();
+        --inflight;
     }
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -262,27 +256,19 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
         std::fprintf(stderr, "no compute backend available\n");
         return 1;
     }
-    BackendInfo chosen = backends.front();
     const std::string want = backend_arg.empty() ? "auto" : backend_arg;
-    if (want == "auto") {
-        for (const auto& b : backends)
-            if (b.is_gpu) {
-                chosen = b;
-                break;
-            }
-    } else {
-        bool found = false;
-        for (const auto& b : backends)
-            if (b.id == want) {
-                chosen = b;
-                found = true;
-                break;
-            }
-        if (!found) {
+    auto it = want == "auto"
+                  ? std::find_if(backends.begin(), backends.end(), [](const auto& b) { return b.is_gpu; })
+                  : std::find_if(backends.begin(), backends.end(),
+                                 [&](const auto& b) { return b.id == want; });
+    if (it == backends.end()) {
+        if (want != "auto") {
             std::fprintf(stderr, "unknown backend: %s\n", want.c_str());
             return 2;
         }
+        it = backends.begin();  // auto with no GPU -> cpu
     }
+    const BackendInfo chosen = *it;
 
     std::unique_ptr<Worker> worker;
     try {
@@ -465,9 +451,7 @@ int main(int argc, char** argv) {
         if (!parse2(center_s, cx, cz, ',')) usage(2);
         long long r = radius_s ? std::atoll(radius_s) : 5000;
         req.region = Region::centered(cx, cz, r);
-    } else if (req.region.candidates() <= 1 && !pattern_path.empty()) {
-        // region came from the file
-    } else if (!region_s && !center_s && pattern_path.empty()) {
+    } else if (pattern_path.empty()) {  // otherwise the region came from the file
         std::fprintf(stderr, "need --center/--radius or --region (or a --pattern file that has them)\n");
         return 2;
     }

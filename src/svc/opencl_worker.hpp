@@ -13,9 +13,7 @@ namespace rokkdoxx::svc {
 
 struct OpenclDevice {
     int index = 0;  // position in the flattened platform x device list
-    std::string label;
-    std::string platform;
-    std::string device;
+    std::string label;  // "<platform> / <device>"
     std::string cl_version;      // CL_DEVICE_VERSION, e.g. "OpenCL 2.0 AMD-APP..."
     std::string driver_version;  // CL_DRIVER_VERSION
     int compute_units = 0;       // CL_DEVICE_MAX_COMPUTE_UNITS
@@ -39,10 +37,8 @@ public:
     // whichever slot end_tile() last drained, so tile N's kernel can run
     // while tile N-1's read-back (or host-side result processing) is still
     // in flight -- hides the fixed ~1-3ms per-tile dispatch/read-back cost.
-    bool supports_pipelining() const override { return true; }
     void begin_tile(const Tile& tile) override;
     std::vector<Match> end_tile() override;
-    int pending_tiles() const override;
 
     // Direct plane dump for the bit-exactness test (row-major w*h, 1 = bedrock).
     std::vector<std::uint8_t> dump_plane(std::uint64_t derived_lo, std::uint64_t derived_hi,

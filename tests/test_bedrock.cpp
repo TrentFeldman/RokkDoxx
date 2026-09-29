@@ -12,7 +12,6 @@
 #include <vector>
 
 #include "gen/bedrock.hpp"
-#include "gen/md5.hpp"
 #include "gen/positional_random.hpp"
 #include "gen/xoroshiro128pp.hpp"
 
@@ -43,29 +42,7 @@ void expect_i64(std::int64_t got, std::int64_t want, const std::string& what) {
     }
 }
 
-std::string hex16(const std::array<std::uint8_t, 16>& d) {
-    static const char* k = "0123456789abcdef";
-    std::string s;
-    for (std::uint8_t b : d) {
-        s.push_back(k[b >> 4]);
-        s.push_back(k[b & 0xF]);
-    }
-    return s;
-}
-
 // ---------------------------------------------------------------------------
-
-void test_md5() {
-    std::printf("test_md5\n");
-    check(hex16(rokkdoxx::md5("")) == "d41d8cd98f00b204e9800998ecf8427e", "md5 empty");
-    check(hex16(rokkdoxx::md5("abc")) == "900150983cd24fb0d6963f7d28e17f72", "md5 abc");
-    check(hex16(rokkdoxx::md5("The quick brown fox jumps over the lazy dog")) ==
-              "9e107d9d372bb6826bd81d3542a419d6",
-          "md5 fox");
-    check(hex16(rokkdoxx::md5("minecraft:bedrock_floor")) ==
-              "bbf7928b7bf1d285c4dc7cf90e1b3b94",
-          "md5 minecraft:bedrock_floor");
-}
 
 void test_seed_upgrade() {
     std::printf("test_seed_upgrade\n");
@@ -222,7 +199,6 @@ void test_counts_reference() {
 }  // namespace
 
 int main() {
-    test_md5();
     test_seed_upgrade();
     test_next_long();
     test_next_float();

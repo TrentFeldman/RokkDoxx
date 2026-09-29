@@ -17,8 +17,6 @@ namespace rokkdoxx {
 inline constexpr std::uint64_t kSilverRatio64 = RK_SILVER_RATIO_64;
 inline constexpr std::uint64_t kGoldenRatio64 = RK_GOLDEN_RATIO_64;
 
-inline std::uint64_t mix_stafford13(std::uint64_t z) noexcept { return rk_mix_stafford13(z); }
-
 struct Xoroshiro128PP {
     std::uint64_t lo;
     std::uint64_t hi;

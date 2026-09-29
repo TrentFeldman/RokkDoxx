@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 
 #include "gen/bedrock.hpp"
@@ -8,13 +9,8 @@
 namespace rokkdoxx::tui {
 
 bool parse_i64(const std::string& s, long long& out) {
-    try {
-        std::size_t pos = 0;
-        out = std::stoll(s, &pos);
-        return pos == s.size();
-    } catch (...) {
-        return false;
-    }
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+    return ec == std::errc{} && end == s.data() + s.size();
 }
 
 svc::PatternFile model_to_file(const Model& m) {

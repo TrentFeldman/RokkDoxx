@@ -11,7 +11,9 @@
 #pragma once
 
 #include <array>
+#include <charconv>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -208,16 +210,20 @@ public:
     // smaller tiles so progress and cancellation stay responsive.
     virtual int preferred_tile_side() const { return 0; }
 
-    // Optional async pipelining: a worker that can overlap on-device dispatch
-    // for one tile with host read-back of another advertises this and
-    // implements begin_tile/end_tile; everyone else inherits these no-op
-    // defaults and callers just keep using run_tile(). begin_tile() enqueues
-    // `tile` without blocking; end_tile() blocks for and returns the matches
-    // of the OLDEST not-yet-collected begin_tile() call (strict FIFO pairing).
-    virtual bool supports_pipelining() const { return false; }
-    virtual void begin_tile(const Tile& /*tile*/) {}
-    virtual std::vector<Match> end_tile() { return {}; }
-    virtual int pending_tiles() const { return 0; }
+    // Pipelined dispatch -- what the pump calls. begin_tile() enqueues `tile`;
+    // end_tile() blocks for and returns the matches of the OLDEST
+    // not-yet-collected begin_tile() call (strict FIFO pairing). The default
+    // just runs the tile synchronously in begin_tile(); a worker that can
+    // overlap on-device dispatch with read-back (OpenclWorker) overrides both.
+    virtual void begin_tile(const Tile& tile) { queued_.push_back(run_tile(tile)); }
+    virtual std::vector<Match> end_tile() {
+        std::vector<Match> m = std::move(queued_.front());
+        queued_.pop_front();
+        return m;
+    }
+
+private:
+    std::deque<std::vector<Match>> queued_;
 };
 
 using WorkerFactory = std::function<std::unique_ptr<Worker>()>;
@@ -230,21 +236,9 @@ using WorkerFactory = std::function<std::unique_ptr<Worker>()>;
 // sign-extended to 64 bits -- which is what the vanilla client does with a
 // non-numeric seed.
 inline std::int64_t seed_from_string(std::string_view s) {
-    if (!s.empty()) {
-        std::size_t i = (s[0] == '-') ? 1 : 0;
-        bool numeric = i < s.size();
-        for (; i < s.size(); ++i)
-            if (s[i] < '0' || s[i] > '9') {
-                numeric = false;
-                break;
-            }
-        if (numeric) {
-            try {
-                return static_cast<std::int64_t>(std::stoll(std::string(s)));
-            } catch (...) {
-            }
-        }
-    }
+    std::int64_t v = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec == std::errc{} && end == s.data() + s.size()) return v;
     std::int32_t h = 0;
     for (unsigned char c : s) h = static_cast<std::int32_t>(31u * static_cast<std::uint32_t>(h) + c);
     return static_cast<std::int64_t>(h);

@@ -1,9 +1,5 @@
 #include "bedrock.hpp"
 
-#include <array>
-#include <string_view>
-
-#include "md5.hpp"
 #include "xoroshiro128pp.hpp"
 
 namespace rokkdoxx {
@@ -23,9 +19,10 @@ PositionalRandom make_floor_factory(std::uint64_t world_seed) {
     Xoroshiro128PP world = Xoroshiro128PP::from_seed(world_seed);
     const PositionalRandom d0 = PositionalRandom::fork(world);
 
-    const std::array<std::uint8_t, 16> h = md5(std::string_view("minecraft:bedrock_floor"));
-    const std::uint64_t hlo = be_u64(h.data());
-    const std::uint64_t hhi = be_u64(h.data() + 8);
+    // md5("minecraft:bedrock_floor") as two big-endian longs -- a constant, so
+    // it's baked in (tests/reference/bedrock_ref.py recomputes it via hashlib).
+    constexpr std::uint64_t hlo = 0xbbf7928b7bf1d285ULL;
+    constexpr std::uint64_t hhi = 0xc4dc7cf90e1b3b94ULL;
 
     Xoroshiro128PP r1 = Xoroshiro128PP::from_raw(hlo ^ d0.seed_lo, hhi ^ d0.seed_hi);
     return PositionalRandom::fork(r1);

@@ -15,10 +15,9 @@
 // covering its tile chunk plus a halo, then reads that instead of
 // recomputing -- used only when the halo fits the device's local memory
 // budget; see the use_cache computation in configure() and the comment atop
-// search_tile_cached in search_tile.cl). run_tile() drives either kernel
-// fully synchronously (used by callers that don't pipeline); begin_tile()/
-// end_tile() ping-pong two buffer/queue slots so one tile's dispatch can
-// overlap another's read-back (see Worker::supports_pipelining).
+// search_tile_cached in search_tile.cl). begin_tile()/end_tile() ping-pong
+// two buffer/queue slots so one tile's dispatch can overlap another's
+// read-back; run_tile() is the fully synchronous single-slot form.
 #include "opencl_worker.hpp"
 
 #include <algorithm>
@@ -106,10 +105,6 @@ std::vector<OpenclDevice> opencl_list_devices() {
             d.index = static_cast<int>(i);
             d.label = labels[i];
             try {
-                d.device = devs[i].getInfo<CL_DEVICE_NAME>();
-            } catch (...) {
-            }
-            try {
                 d.cl_version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
             } catch (...) {
             }
@@ -165,7 +160,6 @@ struct OpenclWorker::Impl {
 
     int next_begin = 0;  // slot the next begin_tile() dispatches into
     int next_end = 0;    // slot the next end_tile() drains
-    int inflight = 0;    // tiles begun but not yet ended
 
     // Local-memory tile cache (Step 10b), computed fresh in configure() for
     // the current pattern: whether the halo fits the device's local memory
@@ -260,7 +254,6 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     }
     impl_->next_begin = 0;
     impl_->next_end = 0;
-    impl_->inflight = 0;
 
     // Local-memory tile cache (Step 10b): the halo is the pattern's
     // world-space bounding box relative to the anchor -- how far the fill
@@ -287,33 +280,19 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
         min_dz = std::min<std::int64_t>(min_dz, v);
         max_dz = std::max<std::int64_t>(max_dz, v);
     }
-    const std::int64_t halo_w64 = std::max<std::int64_t>(max_dx, -min_dx);
-    const std::int64_t halo_h64 = std::max<std::int64_t>(max_dz, -min_dz);
-
-    // Sanity cap well beyond any real pattern, just to avoid doing further
-    // arithmetic on a pathological value before the budget check below would
-    // reject it anyway.
-    constexpr std::int64_t kHaloSanityLimit = 20000;
-    if (halo_w64 <= kHaloSanityLimit && halo_h64 <= kHaloSanityLimit) {
-        const std::size_t cache_w =
-            static_cast<std::size_t>(Impl::kGroupW) + 2 * static_cast<std::size_t>(halo_w64);
-        const std::size_t cache_h =
-            static_cast<std::size_t>(Impl::kGroupH) + 2 * static_cast<std::size_t>(halo_h64);
-        const std::size_t cache_bytes = cache_w * cache_h;  // 1 uchar per cell
-        // Cap at a conservative fraction of a conservative local-memory
-        // figure -- leaves headroom for driver/runtime-side local
-        // allocations this code doesn't control, and never assumes more
-        // than 32KB even on a device that reports more.
-        const std::size_t budget = std::min<std::size_t>(impl_->local_mem_size, 32 * 1024) * 3 / 4;
-        impl_->use_cache = impl_->n_variants > 1 && cache_bytes > 0 && cache_bytes <= budget;
-        impl_->halo_w = static_cast<int>(halo_w64);
-        impl_->halo_h = static_cast<int>(halo_h64);
-        impl_->cache_bytes = cache_bytes;
-    } else {
-        impl_->use_cache = false;
-        impl_->halo_w = impl_->halo_h = 0;
-        impl_->cache_bytes = 0;
-    }
+    const std::int64_t halo_w = std::max(max_dx, -min_dx);
+    const std::int64_t halo_h = std::max(max_dz, -min_dz);
+    // 1 uchar per cell.
+    const std::int64_t cache_bytes = (Impl::kGroupW + 2 * halo_w) * (Impl::kGroupH + 2 * halo_h);
+    // Cap at a conservative fraction of a conservative local-memory figure --
+    // leaves headroom for driver/runtime-side local allocations this code
+    // doesn't control, and never assumes more than 32KB even on a device that
+    // reports more.
+    const std::size_t budget = std::min<std::size_t>(impl_->local_mem_size, 32 * 1024) * 3 / 4;
+    impl_->use_cache = impl_->n_variants > 1 && cache_bytes <= static_cast<std::int64_t>(budget);
+    impl_->halo_w = static_cast<int>(halo_w);
+    impl_->halo_h = static_cast<int>(halo_h);
+    impl_->cache_bytes = static_cast<std::size_t>(cache_bytes);
 }
 
 // Zero the counter and launch the kernel into `slot`, non-blocking. Setting
@@ -332,43 +311,8 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
     cl_uint zero = 0;
     impl_->queue[slot].enqueueWriteBuffer(impl_->buf_count[slot], CL_TRUE, 0, sizeof(cl_uint), &zero);
 
-    if (impl_->use_cache) {
-        cl::Kernel& k = impl_->k_search_cached;
-        cl_uint a = 0;
-        k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
-        k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
-        k.setArg(a++, static_cast<cl_int>(impl_->cfg.plane_y));
-        k.setArg(a++, static_cast<cl_uint>(impl_->cfg.threshold));
-        k.setArg(a++, static_cast<cl_int>(tile.x0));
-        k.setArg(a++, static_cast<cl_int>(tile.z0));
-        k.setArg(a++, static_cast<cl_int>(tile.w));
-        k.setArg(a++, static_cast<cl_int>(tile.h));
-        k.setArg(a++, static_cast<cl_int>(impl_->n_cells));
-        k.setArg(a++, static_cast<cl_int>(impl_->n_variants));
-        k.setArg(a++, impl_->buf_var_off);
-        k.setArg(a++, impl_->buf_want);
-        k.setArg(a++, impl_->buf_var_mask);
-        k.setArg(a++, static_cast<cl_uint>(impl_->cap));
-        k.setArg(a++, impl_->buf_count[slot]);
-        k.setArg(a++, impl_->buf_xz[slot]);
-        k.setArg(a++, impl_->buf_orient[slot]);
-        k.setArg(a++, static_cast<cl_int>(impl_->halo_w));
-        k.setArg(a++, static_cast<cl_int>(impl_->halo_h));
-        k.setArg(a++, cl::Local(impl_->cache_bytes));
-
-        // Global size must be a multiple of the local size -- pad tiles the
-        // scheduler clipped to the region edge; the kernel's own bounds
-        // check (folded into `anchor_ok`, applied after every barrier)
-        // makes the padding work-items harmless.
-        const std::size_t gw = round_up(static_cast<std::size_t>(tile.w), Impl::kGroupW);
-        const std::size_t gh = round_up(static_cast<std::size_t>(tile.h), Impl::kGroupH);
-        impl_->queue[slot].enqueueNDRangeKernel(
-            k, cl::NullRange, cl::NDRange(gw, gh),
-            cl::NDRange(static_cast<std::size_t>(Impl::kGroupW), static_cast<std::size_t>(Impl::kGroupH)));
-        return;
-    }
-
-    cl::Kernel& k = impl_->k_search;
+    const bool cached = impl_->use_cache;
+    cl::Kernel& k = cached ? impl_->k_search_cached : impl_->k_search;
     cl_uint a = 0;
     k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
     k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
@@ -388,10 +332,27 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
     k.setArg(a++, impl_->buf_xz[slot]);
     k.setArg(a++, impl_->buf_orient[slot]);
 
-    impl_->queue[slot].enqueueNDRangeKernel(k, cl::NullRange,
-                                            cl::NDRange(static_cast<std::size_t>(tile.w),
-                                                        static_cast<std::size_t>(tile.h)),
-                                            cl::NullRange);
+    if (!cached) {
+        impl_->queue[slot].enqueueNDRangeKernel(k, cl::NullRange,
+                                                cl::NDRange(static_cast<std::size_t>(tile.w),
+                                                            static_cast<std::size_t>(tile.h)),
+                                                cl::NullRange);
+        return;
+    }
+
+    k.setArg(a++, static_cast<cl_int>(impl_->halo_w));
+    k.setArg(a++, static_cast<cl_int>(impl_->halo_h));
+    k.setArg(a++, cl::Local(impl_->cache_bytes));
+
+    // Global size must be a multiple of the local size -- pad tiles the
+    // scheduler clipped to the region edge; the kernel's own bounds check
+    // (folded into `anchor_ok`, applied after every barrier) makes the
+    // padding work-items harmless.
+    const std::size_t gw = round_up(static_cast<std::size_t>(tile.w), Impl::kGroupW);
+    const std::size_t gh = round_up(static_cast<std::size_t>(tile.h), Impl::kGroupH);
+    impl_->queue[slot].enqueueNDRangeKernel(
+        k, cl::NullRange, cl::NDRange(gw, gh),
+        cl::NDRange(static_cast<std::size_t>(Impl::kGroupW), static_cast<std::size_t>(Impl::kGroupH)));
 }
 
 // Blocking read-back of whatever `slot`'s kernel found. The blocking
@@ -420,11 +381,9 @@ std::vector<Match> OpenclWorker::read_results(int slot) {
 }
 
 std::vector<Match> OpenclWorker::run_tile(const Tile& tile) {
-    // Fully synchronous single-slot path: used by the benchmark's warm-up
-    // sweeps and any non-pipelined caller. The blocking read in
-    // read_results() waits for this slot's write+kernel too (in-order
-    // queue), so this behaves exactly as it did before begin_tile/end_tile
-    // existed.
+    // Fully synchronous single-slot path (the pump uses begin/end_tile). The
+    // blocking read in read_results() waits for this slot's write+kernel too
+    // (in-order queue).
     enqueue_search(0, tile);
     return read_results(0);
 }
@@ -434,18 +393,14 @@ void OpenclWorker::begin_tile(const Tile& tile) {
     enqueue_search(s, tile);
     impl_->queue[s].flush();  // push to the device now; don't wait for a later blocking call
     impl_->next_begin = (s + 1) % Impl::kSlots;
-    ++impl_->inflight;
 }
 
 std::vector<Match> OpenclWorker::end_tile() {
     const int s = impl_->next_end;
     std::vector<Match> out = read_results(s);
     impl_->next_end = (s + 1) % Impl::kSlots;
-    --impl_->inflight;
     return out;
 }
-
-int OpenclWorker::pending_tiles() const { return impl_->inflight; }
 
 std::vector<std::uint8_t> OpenclWorker::dump_plane(std::uint64_t dlo, std::uint64_t dhi, int plane_y,
                                                   std::uint32_t threshold, int x0, int z0, int w,

@@ -103,13 +103,6 @@ RK_INLINE rk_u32 rk_bits24_at(rk_u64 derived_lo, rk_u64 derived_hi, rk_i32 x, rk
     return (rk_u32)(n >> 40);
 }
 
-/* Bedrock test on a single plane: 1 if bedrock, 0 otherwise.
- * `threshold` is precomputed by the host for this y (see rk_floor_threshold). */
-RK_INLINE int rk_is_bedrock_floor(rk_u64 derived_lo, rk_u64 derived_hi, rk_i32 x, rk_i32 y,
-                                  rk_i32 z, rk_u32 threshold) {
-    return rk_bits24_at(derived_lo, derived_hi, x, y, z) < threshold ? 1 : 0;
-}
-
 #if !defined(__OPENCL_VERSION__)
 #include <math.h>
 /* Integer cutoff for a given bedrock-floor y. `bits < threshold` == bedrock.

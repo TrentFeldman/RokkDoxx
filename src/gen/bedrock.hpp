@@ -24,19 +24,10 @@ public:
     static constexpr int kFloorMinY = -64;
     static constexpr int kFloorMaxY = -59;
 
-    // Default sampling plane for the M(x, z) plane function: the highest y with
-    // non-trivial variation (P(bedrock) = 0.2).
-    static constexpr int kDefaultPlaneY = -60;
-
     explicit BedrockGenerator(std::int64_t world_seed);
 
     // True iff block (x, y, z) is bedrock in the Overworld bedrock floor.
     bool is_bedrock_floor(int x, int y, int z) const noexcept;
-
-    // M(x, z): bedrock presence on a single horizontal plane.
-    bool floor_plane(int x, int z, int y = kDefaultPlaneY) const noexcept {
-        return is_bedrock_floor(x, y, z);
-    }
 
     // Per-seed state the OpenCL search kernel needs: the forked positional
     // factory seeds for "minecraft:bedrock_floor". Everything else in the

@@ -369,7 +369,6 @@ gen.is_bedrock_floor(x=100, y=-61, z=-40)   # -> True / False
 
 rokkdoxx::BedrockGenerator gen(/*world_seed=*/12345);
 bool b = gen.is_bedrock_floor(100, -61, -40);
-bool m = gen.floor_plane(100, -40);          // M(x, z) on the default y = -60 plane
 
 // What the OpenCL kernel is handed: two per-seed constants + a per-plane cutoff.
 uint64_t lo = gen.derived_lo(), hi = gen.derived_hi();
