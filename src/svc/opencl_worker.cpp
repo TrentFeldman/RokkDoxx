@@ -1,23 +1,21 @@
-// Host side of the GPU search: pick a device, build the kernel(s), and drive
+// Host side of the GPU search: pick a device, build the kernels, and drive
 // tiles through them.
 //
 // The kernel text is bedrock_core.h concatenated with search_tile.cl and
 // compiled at runtime, so the GPU runs the exact same generation math as the
-// CPU. Per-tile work is: zero the match counter, set kernel arguments, launch
-// a 2D grid of (tile.w x tile.h) work-items, read back the match count and
-// then that many matches. OpenclWorker::preferred_tile_side() asks the
-// scheduler for large (16384-block) tiles to keep the fixed per-dispatch
-// cost a small fraction of each tile's compute time.
+// CPU. Per tile: zero the match counter; for each kChunk x kChunk piece run
+// fill_plane (draw every block of the piece plus the pattern's halo once, one
+// bit each) then match_plane (32 candidates per work-item, tested with word
+// ops); then read back the match count and that many matches. Drawing each
+// block once is what makes all 8 orientations nearly as cheap as one.
+// OpenclWorker::preferred_tile_side() asks the scheduler for large
+// (16384-block) tiles to keep the fixed per-dispatch cost small.
 //
-// Two search kernels, chosen per job in configure(): k_search (plain, every
-// work-item recomputes every cell it needs) and k_search_cached (a
-// work-group cooperatively fills a __local cache of generated bedrock bits
-// covering its tile chunk plus a halo, then reads that instead of
-// recomputing -- used only when the halo fits the device's local memory
-// budget; see the use_cache computation in configure() and the comment atop
-// search_tile_cached in search_tile.cl). begin_tile()/end_tile() ping-pong
-// two buffer/queue slots so one tile's dispatch can overlap another's
-// read-back; run_tile() is the fully synchronous single-slot form.
+// A pattern whose halo exceeds kPlaneHaloMax falls back to search_tile (every
+// work-item recomputes every cell it needs), so the plane buffer stays
+// bounded. begin_tile()/end_tile() ping-pong two buffer/queue slots so one
+// tile's dispatch can overlap another's read-back; run_tile() is the fully
+// synchronous single-slot form.
 #include "opencl_worker.hpp"
 
 #include <algorithm>
@@ -53,13 +51,10 @@ std::string kernel_source() {
     return std::string(kBedrockCoreSrc) + "\n\n" + kSearchTileSrc;
 }
 
-// The cached kernel needs an explicit local work-group size, but
-// TileScheduler clips edge tiles to the region boundary (see
-// TileScheduler::tile_at), so tile.w/tile.h aren't always multiples of the
-// group size. OpenCL requires global size to be evenly divisible by a
-// non-null local size, so the enqueued global size must be padded up --
-// the kernel's own bounds check (folded into `anchor_ok`, applied after
-// every barrier) is what makes the padding work-items harmless.
+// The plane kernels run with an explicit work-group size, but piece sizes are
+// arbitrary (TileScheduler clips edge tiles to the region), and OpenCL wants
+// the global size to be a multiple of a non-null local size -- so it is padded
+// up. Both kernels bounds-check, which makes the padding work-items harmless.
 std::size_t round_up(std::size_t v, std::size_t mult) { return ((v + mult - 1) / mult) * mult; }
 
 std::vector<cl::Device> flat_devices(std::vector<std::string>* labels = nullptr) {
@@ -129,22 +124,13 @@ struct OpenclWorker::Impl {
     // is still draining.
     static constexpr int kSlots = 2;
 
-    // Fixed work-group shape for the cached kernel: 256 threads divides
-    // evenly by both 32 (NVIDIA warps, AMD RDNA wavefronts) and 64 (AMD GCN
-    // wavefronts), so it degrades gracefully in occupancy rather than
-    // correctness on whatever wavefront size a given device actually has.
-    static constexpr int kGroupW = 16;
-    static constexpr int kGroupH = 16;
-
     cl::Device device;
     cl::Context ctx;
     cl::CommandQueue queue[kSlots];
     cl::Program program;
     cl::Kernel k_search;
-    cl::Kernel k_search_cached;
     cl::Kernel k_dump;
     std::string label;
-    std::size_t local_mem_size = 0;  // CL_DEVICE_LOCAL_MEM_SIZE, queried once
 
     WorkerConfig cfg;
     int n_cells = 1;
@@ -161,16 +147,17 @@ struct OpenclWorker::Impl {
     int next_begin = 0;  // slot the next begin_tile() dispatches into
     int next_end = 0;    // slot the next end_tile() drains
 
-    // Local-memory tile cache (Step 10b), computed fresh in configure() for
-    // the current pattern: whether the halo fits the device's local memory
-    // budget, and if so, the halo size and the local buffer size to pass to
-    // the cached kernel. use_cache == false means every dispatch falls back
-    // to the plain, unmodified k_search kernel -- a real code path, not a
-    // hypothetical, since pattern cell spacing is user-controlled and some
-    // patterns will legitimately need it.
-    bool use_cache = false;
+    // Bit-plane path (fill_plane + match_plane). A tile is processed in
+    // kChunk x kChunk pieces so the per-slot plane buffer has a fixed size
+    // (~34 MB at halo 31) whatever tile side the scheduler picked. A halo
+    // past kPlaneHaloMax -- a huge, sparse pattern -- uses k_search instead.
+    static constexpr int kChunk = 16384;
+    static constexpr int kPlaneHaloMax = 1024;
+    static constexpr int kLocalW = 64, kLocalH = 4;
+    cl::Kernel k_fill, k_match;
+    cl::Buffer buf_plane[kSlots];
+    bool use_plane = false;
     int halo_w = 0, halo_h = 0;
-    std::size_t cache_bytes = 0;
 };
 
 OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
@@ -197,12 +184,9 @@ OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
         throw std::runtime_error("OpenCL kernel build failed:\n" + log);
     }
     impl_->k_search = cl::Kernel(impl_->program, "search_tile");
-    impl_->k_search_cached = cl::Kernel(impl_->program, "search_tile_cached");
     impl_->k_dump = cl::Kernel(impl_->program, "dump_plane");
-
-    // Device-specific, not job-specific -- query once and reuse in every
-    // configure() call to size the local-memory cache budget.
-    impl_->local_mem_size = static_cast<std::size_t>(impl_->device.getInfo<CL_DEVICE_LOCAL_MEM_SIZE>());
+    impl_->k_fill = cl::Kernel(impl_->program, "fill_plane");
+    impl_->k_match = cl::Kernel(impl_->program, "match_plane");
 }
 
 OpenclWorker::~OpenclWorker() {
@@ -255,22 +239,9 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     impl_->next_begin = 0;
     impl_->next_end = 0;
 
-    // Local-memory tile cache (Step 10b): the halo is the pattern's
-    // world-space bounding box relative to the anchor -- how far the fill
-    // must reach beyond a work-group's own tile chunk. Pattern cell spacing
-    // is user-controlled, so this is computed fresh per job, not assumed.
-    //
-    // Measured on real hardware: the cached kernel's barriers/atomic_or cost
-    // real throughput on every dispatch, gate or no gate, because a
-    // barrier-synchronized work-group schedules less flexibly than fully
-    // independent work-items -- the any-survivor gate only skips the FILL,
-    // not that fixed sync tax. With n_variants == 1 there's no cross-variant
-    // redundancy for the cache to amortize that tax against (one variant
-    // means the post-anchor work is identical cached or not), and it showed
-    // as a real ~30% regression on both the exact and all-8-symmetric
-    // benchmark phases. With n_variants == 8 the same tax was paid back many
-    // times over (~2x on all-8). So: only use the cache when there's more
-    // than one variant to share halo cells across.
+    // The halo is the pattern's world-space reach from the anchor over every
+    // variant: how far fill_plane must draw beyond a piece's own candidates.
+    // Pattern cell spacing is user-controlled, so it is computed per job.
     std::int64_t min_dx = 0, max_dx = 0, min_dz = 0, max_dz = 0;  // anchor (0,0) always included
     for (std::int32_t v : plan.off_x) {
         min_dx = std::min<std::int64_t>(min_dx, v);
@@ -282,22 +253,20 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     }
     const std::int64_t halo_w = std::max(max_dx, -min_dx);
     const std::int64_t halo_h = std::max(max_dz, -min_dz);
-    // 1 uchar per cell.
-    const std::int64_t cache_bytes = (Impl::kGroupW + 2 * halo_w) * (Impl::kGroupH + 2 * halo_h);
-    // Cap at a conservative fraction of a conservative local-memory figure --
-    // leaves headroom for driver/runtime-side local allocations this code
-    // doesn't control, and never assumes more than 32KB even on a device that
-    // reports more.
-    const std::size_t budget = std::min<std::size_t>(impl_->local_mem_size, 32 * 1024) * 3 / 4;
-    impl_->use_cache = impl_->n_variants > 1 && cache_bytes <= static_cast<std::int64_t>(budget);
     impl_->halo_w = static_cast<int>(halo_w);
     impl_->halo_h = static_cast<int>(halo_h);
-    impl_->cache_bytes = static_cast<std::size_t>(cache_bytes);
+    impl_->use_plane = halo_w <= Impl::kPlaneHaloMax && halo_h <= Impl::kPlaneHaloMax;
+    if (impl_->use_plane) {
+        const std::size_t words = (Impl::kChunk + 2 * halo_w + 31) / 32 + 1;
+        const std::size_t rows = Impl::kChunk + 2 * halo_h;
+        for (int i = 0; i < Impl::kSlots; ++i)
+            impl_->buf_plane[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint));
+    }
 }
 
-// Zero the counter and launch the kernel into `slot`, non-blocking. Setting
+// Zero the counter and launch the kernel(s) into `slot`, non-blocking. Setting
 // kernel args and enqueueing happen back-to-back on this thread, so reusing
-// the single impl_->k_search object across slots is safe: OpenCL captures a
+// one cl::Kernel object across slots and pieces is safe: OpenCL captures a
 // kernel's argument values at enqueue time, not at execution time, so a later
 // setArg() (for the other slot) can never retroactively change a command
 // that's already been enqueued.
@@ -311,8 +280,59 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
     cl_uint zero = 0;
     impl_->queue[slot].enqueueWriteBuffer(impl_->buf_count[slot], CL_TRUE, 0, sizeof(cl_uint), &zero);
 
-    const bool cached = impl_->use_cache;
-    cl::Kernel& k = cached ? impl_->k_search_cached : impl_->k_search;
+    if (impl_->use_plane) {
+        const int hw = impl_->halo_w, hh = impl_->halo_h;
+        const cl::NDRange local(Impl::kLocalW, Impl::kLocalH);
+        for (int cz = 0; cz < tile.h; cz += Impl::kChunk)
+            for (int cx = 0; cx < tile.w; cx += Impl::kChunk) {
+                const std::int64_t x0 = tile.x0 + cx, z0 = tile.z0 + cz;
+                const int w = std::min(Impl::kChunk, tile.w - cx);
+                const int h = std::min(Impl::kChunk, tile.h - cz);
+                const int words_w = (w + 2 * hw + 31) / 32 + 1;
+                const int rows = h + 2 * hh;
+
+                cl::Kernel& f = impl_->k_fill;
+                cl_uint a = 0;
+                f.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
+                f.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
+                f.setArg(a++, static_cast<cl_int>(impl_->cfg.plane_y));
+                f.setArg(a++, static_cast<cl_uint>(impl_->cfg.threshold));
+                f.setArg(a++, static_cast<cl_int>(x0 - hw));
+                f.setArg(a++, static_cast<cl_int>(z0 - hh));
+                f.setArg(a++, static_cast<cl_int>(words_w));
+                f.setArg(a++, static_cast<cl_int>(rows));
+                f.setArg(a++, impl_->buf_plane[slot]);
+                impl_->queue[slot].enqueueNDRangeKernel(
+                    f, cl::NullRange,
+                    cl::NDRange(round_up(words_w, Impl::kLocalW), round_up(rows, Impl::kLocalH)), local);
+
+                cl::Kernel& m = impl_->k_match;
+                a = 0;
+                m.setArg(a++, static_cast<cl_int>(x0));
+                m.setArg(a++, static_cast<cl_int>(z0));
+                m.setArg(a++, static_cast<cl_int>(w));
+                m.setArg(a++, static_cast<cl_int>(h));
+                m.setArg(a++, static_cast<cl_int>(hw));
+                m.setArg(a++, static_cast<cl_int>(hh));
+                m.setArg(a++, static_cast<cl_int>(words_w));
+                m.setArg(a++, impl_->buf_plane[slot]);
+                m.setArg(a++, static_cast<cl_int>(impl_->n_cells));
+                m.setArg(a++, static_cast<cl_int>(impl_->n_variants));
+                m.setArg(a++, impl_->buf_var_off);
+                m.setArg(a++, impl_->buf_want);
+                m.setArg(a++, impl_->buf_var_mask);
+                m.setArg(a++, static_cast<cl_uint>(impl_->cap));
+                m.setArg(a++, impl_->buf_count[slot]);
+                m.setArg(a++, impl_->buf_xz[slot]);
+                m.setArg(a++, impl_->buf_orient[slot]);
+                impl_->queue[slot].enqueueNDRangeKernel(
+                    m, cl::NullRange,
+                    cl::NDRange(round_up((w + 31) / 32, Impl::kLocalW), round_up(h, Impl::kLocalH)), local);
+            }
+        return;
+    }
+
+    cl::Kernel& k = impl_->k_search;
     cl_uint a = 0;
     k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
     k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
@@ -331,28 +351,9 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
     k.setArg(a++, impl_->buf_count[slot]);
     k.setArg(a++, impl_->buf_xz[slot]);
     k.setArg(a++, impl_->buf_orient[slot]);
-
-    if (!cached) {
-        impl_->queue[slot].enqueueNDRangeKernel(k, cl::NullRange,
-                                                cl::NDRange(static_cast<std::size_t>(tile.w),
-                                                            static_cast<std::size_t>(tile.h)),
-                                                cl::NullRange);
-        return;
-    }
-
-    k.setArg(a++, static_cast<cl_int>(impl_->halo_w));
-    k.setArg(a++, static_cast<cl_int>(impl_->halo_h));
-    k.setArg(a++, cl::Local(impl_->cache_bytes));
-
-    // Global size must be a multiple of the local size -- pad tiles the
-    // scheduler clipped to the region edge; the kernel's own bounds check
-    // (folded into `anchor_ok`, applied after every barrier) makes the
-    // padding work-items harmless.
-    const std::size_t gw = round_up(static_cast<std::size_t>(tile.w), Impl::kGroupW);
-    const std::size_t gh = round_up(static_cast<std::size_t>(tile.h), Impl::kGroupH);
     impl_->queue[slot].enqueueNDRangeKernel(
-        k, cl::NullRange, cl::NDRange(gw, gh),
-        cl::NDRange(static_cast<std::size_t>(Impl::kGroupW), static_cast<std::size_t>(Impl::kGroupH)));
+        k, cl::NullRange,
+        cl::NDRange(static_cast<std::size_t>(tile.w), static_cast<std::size_t>(tile.h)), cl::NullRange);
 }
 
 // Blocking read-back of whatever `slot`'s kernel found. The blocking

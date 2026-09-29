@@ -90,47 +90,48 @@ void test_search_parity() {
         {42, -61, -48, 80, 5, 8, 400},
         {3257840388504953787LL, -60, 1200, -800, 7, 5, 350},
     };
-    for (const P& p : ps) {
-        rokkdoxx::BedrockGenerator gen(p.seed);
-        SearchRequest req;
-        req.seed = p.seed;
-        req.plane_y = p.y;
-        req.pattern.w = p.w;
-        req.pattern.h = p.h;
-        req.pattern.cells.assign(static_cast<std::size_t>(p.w) * p.h, Cell::unknown);
-        for (int j = 0; j < p.h; ++j)
-            for (int i = 0; i < p.w; ++i)
-                req.pattern.cells[static_cast<std::size_t>(j) * p.w + i] =
-                    gen.is_bedrock_floor(p.cx + i, p.y, p.cz + j) ? Cell::bedrock : Cell::not_bedrock;
-        req.region = Region::centered(p.cx + 1, p.cz + 1, p.radius);
-        req.all_orientations = true;
+    for (const P& p : ps)
+        for (bool all : {true, false}) {
+            rokkdoxx::BedrockGenerator gen(p.seed);
+            SearchRequest req;
+            req.seed = p.seed;
+            req.plane_y = p.y;
+            req.pattern.w = p.w;
+            req.pattern.h = p.h;
+            req.pattern.cells.assign(static_cast<std::size_t>(p.w) * p.h, Cell::unknown);
+            for (int j = 0; j < p.h; ++j)
+                for (int i = 0; i < p.w; ++i)
+                    req.pattern.cells[static_cast<std::size_t>(j) * p.w + i] =
+                        gen.is_bedrock_floor(p.cx + i, p.y, p.cz + j) ? Cell::bedrock : Cell::not_bedrock;
+            req.region = Region::centered(p.cx + 1, p.cz + 1, p.radius);
+            req.all_orientations = all;
+            const std::string tag = "seed " + std::to_string(p.seed) + (all ? " all-8" : " exact");
 
-        auto cpu = run(make_worker_factory("cpu"), req);
-        auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
-        check(cpu == gpu, "seed " + std::to_string(p.seed) + " parity (" + std::to_string(cpu.size()) +
-                              " cpu vs " + std::to_string(gpu.size()) + " gpu)");
-        // Matches report the anchor cell's world position, so the identity
-        // orientation lands at the fill origin + the anchor offset.
-        const SearchPlan plan = build_search_plan(req.pattern.knowns(), gen.threshold(p.y), true);
-        bool origin = false;
-        for (auto& [k, v] : gpu)
-            if (k.first == p.cx + plan.anchor_i && k.second == p.cz + plan.anchor_j && (v & 1))
-                origin = true;
-        check(origin, "seed " + std::to_string(p.seed) + " fill origin found on GPU");
-    }
+            auto cpu = run(make_worker_factory("cpu"), req);
+            auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
+            check(cpu == gpu, tag + " parity (" + std::to_string(cpu.size()) + " cpu vs " +
+                              std::to_string(gpu.size()) + " gpu)");
+            // Matches report the anchor cell's world position, so the identity
+            // orientation lands at the fill origin + the anchor offset.
+            const SearchPlan plan = build_search_plan(req.pattern.knowns(), gen.threshold(p.y), true);
+            bool origin = false;
+            for (auto& [k, v] : gpu)
+                if (k.first == p.cx + plan.anchor_i && k.second == p.cz + plan.anchor_j && (v & 1))
+                    origin = true;
+            check(origin, tag + " fill origin found on GPU");
+        }
 }
 
-// Three known cells spread ~200 blocks apart inside an otherwise-unknown
-// 401x401 pattern grid -- forces OpenclWorker::configure()'s halo well past
-// any local-memory budget (Step 10b), exercising the cached-kernel fallback
-// to plain search_tile for real, not just as a comment.
-void test_large_halo_fallback() {
-    std::printf("test_large_halo_fallback\n");
+// Three known cells spread `reach` blocks apart inside an otherwise-unknown
+// grid. reach 200 runs the bit-plane kernels with a big halo; reach 1025 is
+// past OpenclWorker's kPlaneHaloMax, so it exercises the search_tile fallback.
+void test_large_halo(int reach) {
+    std::printf("test_large_halo(%d)\n", reach);
     const std::int64_t seed = 999;
     rokkdoxx::BedrockGenerator gen(seed);
     const int y = -60;
     const int cx = 300, cz = -200;
-    const int n = 401;  // grid spans 0..400, centre at (200,200)
+    const int n = 2 * reach + 1;  // grid spans 0..2*reach, centre at (reach,reach)
 
     Pattern pat;
     pat.w = n;
@@ -140,9 +141,9 @@ void test_large_halo_fallback() {
         pat.cells[static_cast<std::size_t>(j) * n + i] =
             gen.is_bedrock_floor(cx + i, y, cz + j) ? Cell::bedrock : Cell::not_bedrock;
     };
-    set(200, 200);  // centre
-    set(0, 200);    // 200 blocks west
-    set(400, 200);  // 200 blocks east
+    set(reach, reach);      // centre
+    set(0, reach);          // `reach` blocks west
+    set(2 * reach, reach);  // `reach` blocks east
 
     SearchRequest req;
     req.seed = seed;
@@ -153,8 +154,8 @@ void test_large_halo_fallback() {
 
     auto cpu = run(make_worker_factory("cpu"), req);
     auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
-    check(cpu == gpu, "large-halo fallback parity (" + std::to_string(cpu.size()) + " cpu vs " +
-                           std::to_string(gpu.size()) + " gpu)");
+    check(cpu == gpu, "large-halo parity (" + std::to_string(cpu.size()) + " cpu vs " +
+                          std::to_string(gpu.size()) + " gpu)");
 }
 
 }  // namespace
@@ -174,7 +175,8 @@ int main() {
         ++g_fail;
     }
     test_search_parity();
-    test_large_halo_fallback();
+    test_large_halo(200);
+    test_large_halo(1025);
 
     if (g_fail == 0) {
         std::printf("\nALL PASS\n");

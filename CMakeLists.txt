@@ -38,6 +38,9 @@ if(ROKK_ENABLE_OPENCL)
     list(APPEND SVC_SOURCES src/svc/opencl_worker.cpp)
     message(STATUS "OpenCL found: ${OpenCL_LIBRARIES}")
     # Embed the kernel text so the binary is self-contained / relocatable.
+    # Re-run configure when either file changes, or the build keeps a stale copy.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 src/gen/bedrock_core.h src/cl/search_tile.cl)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/gen/bedrock_core.h" ROKK_BEDROCK_CORE)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/cl/search_tile.cl" ROKK_SEARCH_TILE)
     # Normalise line endings so a CRLF checkout (Windows, autocrlf) does not put

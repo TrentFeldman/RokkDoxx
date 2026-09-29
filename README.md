@@ -75,11 +75,11 @@ No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
 | Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | BETA: GPU-on-Windows untested but supported |
 | Windows: `rokktui` | BETA: console backend written, untested on a Windows box |
 | Resumable long runs (`--checkpoint`) | ✅ |
-| Local-memory tile cache, async tile pipelining | ✅ |
+| Bit-plane GPU kernel (each block drawn once), async tile pipelining | ✅ |
 | Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
 | `rokktui` redo (flicker-free, resize, backend picker, resume) | ✅ |
 | Further optimizations, early test rejections | ⬜ later |
-| Work on optimizing 8 direction search slowdowns | ⬜ later (2.6× narrower than before, still slower than exact) |
+| Work on optimizing 8 direction search slowdowns | ✅ GPU (all-8 ≈ 0.7× exact, was 0.4×) · ⬜ CPU (still ≈ 0.4×) |
 | Reattach to a running / detached search | ⬜ later |
 
 How the generation works, short version:
@@ -404,17 +404,22 @@ sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`
 
 | | CPU (6c/12t Ryzen 5 5600) | GPU (RX 7900 XTX) | speedup |
 |---|---|---|---|
-| **exact** orientation | ~1.4 G | **~83 G** | ~58× |
-| **all 8** orientations | ~0.6 G | **~32 G** | ~53× |
-| all 8, symmetric pattern | ~1.4 G | **~83 G** | — |
+| **exact** orientation | ~1.4 G | **~222 G** | ~160× |
+| **all 8** orientations | ~0.6 G | **~157 G** | ~260× |
+| all 8, symmetric pattern | ~1.4 G | **~213 G** | — |
 
 The search recentres your pattern on a rare "anchor" cell; one bedrock test there rejects
 all 8 orientations at once, and orientations that a symmetric pattern shares are collapsed —
 so a symmetric shape costs the same as a single orientation. A match reports the world
 position of that anchor cell (near the middle of your pattern).
 
-A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~3 h** on the GPU (exact
-orientation), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
+On the GPU, each block of a tile (plus a small halo around it) is generated exactly once into
+a 1-bit-per-block plane, and 32 neighbouring candidates are then tested at a time with plain
+word operations. Generation is the expensive part, so checking all 8 orientations costs little
+more than checking one.
+
+A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~1 h** on the GPU (exact
+orientation; ~1.5 h all 8), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
 the GPU makes a blind whole-world sweep practical.
 
 ### Benchmark it yourself
@@ -429,7 +434,7 @@ warm-up + 5 timed iterations. Takes ~30 s. This is where the table above comes f
 
 | machine | backend | exact G | all-8 G | all-8 sym G | notes | date |
 |---|---|---|---|---|---|---|
-| RX 7900 XTX (gfx1100) | opencl | 83.2 | 32.4 | 83.2 | ROCm driver 3581, 48 CU; async double-buffer + local-memory tile cache | 2026-09 |
+| RX 7900 XTX (gfx1100) | opencl | 222.1 | 157.4 | 212.8 | ROCm driver 3581, 48 CU; async double-buffer + bit-plane kernel | 2026-09 |
 | Ryzen 5 5600 | cpu | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 | 2026-09 |
 
 ### Why not just use Minecraft to check?
