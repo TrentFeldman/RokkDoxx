@@ -10,6 +10,7 @@
 #include "svc/client.hpp"
 #include "tui/frame.hpp"
 #include "tui/model.hpp"
+#include "tui/screens.hpp"
 
 using namespace rokkdoxx;
 using namespace rokkdoxx::tui;
@@ -171,6 +172,25 @@ void test_frame_diff() {
 
 }  // namespace
 
+void test_grid_typing() {
+    std::printf("test_grid_typing\n");
+    App app;
+    app.screen = Screen::grid;
+    app.m.w = 3;
+    app.m.h = 2;
+    for (int k : {'b', 'e', '.', 'b'}) handle_key(app, k);
+    check(app.m.at(0, 0) == svc::Cell::bedrock && app.m.at(1, 0) == svc::Cell::not_bedrock &&
+              app.m.at(2, 0) == svc::Cell::unknown && app.m.at(0, 1) == svc::Cell::bedrock,
+          "b / e / . paint cells like typing");
+    check(app.gx == 1 && app.gy == 1, "cursor advances and wraps to the next row");
+    handle_key(app, K_BACKSPACE);
+    handle_key(app, K_BACKSPACE);
+    check(app.gx == 2 && app.gy == 0, "backspace steps back across the row boundary");
+    for (int k : {'e', 'e', 'e', 'e'}) handle_key(app, k);
+    check(app.gx == 2 && app.gy == 1 && app.m.at(2, 1) == svc::Cell::not_bedrock,
+          "the last cell holds the cursor");
+}
+
 int main() {
     test_file_round_trip();
     test_build_request_errors();
@@ -179,6 +199,7 @@ int main() {
     test_format_matches();
     test_clip_visible();
     test_frame_diff();
+    test_grid_typing();
     if (g_fail) {
         std::printf("test_tui: %d failure(s)\n", g_fail);
         return 1;

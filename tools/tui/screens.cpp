@@ -226,7 +226,7 @@ bool handle_params(App& app, int k) {
 // pattern grid
 // ---------------------------------------------------------------------------
 
-constexpr int kGridChromeRows = 11;  // header, col index, summary, help, status
+constexpr int kGridChromeRows = 12;  // header, col index, summary, help, status
 constexpr int kRowLabelCols = 6;
 
 // Keep the cursor inside a viewport of vis_rows x vis_cols.
@@ -296,8 +296,10 @@ void draw_grid(App& app, Frame& fr) {
                   needbed);
     fr.line(dim(sb));
     fr.line();
-    fr.line("  " + hi("space") + " cycle  " + kBed + "#" + kRst + " bedrock  " + kAir + "o" + kRst +
-            " not-bedrock  " + kDim + "." + kRst + " unknown   " + hi("Home/End/PgUp/PgDn") + " jump");
+    fr.line("  " + hi("b") + " " + kBed + "#" + kRst + " bedrock   " + hi("e") + " " + kAir + "o" + kRst +
+            " empty   " + hi(".") + " unknown   (cursor advances; " + hi("Backspace") + " steps back)");
+    fr.line("  " + hi("space") + " cycle   " + hi("arrows/hjkl") + " move   " + hi("Home/End/PgUp/PgDn") +
+            " jump");
     fr.line("  " + hi("P") + " fill from world at center   " + hi("C") + " clear   " + hi("S") +
             " save");
     fr.line("  " + hi("Enter") + " run search   " + hi("Tab") + " parameters   " + hi("q") + " quit");
@@ -336,6 +338,14 @@ void start_search(App& app) {
     }
 }
 
+// Set the cell under the cursor, then move right (wrapping to the next row;
+// the last cell stays put).
+void paint(App& app, svc::Cell c) {
+    app.m.at(app.gx, app.gy) = c;
+    if (app.gx + 1 < app.m.w) ++app.gx;
+    else if (app.gy + 1 < app.m.h) app.gx = 0, ++app.gy;
+}
+
 bool handle_grid(App& app, int k) {
     Model& m = app.m;
     switch (k) {
@@ -357,9 +367,15 @@ bool handle_grid(App& app, int k) {
             c = static_cast<svc::Cell>((static_cast<int>(c) + 1) % 3);
             return true;
         }
-        case '#': case '1': m.at(app.gx, app.gy) = svc::Cell::bedrock; return true;
-        case 'o': case '0': m.at(app.gx, app.gy) = svc::Cell::not_bedrock; return true;
-        case '.': case 'x': case K_DELETE: m.at(app.gx, app.gy) = svc::Cell::unknown; return true;
+        // Paint and advance like typing, so a row is entered as e.g. "bbeeb".
+        case 'b': case '#': case '1': paint(app, svc::Cell::bedrock); return true;
+        case 'e': case 'o': case '0': paint(app, svc::Cell::not_bedrock); return true;
+        case '.': case 'x': paint(app, svc::Cell::unknown); return true;
+        case K_DELETE: m.at(app.gx, app.gy) = svc::Cell::unknown; return true;
+        case K_BACKSPACE:  // step back one cell, wrapping to the previous row's end
+            if (app.gx > 0) --app.gx;
+            else if (app.gy > 0) app.gx = m.w - 1, --app.gy;
+            return true;
         case 'C':
             m.clear();
             app.status = "cleared";

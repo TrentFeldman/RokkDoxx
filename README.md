@@ -63,8 +63,10 @@ build/rokktui [--load pattern.txt] [--backend auto|cpu|opencl:N] [--checkpoint r
      ±29,999,984 border.
    - `orientations` — `all 8` tries every rotation/mirror, so the picture needn't face north.
    - `backend`, `checkpoint file` — device choice; optional resume file.
-2. **Pattern editor** (`Enter`). Arrows/`hjkl` move; `space` cycles unknown → bedrock `#` →
-   not-bedrock `o`; `1`/`0`/`.` set directly. Unknown cells are wildcards. `P` fills from the
+2. **Pattern editor** (`Enter`). Type the grid like text: `b` bedrock, `e` empty
+   (not-bedrock), `.` unknown; each moves the cursor on, wrapping to the next row, and
+   `Backspace` steps back. Arrows/`hjkl` move, `space` cycles a cell. Unknown cells are
+   wildcards. `P` fills from the
    real world at the center (a round-trip test), `C` clears, `S` saves, `Enter` searches.
 3. **Results.** Progress, rate, elapsed and ETA while running (`c` cancels), then every match
    and the orientations that fit. `S` saves them as `x z orient_mask` lines.
@@ -158,7 +160,9 @@ all-8 run; the other columns are the ~30 s quick benchmark.
 | RX 7900 XTX | opencl | **149.0** (148.6–153.4, −2.7% first→last) | 222.1 | 157.4 | 212.8 | ROCm, 48 CU |
 | Ryzen 5 5600 | cpu | — | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 |
 
-A whole-world sweep (3.6·10¹⁵ candidates) takes ~4.5 h exact / ~7 h all-8 on that GPU.
+A whole-world sweep (3.6·10¹⁵ candidates) depends on your gpu. time (hours) ≈ 1000 / throughput (Gcands/s)
+Dont see your gpu in the benchmarks? Estimate. Or run one! Submit a push request if you do, so I can add to the DB.
+
 
 ```sh
 build/rokksearch --benchmark-long 15   # standard: sustained all-8, ~30 s sweeps
