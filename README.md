@@ -28,31 +28,41 @@ Without OpenCL the build still works, CPU only. No `make`/`ninja`? `./build.sh`
 (`ROKK_OPENCL=1 ./build.sh` for the GPU, `./build.sh test` to run the tests; Linux/macOS).
 
 
+
 ### Build — Windows
 
-Requires Git, CMake, Visual Studio 2022 with C++ build tools, and an up-to-date GPU driver.
+**Prerequisites (install these first):**
+- [Git for Windows](https://git-scm.com/install/windows) — Default installation.
+- [CMake](https://cmake.org/download/) — Version 4.2+, Windows x64. **Add to system PATH** during installation.
+- [Visual Studio Community](https://aka.ms/vs/stable/vs_community.exe) — **Select Desktop development with C++** during installation.
+- Up-to-date GPU drivers (AMD, NVIDIA, or Intel).
 
-OpenCL headers and libraries are installed through [vcpkg](https://vcpkg.io). Works with AMD, NVIDIA, and Intel GPUs with compatible OpenCL drivers.
+**Restart Windows after installation.**
 
 **Don't know what you're doing?** Copy and paste the following into Windows Command Prompt (CMD):
 
 ```bat
+cd /d "%USERPROFILE%"
 git clone https://github.com/microsoft/vcpkg.git
 cd vcpkg
 .\bootstrap-vcpkg.bat
 .\vcpkg.exe install opencl:x64-windows
 
+REBOOT RECCOMENDED
+
 cd ..
 git clone https://github.com/TrentFeldman/RokkDoxx.git
 cd RokkDoxx
 
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DROKK_ENABLE_OPENCL=ON "-DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake"
-
-cmake --build build --config Release --parallel
+cmake -S . -B build -DROKK_ENABLE_OPENCL=ON "-DCMAKE_TOOLCHAIN_FILE=..\vcpkg\scripts\buildsystems\vcpkg.cmake"
+cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
-
 build\Release\rokksearch.exe --list-backends
 ```
+
+CMake automatically selects your installed Visual Studio version. No specific version is required.
+
+**Build failed?** Delete the old configuration with `rmdir /s /q build` and retry.
 
 If everything worked, the final command should display your available compute backends, including your OpenCL GPU.
 
