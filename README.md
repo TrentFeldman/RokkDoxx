@@ -10,7 +10,7 @@ around a rough location in seconds.
 
 The scope is deliberately narrow: one Overworld bedrock-floor layer per pattern.
 
-## Build
+## Build - Linux
 
 Needs a C++20 compiler (`g++` ≥ 13, `clang++` ≥ 16, or MSVC 17.8+), CMake ≥ 3.16, and
 Python 3 for the tests. OpenCL is optional (Linux: `opencl-headers`, `opencl-clhpp`, plus a
@@ -27,18 +27,35 @@ build/rokktui
 Without OpenCL the build still works, CPU only. No `make`/`ninja`? `./build.sh`
 (`ROKK_OPENCL=1 ./build.sh` for the GPU, `./build.sh test` to run the tests; Linux/macOS).
 
-### Windows
 
-Visual Studio generator; OpenCL headers + import lib via [vcpkg](https://vcpkg.io) (any GPU
-vendor; the driver provides the runtime `OpenCL.dll`):
+### Build — Windows
+
+Requires Git, CMake, Visual Studio 2022 with C++ build tools, and an up-to-date GPU driver.
+
+OpenCL headers and libraries are installed through [vcpkg](https://vcpkg.io). Works with AMD, NVIDIA, and Intel GPUs with compatible OpenCL drivers.
+
+**Don't know what you're doing?** Copy and paste the following into Windows Command Prompt (CMD):
 
 ```bat
-vcpkg install opencl
-cmake -B build -DROKK_ENABLE_OPENCL=ON -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg.exe install opencl:x64-windows
+
+cd ..
+git clone https://github.com/TrentFeldman/RokkDoxx.git
+cd RokkDoxx
+
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DROKK_ENABLE_OPENCL=ON "-DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
+
 build\Release\rokksearch.exe --list-backends
 ```
+
+If everything worked, the final command should display your available compute backends, including your OpenCL GPU.
+
 
 `--list-backends` should show an `opencl:0 … [gpu]` row. If CMake printed `OpenCL not found
 -- building CPU worker only`, the toolchain file wasn't picked up. A vendor SDK (CUDA
