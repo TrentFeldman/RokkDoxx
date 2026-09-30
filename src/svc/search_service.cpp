@@ -339,6 +339,9 @@ void SearchService::run(Job* job) noexcept {
             std::vector<Match> restored;
             if (sched.load_checkpoint(req.checkpoint_path, fp, restored)) sink.add(restored);
         }
+        // Tiles a checkpoint already covered; the rate (and so the ETA) only
+        // counts work done in this run.
+        const long long resumed = sched.candidates_done();
 
         worker->configure(cfg);
 
@@ -374,7 +377,11 @@ void SearchService::run(Job* job) noexcept {
                         : 1.0;
                 job->status.matches = sink.count();
                 job->status.elapsed_s = elapsed;
-                job->status.rate = elapsed > 0 ? static_cast<double>(cdone) / elapsed : 0.0;
+                job->status.rate = elapsed > 0 ? static_cast<double>(cdone - resumed) / elapsed : 0.0;
+                job->status.eta_s =
+                    job->status.rate > 0
+                        ? static_cast<double>(job->status.candidates_total - cdone) / job->status.rate
+                        : 0.0;
                 job->status.truncated = sink.truncated() || worker->truncated();
             }
 
@@ -416,6 +423,7 @@ void SearchService::run(Job* job) noexcept {
         job->status.matches = job->results.size();
         job->status.elapsed_s = std::chrono::duration<double>(clock::now() - t0).count();
         job->status.state = job->cancel.load() ? JobState::cancelled : JobState::done;
+        job->status.eta_s = 0.0;
         if (job->status.state == JobState::done) job->status.progress = 1.0;
     } catch (const std::exception& e) {
         set_err(e.what());

@@ -2,467 +2,199 @@
 
 **Got Bedrock? Get Locations.**
 
-RokkDoxx reproduces Minecraft's bedrock world-generation rule as a plain function and
-searches the coordinate space for a target bedrock pattern without running the game
-engine. Given a world seed and a picture of some bedrock, it tells you where in 
-the world that pattern occurs.
+RokkDoxx reproduces Minecraft 26.2's Overworld bedrock-floor generation as a plain function
+and searches the world for a bedrock pattern without running the game. Give it a seed and a
+picture of some bedrock; it returns every `(x, z)` where that pattern occurs. A GPU
+(OpenCL) sweeps the whole 60M × 60M world in hours; a CPU handles a few thousand blocks
+around a rough location in seconds.
 
-The end goal is a GPU/OpenCL search over the full `30,000,000 × 30,000,000` world. The
-architecture is three tiers: a thin TUI front end, a CPU scheduler that tiles the region and
-validates results, and a compute worker (GPU or CPU). As a full time student, I'm keeping
-this project's scope very narrow — see [Non-goals](#non-goals).
-
----
-
-## Contents
-
-- [Quick start](#quick-start)
-- [What's implemented](#whats-implemented)
-- [Architecture](#architecture)
-- [Requirements](#requirements)
-- [Build](#build)
-- [Usage](#usage) — [`rokktui`](#rokktui--interactive-pattern-search),
-  [`rokksearch`](#rokksearch--headless-search),
-  [`dump_bedrock`](#dump_bedrock--print-the-bedrock-layer-for-a-seed), [Python](#testsreferencebedrock_refpy--same-thing-in-python), [C++ library](#c-library)
-- [How to use it to actually find a location](#how-to-use-it-to-actually-find-a-location)
-- [Performance](#performance)
-- [Verification](#verification)
-- [Non-goals](#non-goals)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## Quick start
-
-```sh
-git clone https://github.com/TrentFeldman/RokkDoxx RokkDoxx && cd RokkDoxx
-
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # DROKK_ENABLE_OPENCL=ON for GPU compute
-cmake --build build
-ctest --test-dir build --output-on-failure
-
-build/rokktui                             # interactive pattern search
-```
-
-On Windows, use the Visual Studio generator:
-
-```bat
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-build\Release\rokksearch.exe --benchmark
-```
-
-That first build skips OpenCL (zero dependencies). For GPU compute, a Defender
-note, and how to check your OpenCL setup, see [Build → Windows](#windows-msvc).
-
-No `make`/`ninja` and not on Windows? Use the fallback: `./build.sh` (or
-`ROKK_OPENCL=1 ./build.sh`), then `./build.sh test`.
-
----
-
-## What's implemented
-
-| Component | State |
-|---|---|
-| Minecraft 26.2 Overworld bedrock-floor generation (`B(seed, x, y, z)`) | ✅ verified |
-| Shared C/OpenCL generation core (`bedrock_core.h`) | ✅ |
-| Search — tiling, scheduling, dedup, progress, cancel | ✅ |
-| `rokktui` (interactive) / `rokksearch` (headless) | ✅ |
-| CPU worker (multi-threaded) | ✅ |
-| OpenCL worker — all 8 orientations, bit-exact with CPU | ✅ |
-| Windows: `rokksearch` + `dump_bedrock` + tests, CPU + GPU | BETA: GPU-on-Windows untested but supported |
-| Windows: `rokktui` | BETA: console backend written, untested on a Windows box |
-| Resumable long runs (`--checkpoint`) | ✅ |
-| Bit-plane GPU kernel (each block drawn once), async tile pipelining | ✅ |
-| Nether roof (`bedrock_roof`), multi-Y patterns | ⬜ later |
-| `rokktui` redo (flicker-free, resize, backend picker, resume) | ✅ |
-| Further optimizations, early test rejections | ⬜ later |
-| Work on optimizing 8 direction search slowdowns | ✅ GPU (all-8 ≈ 0.7× exact, was 0.4×) · ⬜ CPU (still ≈ 0.4×) |
-| Reattach to a running / detached search | ⬜ later |
-
-How the generation works, short version:
-
-- Bedrock floor is a **surface rule** (`minecraft:bedrock_floor`) with a `vertical_gradient`
-  condition. It depends only on the seed and block coordinates — not biome, terrain, or
-  structures — which is what makes an engine-free search possible.
-- `y = -64` is always bedrock; `y ≥ -59` never is; `y = -63..-60` fade out linearly
-  (probability 0.8, 0.6, 0.4, 0.2).
-- The RNG is **Xoroshiro128++** (`XoroshiroRandomSource`), unchanged since Java 1.18.
-- The GPU search is **bit-exact** with the CPU. Vanilla places bedrock when
-  `(double)nextFloat() < prob`; the host precomputes `threshold = ceil(prob · 2²⁴)` once and
-  the kernel does the integer compare `bits24 < threshold` instead. No `fp64`, no rounding
-  modes — identical results on any OpenCL device.
-
----
-
-## Architecture
-
-Three tiers, so the compute scales independently of the UI:
-
-- **Front-ends** (`rokktui`, `rokksearch`) — thin. They build a search request and poll for
-  progress; no search logic of their own. `rokktui` keeps all OS-specific code in one
-  terminal file per platform (`tools/tui/term_posix.cpp`, `term_win.cpp`).
-- **`SearchService`** (CPU) — cuts the region into tiles, schedules them, deduplicates
-  matches (a symmetric pattern can hit under several orientations at one origin), tracks
-  progress, and supports cancel.
-- **`Worker`** — one compute device: `CpuWorker` (multi-threaded) or `OpenclWorker`.
-
-It all runs in one process — there is no daemon and no IPC.
-
----
-
-## Requirements
-
-- A C++20 compiler:
-  - Linux / macOS: `g++` ≥ 13 or `clang++` ≥ 16
-  - Windows: MSVC (Visual Studio 2022 / Build Tools ≥ 17.8), or MinGW-w64 with a
-    `std::thread`-capable runtime (posix thread model, or GCC ≥ 13)
-- **Primary build:** CMake ≥ 3.16 + a generator (`make`, `ninja`, or Visual Studio)
-- **Fallback build (Linux / macOS only):** just `bash` — [`build.sh`](build.sh)
-  compiles everything with one `g++` invocation per target, no build system needed
-- Python 3 — for the reference implementation and the differential test
-- *Optional, for the GPU worker:* OpenCL headers + an ICD loader, and one OpenCL
-  platform. Linux: `opencl-headers`, `opencl-clhpp`, plus `rocm-opencl-runtime`
-  (AMD), `pocl` (CPU OpenCL), or `opencl-mesa` (Rusticl). Windows: see below.
-
----
+The scope is deliberately narrow: one Overworld bedrock-floor layer per pattern.
 
 ## Build
 
-### CMake (preferred)
+Needs a C++20 compiler (`g++` ≥ 13, `clang++` ≥ 16, or MSVC 17.8+), CMake ≥ 3.16, and
+Python 3 for the tests. OpenCL is optional (Linux: `opencl-headers`, `opencl-clhpp`, plus a
+runtime such as `rocm-opencl-runtime`, `pocl` or `opencl-mesa`).
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON    # -DROKK_ENABLE_OPENCL=ON for GPU compute
+git clone https://github.com/TrentFeldman/RokkDoxx && cd RokkDoxx
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DROKK_ENABLE_OPENCL=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
+build/rokktui
 ```
 
-Produces `build/{dump_bedrock, rokksearch, rokktui, test_*}`. `rokktui` picks its
-terminal backend at build time (termios on Linux/macOS, the console API on Windows 10+).
+Without OpenCL the build still works, CPU only. No `make`/`ninja`? `./build.sh`
+(`ROKK_OPENCL=1 ./build.sh` for the GPU, `./build.sh test` to run the tests; Linux/macOS).
 
-### Windows (MSVC)
+### Windows
+
+Visual Studio generator; OpenCL headers + import lib via [vcpkg](https://vcpkg.io) (any GPU
+vendor; the driver provides the runtime `OpenCL.dll`):
 
 ```bat
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+vcpkg install opencl
+cmake -B build -DROKK_ENABLE_OPENCL=ON -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
-
-build\Release\rokksearch.exe --benchmark        :: add an OpenCL SDK for GPU compute, see below
+build\Release\rokksearch.exe --list-backends
 ```
 
-The Visual Studio generator is multi-config, so pass `--config Release` at build
-time and `-C Release` to `ctest`. The command above **skips OpenCL**, so the
-build has zero external dependencies — a quick way to confirm the toolchain
-works. The GPU path is fully supported on Windows and produces the same
-bit-exact results as Linux; it just needs the OpenCL SDK below at build time.
+`--list-backends` should show an `opencl:0 … [gpu]` row. If CMake printed `OpenCL not found
+-- building CPU worker only`, the toolchain file wasn't picked up. A vendor SDK (CUDA
+Toolkit, AMD HIP SDK via `-DOpenCL_ROOT=…`, Intel oneAPI) also works instead of vcpkg.
 
-**OpenCL on Windows.** Two separate pieces:
-
-- **At runtime** — `OpenCL.dll` (the ICD loader) ships with Windows and every
-  modern GPU driver (AMD Adrenalin, NVIDIA, Intel). Nothing to install.
-- **At build time** — you need the OpenCL **headers** + an `OpenCL.lib` import
-  stub, which MSVC does *not* bundle. Install your GPU vendor's toolkit:
-
-  - **NVIDIA** — the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
-    puts `CL/*.h` + `OpenCL.lib` under `%CUDA_PATH%`, which CMake's
-    `find_package(OpenCL)` finds automatically. Just
-    `cmake -B build -DROKK_ENABLE_OPENCL=ON`.
-  - **AMD** — the [HIP SDK for Windows](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
-    (ROCm on Windows) ships the OpenCL headers + lib. Point CMake at it:
-    `-DOpenCL_ROOT="C:/Program Files/AMD/ROCm/<version>"`. (The Adrenalin driver
-    alone gives you the runtime `OpenCL.dll`, but not the build-time files.)
-  - **Intel** — the [oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html)
-    includes the OpenCL SDK (headers, `OpenCL.lib`, a CPU/GPU runtime) and sets
-    `INTELOCLSDKROOT`, which `find_package(OpenCL)` checks.
-
-  **Fallback** (any vendor, or no toolkit installed) — [vcpkg](https://vcpkg.io):
-
-  ```bat
-  vcpkg install opencl
-  cmake -B build -DROKK_ENABLE_OPENCL=ON ^
-    -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-  ```
-
-  This pulls the Khronos headers + a generic `OpenCL.lib` stub; works regardless
-  of which GPU you have.
-
-**Check it worked:**
-
-1. *Did CMake find the SDK?* The configure step prints one of:
-   ```
-   -- OpenCL found: C:/.../OpenCL.lib
-   -- OpenCL not found -- building CPU worker only
-   ```
-   Re-run `cmake -B build -DROKK_ENABLE_OPENCL=ON ...` and read that line.
-2. *Is a GPU visible at runtime?* After building:
-   ```bat
-   build\Release\rokksearch.exe --list-backends
-   ```
-   Expect an `opencl:0  <device name>  [gpu]` row next to `cpu`. If only `cpu`
-   appears, the GPU driver / ICD isn't being seen — update your GPU driver.
-3. *`OpenCL.dll` present?* `where OpenCL.dll` should hit `C:\Windows\System32`.
-   Vendor ICDs register under `HKLM\SOFTWARE\Khronos\OpenCL\Vendors` (a current
-   GPU driver installs one). For a full device dump, `clinfo` (Khronos) or
-   GPU-Z also work.
-4. *End to end:* `build\Release\rokksearch.exe --benchmark` (no `--backend`)
-   auto-selects the GPU when present — the `device :` header line names it.
-
-> **Windows Defender / SmartScreen.** A freshly built, **unsigned** `.exe` —
-> especially one that pins every CPU core and drives the GPU — commonly trips a
-> SmartScreen "Windows protected your PC" prompt or a Defender heuristic. This is
-> expected for any small tool without a paid code-signing certificate; it is not
-> a detection of anything. RokkDoxx makes **no network connections** and writes
-> only the files you name on the command line — if you built it from this
-> source, trust the binary as much as you trust the source. To proceed: click
-> **More info → Run anyway**, or in PowerShell
-> `Unblock-File .\build\Release\rokksearch.exe`.
-
-### Fallback (`build.sh`, no build system, not reccomended, Linux / macOS only)
-
-```sh
-./build.sh                 # CPU only
-ROKK_OPENCL=1 ./build.sh   # + GPU worker (needs libOpenCL + headers)
-./build.sh test            # build, then run the test suite
-```
-
-Both paths build the same targets and run the same tests; `build.sh` exists so the
-project builds on a box with a compiler but no `make`/`ninja`.
-
----
+A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyway", or
+`Unblock-File`). RokkDoxx makes no network connections and only writes files you name.
 
 ## Usage
 
-### `rokktui` — interactive pattern search
+### `rokktui` — interactive
 
 ```sh
-build/rokktui              # or: build/rokktui --load pattern.txt --backend opencl:0 --checkpoint run.ckpt
+build/rokktui [--load pattern.txt] [--backend auto|cpu|opencl:N] [--checkpoint run.ckpt]
 ```
 
-HOW TO USE ROKKTUI
+1. **Parameters.** Up/Down/Tab move, type to edit, Left/Right change, `Del` clears.
+   - `seed` — number or text (text is hashed like Minecraft does).
+   - `width`/`height` — pattern size, up to 32×32.
+   - `Y layer` — `-64 … -59`. Use `-60`: it has the most detail (P(bedrock) = 0.2).
+   - `center X/Z`, `radius` — the square to search. `radius -1` = the whole world inside the
+     ±29,999,984 border.
+   - `orientations` — `all 8` tries every rotation/mirror, so the picture needn't face north.
+   - `backend`, `checkpoint file` — device choice; optional resume file.
+2. **Pattern editor** (`Enter`). Arrows/`hjkl` move; `space` cycles unknown → bedrock `#` →
+   not-bedrock `o`; `1`/`0`/`.` set directly. Unknown cells are wildcards. `P` fills from the
+   real world at the center (a round-trip test), `C` clears, `S` saves, `Enter` searches.
+3. **Results.** Progress, rate, elapsed and ETA while running (`c` cancels), then every match
+   and the orientations that fit. `S` saves them as `x z orient_mask` lines.
 
-1. **Parameters screen.** Up/Down (or Tab) to move between fields, Home/End to jump to the
-   first/last, type to edit, `Del` clears a text field.
-   - `seed` — numeric (may be negative), or any text string (hashed the way Minecraft
-     hashes non-numeric seeds).
-   - `width` / `height` — the size of the bedrock pattern you're going to enter, up to
-     32×32. Adjust with Left/Right.
-   - `Y layer` — which bedrock layer the pattern is on, `-64 … -59` (Left/Right). `-60` is
-     the default and the most useful — it has the most detail per cell. The screen shows
-     `P(bedrock)` for the chosen layer and warns if you pick `-64` (solid) or `-59` (empty).
-   - `center X` / `center Z` and `radius` — the square area to search around the center
-     point. The radius controls how far the search extends in each direction.
-   - `backend` — Left/Right cycles `auto` and every device this build can use (CPU, each
-     OpenCL GPU).
-   - `checkpoint file` — optional. Progress (and matches found so far) is saved there every
-     few seconds and when the run ends or is cancelled; running the same search again with
-     the same file resumes where it left off. A file written for a different search is
-     ignored.
-   - `Enter` opens the pattern editor.
-
-2. **Pattern editor.** A grid of the size you chose. Arrow keys / `hjkl` move the cursor;
-   Home/End jump to the row's ends, PgUp/PgDn to the column's. If the window is too small
-   for the grid, it scrolls to follow the cursor.
-   - `space` cycles a cell: unknown → **bedrock** (`#`) → **not-bedrock** (`o`) → unknown.
-     (`1` / `0` / `.` set them directly.)
-   - Unknown cells are wildcards — not checked.
-   - `P` fills the whole grid from the actual world at your center point — handy as a
-     round-trip test (search should then find that exact spot).
-   - `C` clears, `S` saves the pattern to a file, `Tab` goes back to parameters.
-   - `Enter` runs the search.
-
-   On the parameters screen, `orientations` = `all 8` tries every rotation/mirror of your
-   pattern (you don't have to align the screenshot to world axes); `exact` matches only as
-   drawn.
-
-3. **Results screen.** Live progress bar + rate while the job runs (`c` cancels); then
-   every match `(x, z)` — the pattern's anchor cell, a block near its middle — with the
-   orientations that matched. Up/Down/PgUp/PgDn/Home/End scroll. `S` saves the list in
-   the same `x z orient_mask` format `rokksearch` prints (plus one `#` header line).
-
-The search runs in this process. `--backend opencl:0` picks the GPU at startup (`auto` is
-the default and prefers a GPU if present). `q` quits (outside text fields). The screen
-redraws only what changed and follows terminal resizes. On Windows it needs Windows 10 or
-later (Windows Terminal or the classic console).
-
-### `rokksearch` — headless search
+### `rokksearch` — headless
 
 ```sh
-rokksearch --pattern p.txt --center 0,0 --radius 2000000        # p.txt carries seed/y too
-rokksearch --seed 12345 --y -60 --size 8x8 --region -1000000,1000000,-1000000,1000000 --backend opencl:0
-rokksearch --list-backends
-rokksearch --benchmark                                          # standard reproducible benchmark
-rokksearch --bench --pattern p.txt --center 0,0 --radius 5000000  # rate of *this* search
+rokksearch --pattern p.txt                                   # region from the file
+rokksearch --pattern p.txt --center 0,0 --radius 2000000 --backend opencl:0
+rokksearch --pattern p.txt --region -1000000,1000000,-500000,500000 --orientations exact
 ```
 
-Streams a progress line to stderr; prints matches (`x z orient_mask`) to stdout. `--json`
-for machine output, `--checkpoint FILE` to make a long run resumable (Ctrl-C, then re-run
-the same command). `--help` for everything.
+Progress (with ETA) goes to stderr, matches (`x z orient_mask`) to stdout. `--json` for
+machine output, `--checkpoint FILE` to make a run resumable (Ctrl-C, then rerun),
+`--help` for the rest.
 
-`--benchmark` runs a **fixed** workload (seed 0, a 6×6 pattern, region auto-sized per run)
-so numbers are comparable across machines — warm-up + 5 timed iterations, reported as a
-median with min/max. `--backend cpu` for the CPU figure; `--json` for a pasteable result;
-`--benchmark-seconds` / `--benchmark-iters` to trade run time for stability. See
-[Performance](#performance).
-
-### `dump_bedrock` — print the bedrock layer for a seed
+**Pattern file** (what `rokktui` saves):
 
 ```
-dump_bedrock <seed> <x0> <z0> <width> <height> [y | all]
+# rokkdoxx pattern
+seed 12345
+y -60
+center 0 0
+radius 5000          # -1 = whole world
+orientations all     # or exact
+size 6 5
+oo###o
+oo#oo#
+####o#
+o#oo#o
+#oo#o#
 ```
 
-- `seed` — the world seed (decimal; may be negative)
-- `x0 z0` — north-west corner of the region, in block coordinates
-- `width height` — region size in blocks (`x0 .. x0+width-1`, `z0 .. z0+height-1`)
-- `y` — a single layer (`-64 .. -59`); omit or pass `all` for every layer
+`#` bedrock, `o` not bedrock, `.` unknown (wildcard). This one is copied from the real world
+at (1036, -966); `rokksearch --pattern` on it prints the single match `1038 -964 1`.
 
-Output is an ASCII grid: rows run along **z** (increasing = south), columns along **x**
-(increasing = east), `X` = bedrock, `.` = not bedrock. A per-layer bedrock count is printed
-to stderr.
+A match `(x, z)` is the world position of the pattern's *anchor*: a rare cell near its
+middle, not the top-left corner.
 
-The bedrock output shown in dump_bedrock can be used as a template for the p.txt input. 
+### `dump_bedrock` — print a region
 
-```
-$ build/dump_bedrock 0 0 0 32 8 -60
-y=-60: 47 / 256 bedrock (0.1836)            <- stderr
-# seed=0 x0=0 z0=0 w=32 h=8
+```sh
+$ build/dump_bedrock <seed> <x0> <z0> <width> <height> [y|all]
+$ build/dump_bedrock 0 0 0 32 4 -60
+# seed=0 x0=0 z0=0 w=32 h=4
 # y=-60
 ...X....X....X.X.X......X.X..X.X
 .........X...X...........X......
 ................X...X........XX.
 XXX.........X...................
-...X........XX...XX.X.........X.
-XX...............X.....X......X.
-...X....X....X...X.XX.XX........
-......X..........X.X...X.XXX....
 ```
 
-(Each grid row is 32 characters — trailing `.`s just don't stand out.)
+Rows are z (south = down), columns x (east = right), `X` = bedrock.
+`tests/reference/bedrock_ref.py` is an independent Python implementation with the same CLI.
 
-`y = -60` is the most useful single layer to compare against a screenshot: it's the highest
-level with meaningful variation, so it carries the most distinguishing detail. `y = -64` is
-solid everywhere and `y = -59` is empty everywhere.
-
-### `tests/reference/bedrock_ref.py` — same thing, in Python
-
-An independent implementation of the identical algorithm. Same CLI as `dump_bedrock`, so
-you can cross-check any region:
-
-```sh
-python3 tests/reference/bedrock_ref.py 0 0 0 32 8 -60
-```
-
-Import it as a library:
-
-```python
-from tests.reference.bedrock_ref import BedrockGenerator
-
-gen = BedrockGenerator(seed=12345)
-gen.is_bedrock_floor(x=100, y=-61, z=-40)   # -> True / False
-```
-
-### C++ library
+### As a library
 
 ```cpp
 #include "gen/bedrock.hpp"
-
-rokkdoxx::BedrockGenerator gen(/*world_seed=*/12345);
+rokkdoxx::BedrockGenerator gen(12345);
 bool b = gen.is_bedrock_floor(100, -61, -40);
-
-// What the OpenCL kernel is handed: two per-seed constants + a per-plane cutoff.
-uint64_t lo = gen.derived_lo(), hi = gen.derived_hi();
-uint32_t t  = gen.threshold(-60);            // rk_bits24_at(lo,hi,x,-60,z) < t  == bedrock
 ```
 
-Link `rokkdoxx_gen` (`src/gen/bedrock.cpp` + headers). To run a search from your own code,
-link `rokksvc` and use `rokkdoxx::svc::make_client(...)`.
+Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_client("auto")`.
 
----
+## How it works
 
-## How to use it to actually find a location
-
-1. In-game, stand on the bedrock you want to locate (Nether floor, or a shaft dug to
-   bedrock). Note the layout of bedrock / non-bedrock on one layer.
-2. Run `rokktui`, enter the seed, set the pattern size and Y layer, and paint what you saw.
-   Mark cells you're unsure about as unknown; leave `orientations` on `all 8` so you don't
-   have to align the screenshot to north.
-3. Set a search center + radius and run, or use `rokksearch` for a scripted / very large
-   run. You get back every `(x, z)` where the pattern occurs — a block near the middle of
-   the shape (a rare "anchor" cell), already an in-game coordinate — plus which
-   orientations fit there.
-
-On CPU this covers a region a few thousand blocks<sup>2</sup>  in seconds; a whole-world
-sweep is the job the GPU worker exists for (build with `-DROKK_ENABLE_OPENCL=ON`). See
-[Performance](#performance).
-
----
+- Bedrock floor is the surface rule `minecraft:bedrock_floor` with a `vertical_gradient`:
+  `y = -64` always bedrock, `-63 … -60` with probability 0.8 … 0.2, `≥ -59` never. It depends
+  only on seed and coordinates (no biome, terrain or structures), so no game engine is needed.
+- The RNG is Xoroshiro128++ positional randomness, unchanged since Java 1.18.
+- Vanilla places bedrock when `(double)nextFloat() < prob`. The host precomputes
+  `threshold = ceil(prob · 2²⁴)` and every device compares `bits24 < threshold`: integer-only,
+  no fp64, so the GPU is bit-exact with the CPU.
+- The pattern is recentred on a rare anchor cell: one test there rejects all 8 orientations
+  at once, and orientations a symmetric pattern shares are collapsed.
+- On the GPU, each block of a tile is generated exactly once into a 1-bit-per-block plane,
+  then 32 candidates are tested at a time with word operations. Generation is the expensive
+  part, so all 8 orientations cost little more than one.
+- Three tiers in one process: front-ends (`rokktui`, `rokksearch`) → `SearchService`
+  (tiling, scheduling, dedup, progress, cancel, checkpoints) → one `Worker` (`CpuWorker` or
+  `OpenclWorker`).
 
 ## Performance
 
-**`G` = 10⁹** (one billion) candidate origins checked per second.
+`G` = 10⁹ candidate origins per second. The standard figure is the 15-minute sustained
+all-8 run; the other columns are the ~30 s quick benchmark.
 
-| | CPU (6c/12t Ryzen 5 5600) | GPU (RX 7900 XTX) | speedup |
-|---|---|---|---|
-| **exact** orientation | ~1.4 G | **~222 G** | ~160× |
-| **all 8** orientations | ~0.6 G | **~157 G** | ~260× |
-| all 8, symmetric pattern | ~1.4 G | **~213 G** | — |
+| machine | backend | **sustained all-8 G** (15 min) | exact G | all-8 G | all-8 sym G | notes |
+|---|---|---|---|---|---|---|
+| RX 7900 XTX | opencl | **149.0** (148.6–153.4, −2.7% first→last) | 222.1 | 157.4 | 212.8 | ROCm, 48 CU |
+| Ryzen 5 5600 | cpu | — | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 |
 
-The search recentres your pattern on a rare "anchor" cell; one bedrock test there rejects
-all 8 orientations at once, and orientations that a symmetric pattern shares are collapsed —
-so a symmetric shape costs the same as a single orientation. A match reports the world
-position of that anchor cell (near the middle of your pattern).
-
-On the GPU, each block of a tile (plus a small halo around it) is generated exactly once into
-a 1-bit-per-block plane, and 32 neighbouring candidates are then tested at a time with plain
-word operations. Generation is the expensive part, so checking all 8 orientations costs little
-more than checking one.
-
-A full Overworld-border sweep (9·10¹⁴ candidate origins) is **~1 h** on the GPU (exact
-orientation; ~1.5 h all 8), vs. weeks on the CPU. So: the CPU is fine once you know your rough location;
-the GPU makes a blind whole-world sweep practical.
-
-### Benchmark it yourself
+A whole-world sweep (3.6·10¹⁵ candidates) takes ~4.5 h exact / ~7 h all-8 on that GPU.
 
 ```sh
-build/rokksearch --benchmark              # GPU (or CPU if no GPU / --backend cpu)
-build/rokksearch --backend cpu --benchmark
+build/rokksearch --benchmark-long 15   # standard: sustained all-8, ~30 s sweeps
+build/rokksearch --benchmark           # quick: exact / all-8 / all-8 symmetric
 ```
 
-Fixed workload (a 6×6 asymmetric pattern + a 5×5 symmetric one), auto-sized region,
-warm-up + 5 timed iterations. Takes ~30 s. This is where the table above comes from.
+Both use a fixed workload (seed 0, a 6×6 pattern), so results compare across machines;
+`--backend cpu` for the CPU, `--json` for a pasteable result. `--benchmark-long` also checks
+that every sweep returns the identical matches (count + hash) and exits 1 if not, which
+catches throttling or a device that goes wrong under heat.
 
-| machine | backend | exact G | all-8 G | all-8 sym G | notes | date |
-|---|---|---|---|---|---|---|
-| RX 7900 XTX (gfx1100) | opencl | 222.1 | 157.4 | 212.8 | ROCm driver 3581, 48 CU; async double-buffer + bit-plane kernel | 2026-09 |
-| Ryzen 5 5600 | cpu | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 | 2026-09 |
+## Status
 
-### Why not just use Minecraft to check?
-
-As expected, the speedup vs in-engine usage is drastically increased. 
-
-- A vanilla client only uses JIT (Just-In-Time) generation, which limits large-scale sweeps like this program does
-- Headless generation ignores all wasted computation time for in-game objects such as mobs, entity calculations, etc. 
-
-
----
+| | Feature | Notes |
+|:-:|---|---|
+| ✅ | Overworld bedrock-floor generation | bit-exact vs Java RNG vectors + a Python reference |
+| ✅ | CPU search | multi-threaded |
+| ✅ | OpenCL GPU search | bit-plane kernel, bit-exact with the CPU |
+| ✅ | All 8 orientations | shared anchor, symmetric patterns collapsed |
+| ✅ | Whole-world search | `radius -1` |
+| ✅ | Resumable runs | `--checkpoint` |
+| ✅ | ETA + sustained benchmark | `--benchmark-long 15` checks results stay identical |
+| ✅ | `rokktui` / `rokksearch` on Linux | |
+| 🧪 | Windows (`rokktui`, `rokksearch`, GPU) | beta |
+| ⬜ | Faster CPU all-8 | still ~0.4× exact; the GPU's bit-plane idea should apply |
+| ⬜ | Reattach to a running search | |
+| ⬜ | Multi-Y patterns | several layers in one pattern |
+| ⬜ | Nether roof (`bedrock_roof`) | |
 
 ## Verification
 
-- The generator itself is checked against Java-generated RNG vectors and, byte-for-byte,
-  against an independent Python reimplementation over adversarial seeds and coordinates
-  (`test_bedrock`, `diff_test.py`).
-- **The search** is checked against a direct `BedrockGenerator` brute force (all 8
-  orientations) and proven independent of tile size (`test_search`).
-- **The GPU kernel** is diffed byte-for-byte against the CPU and checked for CPU/GPU search
-  parity (`test_gpu`, needs a device).
-- **The TUI's logic** (pattern ↔ file, request building, a fill-from-world → search round
-  trip, the matches file format, the screen diff) is tested without a terminal (`test_tui`).
-
-
----
+`ctest` runs: the generator against Java-generated RNG vectors and byte-for-byte against the
+Python reference (`test_bedrock`, `diff_test.py`); the search against a brute-force scan and
+across tile sizes (`test_search`); GPU vs CPU bit-exactness and search parity (`test_gpu`,
+needs a device); and the TUI's logic without a terminal (`test_tui`).
 
 ## License
 
-RokkDoxx is free software under the **GNU General Public License v3.0** — see
-[`LICENSE`](LICENSE).
+GPL-3.0 — see [`LICENSE`](LICENSE).

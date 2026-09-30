@@ -58,6 +58,12 @@ void test_build_request_errors() {
     m.at(0, 0) = svc::Cell::bedrock;
     m.radius = "-5";
     check(!build_request(m, req, err), "negative radius is rejected");
+    m.radius = "-1";
+    check(build_request(m, req, err) && req.region.x0 == -svc::Region::kWorldBorder &&
+              req.region.z1 == svc::Region::kWorldBorder - 1,
+          "radius -1 searches the whole world");
+    check(search_candidates(m) == 4.0 * svc::Region::kWorldBorder * svc::Region::kWorldBorder,
+          "radius -1 area is the whole world");
     m.radius = "12x";
     check(!build_request(m, req, err), "junk radius is rejected");
     m.radius = "10";

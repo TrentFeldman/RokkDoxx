@@ -54,8 +54,8 @@ bool fill_from_world(Model& m, std::string& err);
 // Chance a block at this Y of the bedrock floor is bedrock.
 double bedrock_probability(int y);
 
-// Candidate origins the search area covers; -1 if the radius isn't a valid
-// integer.
+// Candidate origins the search area covers (radius -1 = the whole world); -1
+// if the radius isn't valid.
 double search_candidates(const Model& m);
 
 // One "x z mask" line per match -- byte-identical to rokksearch's stdout.

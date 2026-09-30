@@ -13,6 +13,7 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -86,6 +87,11 @@ struct Region {
     static Region centered(std::int64_t cx, std::int64_t cz, std::int64_t radius) {
         return Region{cx - radius, cx + radius, cz - radius, cz + radius};
     }
+    // Every block inside the default Overworld world border (+/-29,999,984).
+    static constexpr std::int64_t kWorldBorder = 29'999'984;
+    static Region world() {
+        return Region{-kWorldBorder, kWorldBorder - 1, -kWorldBorder, kWorldBorder - 1};
+    }
     long long candidates() const {
         return static_cast<long long>(x1 - x0 + 1) * static_cast<long long>(z1 - z0 + 1);
     }
@@ -134,12 +140,26 @@ struct JobStatus {
     long long candidates_done = 0;
     std::uint64_t matches = 0;
     double elapsed_s = 0.0;
-    double rate = 0.0;  // candidate origins / second
+    double rate = 0.0;   // candidate origins / second, this run (not counting resumed tiles)
+    double eta_s = 0.0;  // seconds left at `rate`; 0 until the first tile lands
     bool truncated = false;
     std::string error;
 };
 
 using JobId = std::uint64_t;
+
+// "1h 02m 03s" / "4m 05s" / "7s" -- for ETA and elapsed displays.
+inline std::string format_duration(double seconds) {
+    const long long t = seconds > 0 ? static_cast<long long>(seconds + 0.5) : 0;
+    char b[48];
+    if (t >= 3600)
+        std::snprintf(b, sizeof b, "%lldh %02lldm %02llds", t / 3600, t / 60 % 60, t % 60);
+    else if (t >= 60)
+        std::snprintf(b, sizeof b, "%lldm %02llds", t / 60, t % 60);
+    else
+        std::snprintf(b, sizeof b, "%llds", t);
+    return b;
+}
 
 // --- worker (compute tier) ----------------------------------------------
 

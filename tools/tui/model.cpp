@@ -46,8 +46,8 @@ void file_to_model(const svc::PatternFile& pf, Model& m) {
 
 bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
     long long cx, cz, rad;
-    if (!parse_i64(m.cx, cx) || !parse_i64(m.cz, cz) || !parse_i64(m.radius, rad) || rad < 0) {
-        err = "center X/Z and radius must be integers (radius >= 0)";
+    if (!parse_i64(m.cx, cx) || !parse_i64(m.cz, cz) || !parse_i64(m.radius, rad) || rad < -1) {
+        err = "center X/Z and radius must be integers (radius >= 0, or -1 for the whole world)";
         return false;
     }
     req.seed = svc::seed_from_string(m.seed);
@@ -57,7 +57,7 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
         err = "pattern has no known cells -- paint some bedrock first";
         return false;
     }
-    req.region = svc::Region::centered(cx, cz, rad);
+    req.region = rad == -1 ? svc::Region::world() : svc::Region::centered(cx, cz, rad);
     req.all_orientations = m.all_orient;
     req.match_cap = 1u << 20;
     req.checkpoint_path = m.checkpoint;
@@ -87,8 +87,8 @@ double bedrock_probability(int y) {
 
 double search_candidates(const Model& m) {
     long long r = 0;
-    if (!parse_i64(m.radius, r) || r < 0) return -1;
-    const double side = 2.0 * static_cast<double>(r) + 1.0;
+    if (!parse_i64(m.radius, r) || r < -1) return -1;
+    const double side = r == -1 ? 2.0 * svc::Region::kWorldBorder : 2.0 * static_cast<double>(r) + 1.0;
     return side * side;
 }
 

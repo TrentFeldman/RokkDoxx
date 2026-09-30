@@ -33,6 +33,7 @@ std::vector<Match> run(SearchService& svc, const SearchRequest& req) {
     JobId id = svc.submit(req);
     for (;;) {
         JobStatus st = svc.poll(id);
+        if (st.state == JobState::done) check(st.eta_s == 0.0, "a finished job has no ETA left");
         if (st.state == JobState::done || st.state == JobState::cancelled) break;
         if (st.state == JobState::error) {
             std::printf("  FAIL: job error: %s\n", st.error.c_str());
@@ -240,6 +241,15 @@ void test_pattern_io_roundtrip() {
 // build_search_plan: anchor choice + duplicate-orientation collapse, plus an
 // end-to-end check that a symmetric pattern still returns exactly what a plain
 // 8-orientation brute force does (keyed to the anchor).
+void test_format_duration() {
+    std::printf("test_format_duration\n");
+    check(format_duration(0) == "0s" && format_duration(-3) == "0s", "zero / negative");
+    check(format_duration(59.4) == "59s", "seconds");
+    check(format_duration(65) == "1m 05s", "minutes");
+    check(format_duration(3723) == "1h 02m 03s", "hours");
+    check(format_duration(100 * 3600.0) == "100h 00m 00s", "long runs keep counting hours");
+}
+
 void test_search_plan() {
     std::printf("test_search_plan\n");
 
@@ -305,6 +315,7 @@ int main() {
     test_roundtrip_and_equiv();
     test_tiling_invariant();
     test_search_plan();
+    test_format_duration();
     test_cancel();
     test_scheduler_checkpoint();
     test_pattern_io_roundtrip();

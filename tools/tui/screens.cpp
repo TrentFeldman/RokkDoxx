@@ -41,7 +41,7 @@ const char* field_name(int f) {
         case F_Y: return "Y layer";
         case F_CX: return "center X";
         case F_CZ: return "center Z";
-        case F_RADIUS: return "radius (blocks)";
+        case F_RADIUS: return "radius (-1=all)";
         case F_ORIENT: return "orientations";
         case F_BACKEND: return "backend";
         case F_CKPT: return "checkpoint file";
@@ -66,7 +66,7 @@ std::string field_value(const App& app, int f) {
         case F_Y: return std::to_string(m.y);
         case F_CX: return m.cx;
         case F_CZ: return m.cz;
-        case F_RADIUS: return m.radius;
+        case F_RADIUS: return m.radius == "-1" ? "-1  (whole world, center ignored)" : m.radius;
         case F_ORIENT: return m.all_orient ? "all 8" : "exact";
         case F_BACKEND: return backend_text(app);
         case F_CKPT: return m.checkpoint.empty() ? "(off)" : m.checkpoint;
@@ -104,7 +104,7 @@ void draw_params(const App& app, Frame& fr) {
         const double n = search_candidates(app.m);
         char b[160];
         if (n < 0)
-            std::snprintf(b, sizeof(b), "  search area: radius must be a non-negative integer");
+            std::snprintf(b, sizeof(b), "  search area: radius must be -1 or a non-negative integer");
         else
             std::snprintf(b, sizeof(b), "  search area: %.4g candidate origins", n);
         fr.line(dim(b));
@@ -208,7 +208,7 @@ bool handle_params(App& app, int k) {
         case F_Y: m.y = std::clamp(m.y + step, -64, -59); break;
         case F_CX: edit_text(m.cx, k, true, true); break;
         case F_CZ: edit_text(m.cz, k, true, true); break;
-        case F_RADIUS: edit_text(m.radius, k, true, false); break;
+        case F_RADIUS: edit_text(m.radius, k, true, true); break;
         case F_ORIENT:
             if (step != 0 || k == ' ') m.all_orient = !m.all_orient;
             break;
@@ -407,10 +407,12 @@ void draw_result(App& app, Frame& fr) {
     }
 
     char b[256];
-    std::snprintf(b, sizeof(b), "  %s  %5.1f%%   %s   %.0f M/s   %.1fs", to_string(st.state),
-                  st.progress * 100.0, progress_bar(st.progress, 32).c_str(), st.rate / 1e6,
-                  st.elapsed_s);
+    std::snprintf(b, sizeof(b), "  %s  %5.1f%%   %s   %.0f M/s", to_string(st.state),
+                  st.progress * 100.0, progress_bar(st.progress, 32).c_str(), st.rate / 1e6);
     fr.line(b);
+    std::string times = "  elapsed " + svc::format_duration(st.elapsed_s);
+    if (app.job_running) times += "    ETA " + (st.rate > 0 ? svc::format_duration(st.eta_s) : "--");
+    fr.line(times);
     std::snprintf(b, sizeof(b), "  scanned %.4g / %.4g origins    matches: %llu%s",
                   static_cast<double>(st.candidates_done), static_cast<double>(st.candidates_total),
                   static_cast<unsigned long long>(st.matches), st.truncated ? "  (capped)" : "");

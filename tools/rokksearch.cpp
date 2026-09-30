@@ -36,7 +36,7 @@ namespace {
                  "  --size <WxH>          pattern size when not loading a file\n"
                  "  --pattern <file>      load a .txt pattern (sets seed/y/center/radius too)\n"
                  "  --center <x,z>        search-region center\n"
-                 "  --radius <r>          search-region half-extent (blocks)\n"
+                 "  --radius <r>          search-region half-extent (blocks); -1 = whole world\n"
                  "  --region <x0,x1,z0,z1> explicit search region (overrides center/radius)\n"
                  "  --orientations <all|exact>\n"
                  "  --cap <n>             max matches to keep (default 1048576)\n"
@@ -49,6 +49,9 @@ namespace {
                  "                       (fixed workload; ignores --seed/--pattern/--region)\n"
                  "  --benchmark-seconds <f>  target seconds per phase (default 2.0)\n"
                  "  --benchmark-iters <n>    measured iterations per phase (default 5)\n"
+                 "  --benchmark-long <min>   sustained all-8 load for <min> minutes (15 = the\n"
+                 "                           standard); checks every ~30 s sweep returns\n"
+                 "                           identical matches (exit 1 if not)\n"
                  "  --list-backends\n");
     std::exit(code);
 }
@@ -75,8 +78,8 @@ constexpr long long kMaxCandidates = 500'000'000'000LL;  // clamp per phase
 
 // The fixed workload pattern: a 6x6 patch (a typical real size) filled from the
 // generator at a fixed origin, so it is a genuine bedrock configuration for
-// `kSeed`. It matches ~once in the whole benchmark region, so result collection
-// is free and the search does representative work. This shape has 8 distinct D4
+// `kSeed`. It matches well under once per million candidates, so result
+// collection stays negligible and the search does representative work. This shape has 8 distinct D4
 // orientations -- the all-8 worst case.
 constexpr int kPatW = 6, kPatH = 6, kFillX = 137, kFillZ = -251;
 
@@ -111,10 +114,17 @@ inline Pattern symmetric_pattern() {
     return p;
 }
 
+// Order-independent fingerprint of a sweep's matches: tiles and GPU atomics
+// finish in any order, so the hash is a sum of per-match mixes.
+struct Digest {
+    std::uint64_t count = 0, hash = 0;
+    bool operator==(const Digest&) const = default;
+};
+
 // One timed sweep of `region` through an already-configured worker. Mirrors
 // SearchService::run()'s pump loop (two tiles in flight) so the benchmark
 // measures the overlapped path the service ships with.
-inline double sweep(Worker& w, const Region& region, int tile_side) {
+inline double sweep(Worker& w, const Region& region, int tile_side, Digest* d = nullptr) {
     TileScheduler sched(region, tile_side);
     Tile t;
     const auto t0 = std::chrono::steady_clock::now();
@@ -131,8 +141,15 @@ inline double sweep(Worker& w, const Region& region, int tile_side) {
             ++inflight;
         }
         if (inflight == 0) break;
-        (void)w.end_tile();
+        const std::vector<Match> m = w.end_tile();
         --inflight;
+        if (d)
+            for (const Match& x : m) {
+                const std::uint64_t key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x.x)) << 32) |
+                                          static_cast<std::uint32_t>(x.z);
+                ++d->count;
+                d->hash += rk_mix_stafford13(rk_mix_stafford13(key) ^ x.orient_mask);
+            }
     }
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -143,17 +160,18 @@ inline long long candidates_of(long r) {
 }
 
 // radius whose region has ~`cand` candidate origins, clamped to sane bounds.
-inline long radius_for(double cand) {
-    if (cand > static_cast<double>(kMaxCandidates)) cand = static_cast<double>(kMaxCandidates);
+inline long radius_for(double cand, double cap = static_cast<double>(kMaxCandidates)) {
+    if (cand > cap) cand = cap;
     long r = static_cast<long>((std::sqrt(cand) - 1.0) / 2.0);
     return r < 1000 ? 1000 : r;
 }
 
 // Extrapolate from one measured sweep to the radius that should take `target_s`.
-inline long calibrate_from(long r, double elapsed, double target_s) {
-    if (elapsed < 1e-6) return radius_for(static_cast<double>(kMaxCandidates));
+inline long calibrate_from(long r, double elapsed, double target_s,
+                           double cap = static_cast<double>(kMaxCandidates)) {
+    if (elapsed < 1e-6) return radius_for(cap, cap);
     const double rate = static_cast<double>(candidates_of(r)) / elapsed;  // cand / s
-    return radius_for(rate * target_s);
+    return radius_for(rate * target_s, cap);
 }
 
 struct PhaseResult {
@@ -246,7 +264,99 @@ inline std::string host_compiler() {
     return buf;
 }
 
-inline int run(const std::string& backend_arg, bool json, double target_s, int iters) {
+inline void print_header(const char* title, const BackendInfo& chosen) {
+    std::printf("rokksearch %s v%d\n", title, kBenchVersion);
+    std::printf("backend   : %s\n", chosen.label.c_str());
+    if (chosen.is_gpu)
+        std::printf("device    : %s  |  %s  |  driver %s  |  %d CU\n", chosen.label.c_str(),
+                    chosen.version.empty() ? "OpenCL ?" : chosen.version.c_str(),
+                    chosen.driver.empty() ? "?" : chosen.driver.c_str(), chosen.units);
+    std::printf("host      : %s %s  |  %u threads  |  %s\n", host_os(), host_arch(),
+                std::thread::hardware_concurrency(), host_compiler().c_str());
+}
+
+// --benchmark-long: sustained load. The all-8 phase's workload, sized to
+// ~kLongSweepS per sweep, swept back to back for `minutes`. Every sweep must
+// return the identical match set (count + order-independent hash): a device
+// that overheats, throttles into errors or flips bits shows up here, not in a
+// 2-second phase. The per-sweep rates show clock drift over the run.
+constexpr double kLongSweepS = 30.0;
+
+inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, bool json,
+                    const BackendInfo& chosen) {
+    using clock = std::chrono::steady_clock;
+    cfg.knowns = standard_pattern().knowns();
+    cfg.all_orientations = true;
+    w.configure(cfg);
+
+    // Calibrate the sweep size (capped at the whole world).
+    const double world = 4.0 * static_cast<double>(Region::kWorldBorder) * Region::kWorldBorder;
+    double e = sweep(w, Region::centered(0, 0, 3000), tile_side);
+    long r = calibrate_from(3000, e, 2.0, world);
+    e = sweep(w, Region::centered(0, 0, r), tile_side);
+    r = calibrate_from(r, e, kLongSweepS, world);
+    const Region region = Region::centered(0, 0, r);
+    const long long cand = candidates_of(r);
+
+    // Progress lines go to stderr in --json mode so stdout stays one object.
+    FILE* out = json ? stderr : stdout;
+    if (!json) {
+        print_header("long benchmark", chosen);
+        std::printf("workload  : all-8, %dx%d pattern, seed %lld at y %d, r=%ld (%.2e cand/sweep)\n",
+                    kPatW, kPatH, static_cast<long long>(kSeed), kPlaneY, r, static_cast<double>(cand));
+        std::printf("duration  : %s\n\n", format_duration(minutes * 60).c_str());
+    }
+
+    const auto t0 = clock::now();
+    std::vector<double> rates;
+    Digest first;
+    bool consistent = true, capped = false;
+    for (int n = 0;; ++n) {
+        const double spent = std::chrono::duration<double>(clock::now() - t0).count();
+        if (n >= 2 && spent >= minutes * 60) break;
+        w.configure(cfg);  // resets the worker's match cap / truncation state
+        Digest d;
+        const double el = sweep(w, region, tile_side, &d);
+        const bool trunc = w.truncated();
+        if (n == 0) first = d;
+        const bool same = d == first;
+        consistent = consistent && same;
+        capped = capped || trunc;
+        rates.push_back(static_cast<double>(cand) / el / 1e9);
+        const double left = minutes * 60 - std::chrono::duration<double>(clock::now() - t0).count();
+        std::fprintf(out, "sweep %3d  %7.2f Gcand/s  %8llu matches  %016llx  %s   ETA %s\n", n + 1,
+                     rates.back(), static_cast<unsigned long long>(d.count),
+                     static_cast<unsigned long long>(d.hash),
+                     trunc ? "CAPPED" : same ? "ok" : "MISMATCH",
+                     format_duration(left).c_str());
+        std::fflush(out);
+    }
+
+    std::vector<double> sorted = rates;
+    std::sort(sorted.begin(), sorted.end());
+    const double drift = (rates.back() / rates.front() - 1.0) * 100.0;
+    const double total = std::chrono::duration<double>(clock::now() - t0).count();
+    const char* verdict = !consistent ? "INCONSISTENT" : capped ? "CAPPED (hash not comparable)" : "consistent";
+    if (json) {
+        std::printf("{\"benchmark_version\":%d,\"mode\":\"long\",\"backend\":\"%s\",\"sweeps\":%zu,"
+                    "\"elapsed_s\":%.1f,\"candidates_per_sweep\":%lld,\"matches_per_sweep\":%llu,"
+                    "\"consistent\":%s,\"capped\":%s,\"gcand_s_first\":%.4f,\"gcand_s_last\":%.4f,"
+                    "\"gcand_s_min\":%.4f,\"gcand_s_median\":%.4f,\"gcand_s_max\":%.4f,\"drift_pct\":%.2f}\n",
+                    kBenchVersion, chosen.label.c_str(), rates.size(), total, cand,
+                    static_cast<unsigned long long>(first.count), consistent ? "true" : "false",
+                    capped ? "true" : "false", rates.front(), rates.back(), sorted.front(),
+                    sorted[sorted.size() / 2], sorted.back(), drift);
+    } else {
+        std::printf("\n%zu sweeps in %s: median %.2f Gcand/s (min %.2f, max %.2f), "
+                    "last vs first %+.1f%%\nresults: %s\n",
+                    rates.size(), format_duration(total).c_str(), sorted[sorted.size() / 2],
+                    sorted.front(), sorted.back(), drift, verdict);
+    }
+    return consistent && !capped ? 0 : 1;
+}
+
+inline int run(const std::string& backend_arg, bool json, double target_s, int iters,
+               double long_minutes) {
     if (target_s <= 0.05) target_s = 0.05;
     if (iters < 1) iters = 1;
 
@@ -289,6 +399,7 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
     base.match_cap = 1u << 20;
 
     const int tile_side = std::max(4096, worker->preferred_tile_side());
+    if (long_minutes > 0) return run_long(*worker, base, tile_side, long_minutes, json, chosen);
 
     const PhaseResult ex = run_phase(*worker, "exact", asym, false, tile_side, base, target_s, iters);
     const PhaseResult a8 = run_phase(*worker, "all-8", asym, true, tile_side, base, target_s, iters);
@@ -322,14 +433,7 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
         return 0;
     }
 
-    std::printf("rokksearch benchmark v%d\n", kBenchVersion);
-    std::printf("backend   : %s\n", chosen.label.c_str());
-    if (chosen.is_gpu)
-        std::printf("device    : %s  |  %s  |  driver %s  |  %d CU\n", chosen.label.c_str(),
-                    chosen.version.empty() ? "OpenCL ?" : chosen.version.c_str(),
-                    chosen.driver.empty() ? "?" : chosen.driver.c_str(), chosen.units);
-    std::printf("host      : %s %s  |  %u threads  |  %s\n", host_os(), host_arch(), threads,
-                host_compiler().c_str());
+    print_header("benchmark", chosen);
     std::printf("pattern   : %dx%d asymmetric + 5x5 symmetric plus, seed %lld at y %d\n\n", kPatW,
                 kPatH, static_cast<long long>(kSeed), kPlaneY);
     for (const PhaseResult& p : phases) {
@@ -359,6 +463,7 @@ int main(int argc, char** argv) {
     bool json = false, bench = false, benchmark = false;
     double benchmark_seconds = 2.0;
     int benchmark_iters = 5;
+    double benchmark_long = 0;
     bool have_y = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -385,6 +490,7 @@ int main(int argc, char** argv) {
         else if (a == "--benchmark") benchmark = true;
         else if (a == "--benchmark-seconds") benchmark_seconds = std::atof(val("benchmark-seconds"));
         else if (a == "--benchmark-iters") benchmark_iters = std::atoi(val("benchmark-iters"));
+        else if (a == "--benchmark-long") { benchmark = true; benchmark_long = std::atof(val("benchmark-long")); }
         else if (a == "--list-backends") {
             for (const auto& b : list_backends())
                 std::printf("%-10s  %s%s\n", b.id.c_str(), b.label.c_str(), b.is_gpu ? "  [gpu]" : "");
@@ -398,7 +504,7 @@ int main(int argc, char** argv) {
     if (benchmark) {
         if (seed_s || !pattern_path.empty() || region_s || center_s)
             std::fprintf(stderr, "note: --benchmark uses a fixed workload; search args ignored\n");
-        return bmark::run(backend, json, benchmark_seconds, benchmark_iters);
+        return bmark::run(backend, json, benchmark_seconds, benchmark_iters, benchmark_long);
     }
 
     SearchRequest req;
@@ -415,7 +521,7 @@ int main(int argc, char** argv) {
         if (!center_s && !region_s) {
             long long cx = std::atoll(pf.center_x.c_str()), cz = std::atoll(pf.center_z.c_str());
             long long r = std::atoll(pf.radius.c_str());
-            req.region = Region::centered(cx, cz, r);
+            req.region = r == -1 ? Region::world() : Region::centered(cx, cz, r);
         }
         req.all_orientations = pf.all_orientations;
     }
@@ -450,7 +556,7 @@ int main(int argc, char** argv) {
         long long cx, cz;
         if (!parse2(center_s, cx, cz, ',')) usage(2);
         long long r = radius_s ? std::atoll(radius_s) : 5000;
-        req.region = Region::centered(cx, cz, r);
+        req.region = r == -1 ? Region::world() : Region::centered(cx, cz, r);
     } else if (pattern_path.empty()) {  // otherwise the region came from the file
         std::fprintf(stderr, "need --center/--radius or --region (or a --pattern file that has them)\n");
         return 2;
@@ -466,11 +572,12 @@ int main(int argc, char** argv) {
         job = client->submit(req);
         for (;;) {
             JobStatus st = client->poll(job);
-            std::fprintf(stderr, "\r%-9s %6.2f%%  %lld/%lld  matches=%" PRIu64 "  %.0f M/s   ",
+            std::fprintf(stderr, "\r%-9s %6.2f%%  %lld/%lld  matches=%" PRIu64 "  %.0f M/s  ETA %s   ",
                          to_string(st.state), st.progress * 100.0,
                          static_cast<long long>(st.candidates_done),
                          static_cast<long long>(st.candidates_total),
-                         static_cast<std::uint64_t>(st.matches), st.rate / 1e6);
+                         static_cast<std::uint64_t>(st.matches), st.rate / 1e6,
+                         st.rate > 0 ? format_duration(st.eta_s).c_str() : "--");
             std::fflush(stderr);
             if (st.state == JobState::done || st.state == JobState::cancelled) break;
             if (st.state == JobState::error) {
