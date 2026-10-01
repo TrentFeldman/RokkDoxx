@@ -43,7 +43,18 @@ std::uint64_t request_fingerprint(const SearchRequest& req) {
     return h;
 }
 
-TileScheduler::TileScheduler(Region region, int tile_side)
+namespace {
+// Cutting n tiles into `cells` map cells: cell m starts at tile split(m), so
+// the cells differ in size by at most one tile. cell_of_tile() is its inverse.
+int split(int n, int cells, int m) {
+    return static_cast<int>(static_cast<long long>(m) * n / cells);
+}
+int cell_of_tile(int n, int cells, int t) {
+    return static_cast<int>(((static_cast<long long>(t) + 1) * cells - 1) / n);
+}
+}  // namespace
+
+TileScheduler::TileScheduler(Region region, int tile_side, int map_w, int map_h)
     : region_(region), tile_side_(tile_side < 1 ? 1 : tile_side) {
     constexpr long long kMaxTiles = 2'000'000;
     const long long spanx = region_.x1 - region_.x0 + 1;
@@ -61,7 +72,33 @@ TileScheduler::TileScheduler(Region region, int tile_side)
         tile_side_ *= 2;
     }
     n_ = nx_ * nz_;
+    mw_ = std::clamp(map_w, 1, nx_);
+    mh_ = std::clamp(map_h, 1, nz_);
     done_.assign(static_cast<std::size_t>(n_), 0);
+    busy_.assign(static_cast<std::size_t>(n_), 0);
+    const std::size_t cells = static_cast<std::size_t>(mw_) * static_cast<std::size_t>(mh_);
+    cell_done_.assign(cells, 0);
+    cell_busy_.assign(cells, 0);
+    cell_hit_.assign(cells, 0);
+
+    // Spiral order: by ring (Chebyshev distance from the centre tile), and round
+    // each ring clockwise from its top-left corner.
+    const int cx = std::clamp(static_cast<int>(((region_.x0 + region_.x1) / 2 - region_.x0) / tile_side_), 0, nx_ - 1);
+    const int cz = std::clamp(static_cast<int>(((region_.z0 + region_.z1) / 2 - region_.z0) / tile_side_), 0, nz_ - 1);
+    std::vector<std::pair<std::int64_t, int>> keyed(static_cast<std::size_t>(n_));
+    for (int i = 0; i < n_; ++i) {
+        const int dx = i % nx_ - cx, dz = i / nx_ - cz;
+        const int r = std::max(std::abs(dx), std::abs(dz));
+        const int along = r == 0 ? 0
+                          : dz == -r ? dx + r                  // top row, left to right
+                          : dx == r  ? 2 * r + (dz + r)        // right column, downward
+                          : dz == r  ? 4 * r + (r - dx)        // bottom row, right to left
+                                     : 6 * r + (r - dz);       // left column, upward
+        keyed[static_cast<std::size_t>(i)] = {(static_cast<std::int64_t>(r) << 25) | along, i};
+    }
+    std::sort(keyed.begin(), keyed.end());
+    order_.reserve(keyed.size());
+    for (const auto& k : keyed) order_.push_back(k.second);
 }
 
 Tile TileScheduler::tile_at(int index) const {
@@ -79,21 +116,59 @@ Tile TileScheduler::tile_at(int index) const {
     return t;
 }
 
-bool TileScheduler::next(Tile& out) {
-    while (cursor_ < n_ && done_[static_cast<std::size_t>(cursor_)]) ++cursor_;
-    if (cursor_ >= n_) return false;
-    out = tile_at(cursor_);
-    ++cursor_;
-    return true;
+int TileScheduler::cell_of(int tile_index) const {
+    return cell_of_tile(nz_, mh_, tile_index / nx_) * mw_ + cell_of_tile(nx_, mw_, tile_index % nx_);
 }
 
-void TileScheduler::mark_done(const Tile& tile) {
-    const int index = tile.index;
-    if (index >= 0 && index < n_ && !done_[static_cast<std::size_t>(index)]) {
-        done_[static_cast<std::size_t>(index)] = 1;
-        ++done_count_;
-        candidates_done_ += static_cast<long long>(tile.w) * tile.h;
+bool TileScheduler::next(Tile& out) {
+    while (cursor_ < order_.size()) {
+        const int index = order_[cursor_++];
+        if (done_[static_cast<std::size_t>(index)]) continue;
+        busy_[static_cast<std::size_t>(index)] = 1;
+        ++cell_busy_[static_cast<std::size_t>(cell_of(index))];
+        out = tile_at(index);
+        return true;
     }
+    return false;
+}
+
+void TileScheduler::mark_done(const Tile& tile) { finish(tile.index); }
+
+void TileScheduler::finish(int index) {
+    if (index < 0 || index >= n_ || done_[static_cast<std::size_t>(index)]) return;
+    const Tile t = tile_at(index);
+    const std::size_t c = static_cast<std::size_t>(cell_of(index));
+    done_[static_cast<std::size_t>(index)] = 1;
+    ++done_count_;
+    ++cell_done_[c];
+    candidates_done_ += static_cast<long long>(t.w) * t.h;
+    if (busy_[static_cast<std::size_t>(index)]) {
+        busy_[static_cast<std::size_t>(index)] = 0;
+        --cell_busy_[c];
+    }
+}
+
+void TileScheduler::mark_hit(std::int64_t x, std::int64_t z) {
+    if (x < region_.x0 || x > region_.x1 || z < region_.z0 || z > region_.z1) return;
+    const int tx = static_cast<int>((x - region_.x0) / tile_side_);
+    const int tz = static_cast<int>((z - region_.z0) / tile_side_);
+    ++cell_hit_[static_cast<std::size_t>(cell_of(tz * nx_ + tx))];
+}
+
+std::vector<MapCell> TileScheduler::map() const {
+    std::vector<MapCell> out(static_cast<std::size_t>(mw_) * static_cast<std::size_t>(mh_));
+    for (int c = 0; c < mw_ * mh_; ++c) {
+        const int mx = c % mw_, mz = c / mw_;
+        const int tiles = (split(nx_, mw_, mx + 1) - split(nx_, mw_, mx)) *
+                          (split(nz_, mh_, mz + 1) - split(nz_, mh_, mz));
+        const std::size_t i = static_cast<std::size_t>(c);
+        out[i].phase = cell_busy_[i]            ? MapCell::searching
+                       : cell_done_[i] == tiles ? MapCell::done
+                       : cell_done_[i] > 0      ? MapCell::partial
+                                                : MapCell::pending;
+        out[i].hit = cell_hit_[i] > 0;
+    }
+    return out;
 }
 
 // Checkpoint file format:
@@ -107,9 +182,13 @@ void TileScheduler::mark_done(const Tile& tile) {
 // already-done. Any other version is rejected.
 bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t fingerprint,
                                     std::vector<Match>& out_matches) {
-    out_matches.clear();
     std::ifstream f(path);
-    if (!f) return false;
+    return f && read_checkpoint(f, fingerprint, out_matches);
+}
+
+bool TileScheduler::read_checkpoint(std::istream& f, std::uint64_t fingerprint,
+                                    std::vector<Match>& out_matches) {
+    out_matches.clear();
     std::string tag;
     int version = 0;
     std::uint64_t fp = 0;
@@ -135,13 +214,7 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
                 a = std::atoi(tok.substr(0, dash).c_str());
                 b = std::atoi(tok.substr(dash + 1).c_str());
             }
-            for (int i = a; i <= b && i < n_; ++i)
-                if (i >= 0 && !done_[static_cast<std::size_t>(i)]) {
-                    done_[static_cast<std::size_t>(i)] = 1;
-                    ++done_count_;
-                    const Tile t = tile_at(i);
-                    candidates_done_ += static_cast<long long>(t.w) * t.h;
-                }
+            for (int i = std::max(a, 0); i <= b && i < n_; ++i) finish(i);
         }
     }
 
@@ -165,7 +238,11 @@ bool TileScheduler::load_checkpoint(const std::string& path, std::uint64_t finge
 void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t fingerprint,
                                     const std::vector<Match>& matches) const {
     std::ofstream f(path, std::ios::trunc);
-    if (!f) return;
+    if (f) write_checkpoint(f, fingerprint, matches);
+}
+
+void TileScheduler::write_checkpoint(std::ostream& f, std::uint64_t fingerprint,
+                                     const std::vector<Match>& matches) const {
     f << "rokkdoxx-checkpoint 2 " << fingerprint << "\ndone";
     int i = 0;
     while (i < n_) {
@@ -225,10 +302,12 @@ struct SearchService::Job {
     JobId id = 0;
     SearchRequest req;
     std::atomic<bool> cancel{false};
+    std::atomic<bool> pause{false};
 
     mutable std::mutex mu;
     JobStatus status;
     std::vector<Match> results;
+    std::string ckpt_text;  // see SearchRequest::keep_checkpoint
 
     std::thread th;
 };
@@ -295,6 +374,20 @@ void SearchService::cancel(JobId id) {
     if (it != jobs_.end()) it->second->cancel.store(true);
 }
 
+void SearchService::pause(JobId id, bool on) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = jobs_.find(id);
+    if (it != jobs_.end()) it->second->pause.store(on);
+}
+
+std::string SearchService::checkpoint(JobId id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = jobs_.find(id);
+    if (it == jobs_.end()) return {};
+    std::lock_guard<std::mutex> jl(it->second->mu);
+    return it->second->ckpt_text;
+}
+
 // The body of one job's worker thread. noexcept: any failure is recorded in the
 // job's status, never thrown out of the thread.
 void SearchService::run(Job* job) noexcept {
@@ -332,19 +425,42 @@ void SearchService::run(Job* job) noexcept {
         int tile_side = req.tile_side;
         if (const int pref = worker->preferred_tile_side()) tile_side = std::max(tile_side, pref);
 
-        TileScheduler sched(req.region, tile_side);
+        TileScheduler sched(req.region, tile_side, req.map_w, req.map_h);
         const std::uint64_t fp = request_fingerprint(req);
         ResultSink sink(req.match_cap);
-        if (!req.checkpoint_path.empty()) {
+        {
             std::vector<Match> restored;
-            if (sched.load_checkpoint(req.checkpoint_path, fp, restored)) sink.add(restored);
+            bool resumed_from = false;
+            if (!req.resume_text.empty()) {
+                std::istringstream in(req.resume_text);
+                resumed_from = sched.read_checkpoint(in, fp, restored);
+            }
+            if (!resumed_from && !req.checkpoint_path.empty())
+                resumed_from = sched.load_checkpoint(req.checkpoint_path, fp, restored);
+            if (resumed_from) {
+                sink.add(restored);
+                for (const Match& m : restored) sched.mark_hit(m.x, m.z);
+            }
         }
+
+        // Copy the scheduler's progress map into the job status (if a front-end
+        // asked for one) so poll() can show which areas are being searched.
+        const bool want_map = req.map_w > 0 && req.map_h > 0;
+        auto publish_map = [&] {
+            if (!want_map) return;
+            std::vector<MapCell> cells = sched.map();
+            std::lock_guard<std::mutex> jl(job->mu);
+            job->status.map_w = sched.map_w();
+            job->status.map_h = sched.map_h();
+            job->status.map = std::move(cells);
+        };
         // Tiles a checkpoint already covered; the rate (and so the ETA) only
         // counts work done in this run.
         const long long resumed = sched.candidates_done();
 
         worker->configure(cfg);
 
+        publish_map();
         {
             std::lock_guard<std::mutex> jl(job->mu);
             job->status.state = JobState::running;
@@ -355,18 +471,38 @@ void SearchService::run(Job* job) noexcept {
         // completed tile so a poller sees live progress. Up to two tiles are
         // in flight, so OpenclWorker's dispatch for tile N overlaps its
         // read-back for tile N-1 (other workers run each tile in begin_tile()).
-        auto last_ckpt = clock::now();
+        // Progress goes to the checkpoint file and/or the in-memory copy. The
+        // first tile saves at once (last_ckpt starts in the past), then every 5 s.
+        auto last_ckpt = clock::now() - std::chrono::seconds(10);
+        auto save_progress = [&](const std::vector<Match>& matches) {
+            if (req.checkpoint_path.empty() && !req.keep_checkpoint) return;
+            std::ostringstream text;
+            sched.write_checkpoint(text, fp, matches);
+            if (!req.checkpoint_path.empty()) {
+                std::ofstream f(req.checkpoint_path, std::ios::trunc);
+                if (f) f << text.str();
+            }
+            if (req.keep_checkpoint) {
+                std::lock_guard<std::mutex> jl(job->mu);
+                job->ckpt_text = text.str();
+            }
+            last_ckpt = clock::now();
+        };
+        double paused_total = 0.0;  // seconds spent paused: not counted in elapsed / rate
 
         // Bookkeeping for one *completed* tile -- called at drain time, which
         // lags dispatch order by up to one tile. That
         // lag is fine: TileScheduler::mark_done/ResultSink::add are already
         // idempotent/order-independent, and progress stays monotonic.
+        bool stop = false;  // stop_at_first_match: no new tiles once one has a match
         auto on_tile_done = [&](const Tile& done, const std::vector<Match>& m) {
+            if (req.stop_at_first_match && !m.empty()) stop = true;
             sink.add(m);
+            for (const Match& mm : m) sched.mark_hit(mm.x, mm.z);
             sched.mark_done(done);
 
             const auto now = clock::now();
-            const double elapsed = std::chrono::duration<double>(now - t0).count();
+            const double elapsed = std::chrono::duration<double>(now - t0).count() - paused_total;
             const long long cdone = sched.candidates_done();
             {
                 std::lock_guard<std::mutex> jl(job->mu);
@@ -384,12 +520,26 @@ void SearchService::run(Job* job) noexcept {
                         : 0.0;
                 job->status.truncated = sink.truncated() || worker->truncated();
             }
+            publish_map();
 
-            if (!req.checkpoint_path.empty() &&
-                std::chrono::duration<double>(now - last_ckpt).count() > 5.0) {
-                sched.save_checkpoint(req.checkpoint_path, fp, sink.snapshot());
-                last_ckpt = now;
+            if (std::chrono::duration<double>(now - last_ckpt).count() > 5.0) save_progress(sink.snapshot());
+        };
+
+        // Idle until resumed (or cancelled). Entering the pause is the moment to
+        // save: nothing is in flight, so the saved progress is exact.
+        auto wait_while_paused = [&] {
+            const auto since = clock::now();
+            {
+                std::lock_guard<std::mutex> jl(job->mu);
+                job->status.elapsed_s = std::chrono::duration<double>(since - t0).count() - paused_total;
+                job->status.state = JobState::paused;
             }
+            save_progress(sink.snapshot());
+            while (job->pause.load() && !job->cancel.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            paused_total += std::chrono::duration<double>(clock::now() - since).count();
+            std::lock_guard<std::mutex> jl(job->mu);
+            job->status.state = JobState::running;
         };
 
         constexpr int kDepth = 2;
@@ -397,34 +547,44 @@ void SearchService::run(Job* job) noexcept {
         Tile t;
         bool more = true;
         while (true) {
-            // Admit new tiles up to the pipeline depth. Cancellation only
-            // stops *new* admissions -- anything already begun always gets
+            // Admit new tiles up to the pipeline depth. Cancellation and pausing
+            // only stop *new* admissions -- anything already begun always gets
             // drained below, so the loop never exits with GPU work still
             // outstanding.
-            while (more && !job->cancel.load() && static_cast<int>(inflight.size()) < kDepth) {
+            const auto may_admit = [&] { return more && !stop && !job->cancel.load(); };
+            while (may_admit() && !job->pause.load() && static_cast<int>(inflight.size()) < kDepth) {
                 if (!sched.next(t)) {
                     more = false;
                     break;
                 }
+                publish_map();  // the tile is now "searching" (a CPU worker computes it inside begin_tile)
                 worker->begin_tile(t);
                 inflight.push_back(t);
             }
-            if (inflight.empty()) break;
+            if (inflight.empty()) {
+                if (may_admit() && job->pause.load()) {  // drained: now actually pause
+                    wait_while_paused();
+                    continue;
+                }
+                break;
+            }
             std::vector<Match> m = worker->end_tile();
             on_tile_done(inflight.front(), m);
             inflight.pop_front();
         }
 
         std::vector<Match> final_matches = sink.snapshot();
-        if (!req.checkpoint_path.empty()) sched.save_checkpoint(req.checkpoint_path, fp, final_matches);
+        save_progress(final_matches);
 
         std::lock_guard<std::mutex> jl(job->mu);
         job->results = std::move(final_matches);
         job->status.matches = job->results.size();
-        job->status.elapsed_s = std::chrono::duration<double>(clock::now() - t0).count();
+        job->status.elapsed_s = std::chrono::duration<double>(clock::now() - t0).count() - paused_total;
         job->status.state = job->cancel.load() ? JobState::cancelled : JobState::done;
         job->status.eta_s = 0.0;
-        if (job->status.state == JobState::done) job->status.progress = 1.0;
+        const bool early = stop && sched.done_count() < sched.tile_count();  // a match on the last tile cut nothing short
+        job->status.stopped_early = early && job->status.state == JobState::done;
+        if (job->status.state == JobState::done && !early) job->status.progress = 1.0;
     } catch (const std::exception& e) {
         set_err(e.what());
     } catch (...) {

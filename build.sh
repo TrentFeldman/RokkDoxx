@@ -58,4 +58,5 @@ if [[ "${1:-}" == "test" ]]; then
   ./build/test_tui
   [[ -n "$GPU_TEST" ]] && ./build/test_gpu
   python3 tests/diff_test.py ./build/dump_bedrock
+  python3 tests/demo_test.py ./build/rokksearch
 fi

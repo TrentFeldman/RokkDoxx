@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,11 +35,14 @@ namespace {
                  "  --seed <s>            world seed (numeric or text)\n"
                  "  --y <n>               bedrock plane, -64..-59 (default -60)\n"
                  "  --size <WxH>          pattern size when not loading a file\n"
-                 "  --pattern <file>      load a .txt pattern (sets seed/y/center/radius too)\n"
+                 "  --pattern <file>      load a .txt pattern (sets seed/y/center/radius too); a session\n"
+                 "                        saved by rokktui (`s`) also resumes from its progress file\n"
                  "  --center <x,z>        search-region center\n"
                  "  --radius <r>          search-region half-extent (blocks); -1 = whole world\n"
                  "  --region <x0,x1,z0,z1> explicit search region (overrides center/radius)\n"
                  "  --orientations <all|exact>\n"
+                 "  --first               stop at the first match (the search scans outward from\n"
+                 "                        the middle of the region, so this finds the nearest)\n"
                  "  --cap <n>             max matches to keep (default 1048576)\n"
                  "  --tile <n>            tile side floor (default 4096)\n"
                  "  --checkpoint <file>   resumable progress file\n"
@@ -52,6 +56,11 @@ namespace {
                  "  --benchmark-long <min>   sustained all-8 load for <min> minutes (15 = the\n"
                  "                           standard); checks every ~30 s sweep returns\n"
                  "                           identical matches (exit 1 if not)\n"
+                 "  --demo <time>         write a pattern file to try without Minecraft: a random\n"
+                 "                        seed and spot, sized so searching for it takes about <time>\n"
+                 "                        on this machine: 90 or 90s, 5m, 2h; 'max' = the whole world\n"
+                 "                        (uses --seed/--y/--orientations/--backend if given)\n"
+                 "  --out <file>          where --demo writes (default demo_pattern.txt)\n"
                  "  --list-backends\n");
     std::exit(code);
 }
@@ -62,6 +71,23 @@ bool parse2(const char* s, long long& a, long long& b, char sep) {
     a = std::atoll(std::string(s, p).c_str());
     b = std::atoll(p + 1);
     return true;
+}
+
+// "90" / "90s" / "5m" / "1.5h" -> seconds; "max" -> `max` (the whole world).
+bool parse_budget(const char* text, double& seconds, bool& max) {
+    max = std::strcmp(text, "max") == 0;
+    if (max) {
+        seconds = 0;
+        return true;
+    }
+    char* end = nullptr;
+    const double v = std::strtod(text, &end);
+    const double unit = *end == '\0' || std::strcmp(end, "s") == 0 ? 1
+                        : std::strcmp(end, "m") == 0               ? 60
+                        : std::strcmp(end, "h") == 0               ? 3600
+                                                                   : 0;
+    seconds = v * unit;
+    return end != text && unit > 0 && seconds > 0;
 }
 
 // ===========================================================================
@@ -355,12 +381,10 @@ inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, 
     return consistent && !capped ? 0 : 1;
 }
 
-inline int run(const std::string& backend_arg, bool json, double target_s, int iters,
-               double long_minutes) {
-    if (target_s <= 0.05) target_s = 0.05;
-    if (iters < 1) iters = 1;
-
-    // Resolve the backend so we can also report its details.
+// Resolve `backend_arg` to a device and build its worker (a GPU kernel compiles
+// here). Returns 0, or the exit code to give up with.
+inline int open_worker(const std::string& backend_arg, BackendInfo& chosen,
+                       std::unique_ptr<Worker>& worker) {
     const auto backends = list_backends();
     if (backends.empty()) {
         std::fprintf(stderr, "no compute backend available\n");
@@ -378,25 +402,53 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
         }
         it = backends.begin();  // auto with no GPU -> cpu
     }
-    const BackendInfo chosen = *it;
-
-    std::unique_ptr<Worker> worker;
+    chosen = *it;
     try {
-        worker = make_worker_factory(chosen.id)();  // builds the GPU kernel once, here
+        worker = make_worker_factory(chosen.id)();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "backend error: %s\n", e.what());
         return 1;
     }
+    return 0;
+}
 
+// The benchmark's fixed seed and plane; callers add the pattern and orientations.
+inline WorkerConfig standard_config() {
     rokkdoxx::BedrockGenerator gen(kSeed);
+    WorkerConfig cfg;
+    cfg.derived_lo = gen.derived_lo();
+    cfg.derived_hi = gen.derived_hi();
+    cfg.plane_y = kPlaneY;
+    cfg.threshold = gen.threshold(kPlaneY);
+    cfg.match_cap = 1u << 20;
+    return cfg;
+}
+
+// Candidates/second for the search `cfg` describes, in about 1.5 s: a warm-up,
+// then two calibration rounds (the rate drifts a little with region size).
+inline double measure_rate(Worker& w, const WorkerConfig& cfg) {
+    w.configure(cfg);
+    const int tile_side = std::max(4096, w.preferred_tile_side());
+    double e = sweep(w, Region::centered(0, 0, 3000), tile_side);
+    long r = calibrate_from(3000, e, 0.4);
+    e = sweep(w, Region::centered(0, 0, r), tile_side);
+    r = calibrate_from(r, e, 1.0);
+    e = sweep(w, Region::centered(0, 0, r), tile_side);
+    return static_cast<double>(candidates_of(r)) / e;
+}
+
+inline int run(const std::string& backend_arg, bool json, double target_s, int iters,
+               double long_minutes) {
+    if (target_s <= 0.05) target_s = 0.05;
+    if (iters < 1) iters = 1;
+
+    BackendInfo chosen;
+    std::unique_ptr<Worker> worker;
+    if (const int rc = open_worker(backend_arg, chosen, worker)) return rc;
+
     const std::vector<KnownCell> asym = standard_pattern().knowns();
     const std::vector<KnownCell> sym = symmetric_pattern().knowns();
-    WorkerConfig base;
-    base.derived_lo = gen.derived_lo();
-    base.derived_hi = gen.derived_hi();
-    base.plane_y = kPlaneY;
-    base.threshold = gen.threshold(kPlaneY);
-    base.match_cap = 1u << 20;
+    const WorkerConfig base = standard_config();
 
     const int tile_side = std::max(4096, worker->preferred_tile_side());
     if (long_minutes > 0) return run_long(*worker, base, tile_side, long_minutes, json, chosen);
@@ -448,6 +500,127 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
 
 }  // namespace bmark
 
+// ===========================================================================
+// --demo <seconds> : a search you can try without opening Minecraft. A random
+// seed and a random spot in the world; the pattern is copied from that spot (so
+// it really is there); the region is sized from this machine's measured rate so
+// the search takes about `seconds`, and the pattern grows until a second,
+// spurious match is unlikely.
+// ===========================================================================
+namespace demo {
+
+constexpr double kMaxExtraMatches = 0.1;  // expected spurious matches we tolerate
+constexpr int kMargin = 40;               // the planted spot stays this far inside the region
+
+inline int run(const std::string& backend, const char* seed_s, int y, bool all_orient,
+               double seconds, bool max, const std::string& out_path) {
+    if (y < -63 || y > -60) {
+        std::fprintf(stderr, "--demo needs --y in -63..-60 (the other layers are all bedrock or all air)\n");
+        return 2;
+    }
+    std::mt19937_64 rng(std::random_device{}() ^
+                        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const std::int64_t seed = seed_s ? seed_from_string(seed_s) : static_cast<std::int64_t>(rng());
+    auto uniform = [&](std::int64_t lo, std::int64_t hi) {  // inclusive
+        return lo + static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(hi - lo + 1));
+    };
+
+    rokkdoxx::BedrockGenerator gen(seed);
+    const double pb = static_cast<double>(gen.threshold(y)) / 16777216.0;  // P(bedrock)
+
+    // `s` x `s` of the world at (fx, fz), as a fully known pattern; `p` = the
+    // chance a random spot matches it (one orientation).
+    auto copy_world = [&](int fx, int fz, int s, double& p) {
+        Pattern pat;
+        pat.w = pat.h = s;
+        pat.cells.assign(static_cast<std::size_t>(s) * s, Cell::not_bedrock);
+        p = 1.0;
+        for (int j = 0; j < s; ++j)
+            for (int i = 0; i < s; ++i) {
+                const bool bed = gen.is_bedrock_floor(fx + i, y, fz + j);
+                if (bed) pat.cells[static_cast<std::size_t>(j) * s + i] = Cell::bedrock;
+                p *= bed ? pb : 1.0 - pb;
+            }
+        return pat;
+    };
+
+    // Time a search shaped like the real one (this seed and layer, an 8x8 pattern
+    // from this world): the cost per candidate depends on the layer.
+    BackendInfo chosen;
+    std::unique_ptr<Worker> worker;
+    if (const int rc = bmark::open_worker(backend, chosen, worker)) return rc;
+    std::fprintf(stderr, "measuring speed on %s ...\n", chosen.label.c_str());
+    WorkerConfig cfg;
+    cfg.derived_lo = gen.derived_lo();
+    cfg.derived_hi = gen.derived_hi();
+    cfg.plane_y = y;
+    cfg.threshold = gen.threshold(y);
+    cfg.all_orientations = all_orient;
+    double unused;
+    cfg.knowns = copy_world(137, -251, 8, unused).knowns();
+    const double rate = bmark::measure_rate(*worker, cfg);  // candidates / second
+
+    // A random square of the world with ~seconds * rate candidates (10% spare).
+    const std::int64_t border = Region::kWorldBorder;
+    const std::int64_t r = max ? border
+                               : std::max<std::int64_t>(
+                                     64, static_cast<std::int64_t>((std::sqrt(rate * seconds * 0.9) - 1) / 2));
+    const bool whole = 2 * r + 1 >= 2 * border;  // `max`, or a budget longer than the world
+    std::int64_t cx = 0, cz = 0;
+    Region region = Region::world();
+    if (!whole) {
+        cx = uniform(-border + r, border - 1 - r);
+        cz = uniform(-border + r, border - 1 - r);
+        region = Region::centered(cx, cz, r);
+    }
+    const std::int64_t px = uniform(region.x0 + kMargin, region.x1 - kMargin);
+    const std::int64_t pz = uniform(region.z0 + kMargin, region.z1 - kMargin);
+
+    // Grow a square pattern copied from the world at (px, pz) until the expected
+    // number of other places it matches (area * orientations * P(pattern)) is small.
+    const double area = static_cast<double>(region.candidates());
+    PatternFile pf;
+    double extra = 0;
+    int fx = 0, fz = 0;
+    for (int s = 4; s <= 32 && (s == 4 || extra > kMaxExtraMatches); ++s) {
+        double p;
+        fx = static_cast<int>(px) - s / 2;
+        fz = static_cast<int>(pz) - s / 2;
+        pf.pattern = copy_world(fx, fz, s, p);
+        extra = area * (all_orient ? 8 : 1) * p;
+    }
+    pf.seed = std::to_string(seed);
+    pf.y = y;
+    pf.center_x = std::to_string(cx);
+    pf.center_z = std::to_string(cz);
+    pf.radius = whole ? "-1" : std::to_string(r);
+    pf.all_orientations = all_orient;
+    std::string err;
+    if (!save_pattern_file(out_path, pf, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+
+    // Matches are reported at the pattern's anchor cell, not its corner.
+    const SearchPlan plan = build_search_plan(pf.pattern.knowns(), gen.threshold(y), all_orient);
+    std::printf("wrote       : %s\n", out_path.c_str());
+    std::printf("seed        : %lld   (y %d)\n", static_cast<long long>(seed), y);
+    std::printf("speed       : %.1f Gcand/s on %s (%s)\n", rate / 1e9, chosen.label.c_str(),
+                all_orient ? "all 8 orientations" : "exact");
+    std::printf("search      : %s, %.2e candidates, about %s\n",
+                whole ? "whole world" : ("center " + std::to_string(cx) + "," + std::to_string(cz) +
+                                          " radius " + std::to_string(r)).c_str(),
+                area, format_duration(area / rate).c_str());
+    std::printf("pattern     : %dx%d, expect %.2g other matches\n", pf.pattern.w, pf.pattern.h, extra);
+    std::printf("expect match: %lld %lld\n", static_cast<long long>(fx + plan.anchor_i),
+                static_cast<long long>(fz + plan.anchor_j));
+    std::printf("try         : rokksearch --pattern %s   |   rokktui --load %s\n", out_path.c_str(),
+                out_path.c_str());
+    return 0;
+}
+
+}  // namespace demo
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -460,10 +633,12 @@ int main(int argc, char** argv) {
     int y = -60;
     std::uint32_t cap = 1u << 20;
     int tile = 4096;
-    bool json = false, bench = false, benchmark = false;
+    bool json = false, bench = false, benchmark = false, first = false;
     double benchmark_seconds = 2.0;
     int benchmark_iters = 5;
     double benchmark_long = 0;
+    const char* demo_arg = nullptr;
+    std::string out_path = "demo_pattern.txt";
     bool have_y = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -485,12 +660,15 @@ int main(int argc, char** argv) {
         else if (a == "--tile") tile = std::atoi(val("tile"));
         else if (a == "--checkpoint") checkpoint = val("checkpoint");
         else if (a == "--backend") backend = val("backend");
+        else if (a == "--first") first = true;
         else if (a == "--json") json = true;
         else if (a == "--bench") bench = true;
         else if (a == "--benchmark") benchmark = true;
         else if (a == "--benchmark-seconds") benchmark_seconds = std::atof(val("benchmark-seconds"));
         else if (a == "--benchmark-iters") benchmark_iters = std::atoi(val("benchmark-iters"));
         else if (a == "--benchmark-long") { benchmark = true; benchmark_long = std::atof(val("benchmark-long")); }
+        else if (a == "--demo") demo_arg = val("demo");
+        else if (a == "--out") out_path = val("out");
         else if (a == "--list-backends") {
             for (const auto& b : list_backends())
                 std::printf("%-10s  %s%s\n", b.id.c_str(), b.label.c_str(), b.is_gpu ? "  [gpu]" : "");
@@ -499,6 +677,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             usage(2);
         }
+    }
+
+    if (demo_arg) {
+        double seconds;
+        bool max;
+        if (!parse_budget(demo_arg, seconds, max)) {
+            std::fprintf(stderr, "--demo wants a time like 90, 90s, 5m, 2h, or max (got '%s')\n", demo_arg);
+            return 2;
+        }
+        return demo::run(backend, seed_s, y, !orient_s || std::strcmp(orient_s, "exact") != 0, seconds,
+                         max, out_path);
     }
 
     if (benchmark) {
@@ -524,12 +713,16 @@ int main(int argc, char** argv) {
             req.region = r == -1 ? Region::world() : Region::centered(cx, cz, r);
         }
         req.all_orientations = pf.all_orientations;
+        // A saved session (from rokktui's `s`) names its progress file: resume it.
+        if (checkpoint.empty()) checkpoint = pf.checkpoint;
+        if (pf.stop_first) first = true;
     }
 
     if (seed_s) req.seed = seed_from_string(seed_s);
     req.plane_y = y;
     if (orient_s) req.all_orientations = std::strcmp(orient_s, "exact") != 0;
     req.match_cap = cap;
+    req.stop_at_first_match = first;
     req.tile_side = tile;
     req.checkpoint_path = checkpoint;
 
@@ -610,8 +803,9 @@ int main(int argc, char** argv) {
         std::printf("]}\n");
     } else {
         for (const auto& m : matches) std::printf("%d %d %u\n", m.x, m.z, m.orient_mask);
-        std::fprintf(stderr, "%zu match(es)%s in %.2fs\n", matches.size(),
-                     fin.truncated ? " (capped)" : "", fin.elapsed_s);
+        std::fprintf(stderr, "%zu match(es)%s in %.2fs%s\n", matches.size(),
+                     fin.truncated ? " (capped)" : "", fin.elapsed_s,
+                     fin.stopped_early ? " (stopped at the first match; rest of the region not searched)" : "");
     }
     return 0;
 }

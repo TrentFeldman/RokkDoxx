@@ -18,6 +18,8 @@ public:
     JobStatus poll(JobId id) override { return svc_.poll(id); }
     std::vector<Match> results(JobId id) override { return svc_.results(id); }
     void cancel(JobId id) override { svc_.cancel(id); }
+    void pause(JobId id, bool on) override { svc_.pause(id, on); }
+    std::string checkpoint(JobId id) override { return svc_.checkpoint(id); }
 
 private:
     SearchService svc_;

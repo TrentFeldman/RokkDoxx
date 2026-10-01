@@ -11,6 +11,9 @@
 // OpenclWorker::preferred_tile_side() asks the scheduler for large
 // (16384-block) tiles to keep the fixed per-dispatch cost small.
 //
+// match_plane is rebuilt per pattern with the first cells' offsets baked in as
+// literals (specialized_source); if that build fails the generic kernel is used.
+//
 // A pattern whose halo exceeds kPlaneHaloMax falls back to search_tile (every
 // work-item recomputes every cell it needs), so the plane buffer stays
 // bounded. begin_tile()/end_tile() ping-pong two buffer/queue slots so one
@@ -49,6 +52,42 @@ std::string trimmed(std::string s) {
 
 std::string kernel_source() {
     return std::string(kBedrockCoreSrc) + "\n\n" + kSearchTileSrc;
+}
+
+// match_plane with this pattern baked in. The per-variant loop (between the rk:variants
+// markers in search_tile.cl) becomes straight-line code: each variant's first
+// kInlineCells cells get their offsets and wants as literals, and the rest keep the
+// generic loop (inlining every cell measured slower). Same results as the generic
+// kernel, ~7-20% faster on a 7900 XTX. Empty if the markers are missing.
+constexpr int kInlineCells = 6;
+
+std::string specialized_source(const SearchPlan& plan) {
+    std::string src = kernel_source();
+    const std::string begin = "// rk:variants-begin", end = "// rk:variants-end";
+    const std::size_t fn = src.find("__kernel void match_plane");
+    const std::size_t b = src.find(begin, fn);
+    const std::size_t e = src.find(end, b);
+    if (fn == std::string::npos || b == std::string::npos || e == std::string::npos) return {};
+
+    const int baked = std::min(kInlineCells, plan.n_cells);
+    std::string code = "\n";
+    for (int v = 0; v < plan.n_variants; ++v) {
+        code += "    { uint m = alive;\n";
+        for (int c = 1; c < baked; ++c) {
+            const std::size_t i = static_cast<std::size_t>(v) * plan.n_cells + c;
+            code += std::string("      if (m) m &= ") + (plan.want[c] ? "" : "~") +
+                    "plane_bits(plane, words_w, row + (" + std::to_string(plan.off_z[i]) +
+                    "), col + (" + std::to_string(plan.off_x[i]) + "));\n";
+        }
+        if (baked < plan.n_cells)
+            code += "      for (int c = " + std::to_string(baked) + "; c < n_cells && m; ++c) {"
+                    " int2 o = var_off[" + std::to_string(v) + " * n_cells + c];"
+                    " const uint w = plane_bits(plane, words_w, row + o.y, col + o.x);"
+                    " m &= want[c] ? w : ~w; }\n";
+        code += "      mv[" + std::to_string(v) + "] = m; any |= m; }\n";
+    }
+    src.replace(b + begin.size(), e - (b + begin.size()), code);
+    return src;
 }
 
 // The plane kernels run with an explicit work-group size, but piece sizes are
@@ -153,8 +192,10 @@ struct OpenclWorker::Impl {
     // past kPlaneHaloMax -- a huge, sparse pattern -- uses k_search instead.
     static constexpr int kChunk = 16384;
     static constexpr int kPlaneHaloMax = 1024;
-    static constexpr int kLocalW = 64, kLocalH = 4;
+    static constexpr int kLocalW = 32, kLocalH = 8;  // measured fastest on a 7900 XTX
     cl::Kernel k_fill, k_match;
+    cl::Program specialized_program;  // the current pattern's match_plane (one at a time)
+    std::string specialized_src;      // its source, so an unchanged pattern isn't rebuilt
     cl::Buffer buf_plane[kSlots];
     bool use_plane = false;
     int halo_w = 0, halo_h = 0;
@@ -261,6 +302,21 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
         const std::size_t rows = Impl::kChunk + 2 * halo_h;
         for (int i = 0; i < Impl::kSlots; ++i)
             impl_->buf_plane[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint));
+
+        // ~200 ms the first time a pattern is seen (the driver caches repeats).
+        try {
+            const std::string src = specialized_source(plan);
+            if (src.empty()) throw std::runtime_error("kernel markers missing");
+            if (src != impl_->specialized_src) {
+                cl::Program p(impl_->ctx, src);
+                p.build("-cl-std=CL1.2");
+                impl_->specialized_program = p;
+                impl_->specialized_src = src;
+            }
+            impl_->k_match = cl::Kernel(impl_->specialized_program, "match_plane");
+        } catch (const std::exception&) {
+            impl_->k_match = cl::Kernel(impl_->program, "match_plane");  // oh-shit fallback: generic, silently
+        }
     }
 }
 

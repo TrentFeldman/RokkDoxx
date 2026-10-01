@@ -26,6 +26,7 @@ struct Model {
     int y = -60;
     std::string cx = "0", cz = "0", radius = "5000";
     bool all_orient = true;
+    bool stop_first = false;  // end the search at the first match (not saved in pattern files)
     std::string checkpoint;  // empty = no checkpointing
 
     // Fixed kMaxDim x kMaxDim storage, so shrinking and re-growing the pattern
@@ -66,5 +67,8 @@ std::string matches_header(const Model& m);
 
 // "id r90 m+r180" etc. for the bits set in an orientation mask.
 std::string orient_names(std::uint8_t mask);
+
+// A block count / coordinate in a few characters: 4096, 820k, -30.0M.
+std::string format_blocks(double n);
 
 }  // namespace rokkdoxx::tui

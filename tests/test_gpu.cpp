@@ -4,7 +4,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <map>
+#include <numeric>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -122,6 +125,46 @@ void test_search_parity() {
         }
 }
 
+// The kernel is rebuilt per pattern with its first cells baked in as literals, so
+// the pattern *is* part of the code: check many shapes against the CPU. 1..12 known
+// cells straddle the baked-in prefix (6), random layouts, all-8 and exact, mixed
+// layers. Fixed seed so a failure reproduces. Cells come from the real world, so
+// there is always at least the planted match.
+void test_random_patterns() {
+    std::printf("test_random_patterns\n");
+    std::mt19937_64 rng(20260930);
+    for (int t = 0; t < 24; ++t) {
+        const int k = t % 12 + 1, w = 8, h = 8;
+        const std::int64_t seed = static_cast<std::int64_t>(rng());
+        const int y = -63 + static_cast<int>(rng() % 4), cx = static_cast<int>(rng() % 20001) - 10000,
+                  cz = static_cast<int>(rng() % 20001) - 10000;
+        rokkdoxx::BedrockGenerator gen(seed);
+        std::vector<int> cells(w * h);
+        std::iota(cells.begin(), cells.end(), 0);
+        std::shuffle(cells.begin(), cells.end(), rng);
+
+        SearchRequest req;
+        req.seed = seed;
+        req.plane_y = y;
+        req.pattern.w = w;
+        req.pattern.h = h;
+        req.pattern.cells.assign(static_cast<std::size_t>(w) * h, Cell::unknown);
+        for (int n = 0; n < k; ++n) {
+            const int i = cells[n] % w, j = cells[n] / w;
+            req.pattern.cells[cells[n]] =
+                gen.is_bedrock_floor(cx + i, y, cz + j) ? Cell::bedrock : Cell::not_bedrock;
+        }
+        req.region = Region::centered(cx + 4, cz + 4, 250);
+        req.all_orientations = t % 3 != 0;
+        const std::string tag = "random #" + std::to_string(t) + " (" + std::to_string(k) + " cells, y " +
+                                std::to_string(y) + (req.all_orientations ? ", all-8)" : ", exact)");
+        auto cpu = run(make_worker_factory("cpu"), req);
+        auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
+        check(!cpu.empty() && cpu == gpu, tag + " parity (" + std::to_string(cpu.size()) + " cpu vs " +
+                                              std::to_string(gpu.size()) + " gpu)");
+    }
+}
+
 // Three known cells spread `reach` blocks apart inside an otherwise-unknown
 // grid. reach 200 runs the bit-plane kernels with a big halo; reach 1025 is
 // past OpenclWorker's kPlaneHaloMax, so it exercises the search_tile fallback.
@@ -175,6 +218,7 @@ int main() {
         ++g_fail;
     }
     test_search_parity();
+    test_random_patterns();
     test_large_halo(200);
     test_large_halo(1025);
 

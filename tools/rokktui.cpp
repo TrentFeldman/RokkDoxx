@@ -4,7 +4,8 @@
 //   * choose the pattern size (width x height), the Y layer, and orientations
 //   * pick the compute backend and, optionally, a checkpoint file to resume from
 //   * paint the bedrock pattern on a grid (bedrock / not-bedrock / unknown)
-//   * run the search and watch progress; list every match
+//   * run the search and watch it sweep a map of the world; list every match
+//   * pause / resume it live, or save it and pick it up later (--resume)
 //
 // The search itself lives in librokksvc (SearchService + a compute Worker),
 // run in-process. The TUI is split across tools/tui/:
@@ -13,6 +14,7 @@
 //   model.*                                     editable state + pure logic
 //   screens.*                                   drawing + key handling
 // This file only parses arguments and runs the loop.
+#include <chrono>
 #include <cstdio>
 #include <string>
 
@@ -25,19 +27,21 @@ namespace svc = rokkdoxx::svc;
 
 int main(int argc, char** argv) {
     tui::App app;
-    std::string backend, load_path;
+    std::string backend, load_path, resume_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
             std::puts(
                 "rokktui -- interactive bedrock pattern search\n"
                 "  --load FILE        preload a pattern file\n"
+                "  --resume FILE      continue a session saved with `s` on the search screen\n"
                 "  --backend ID       cpu | opencl:N | auto (can also be changed on screen)\n"
                 "  --checkpoint FILE  resumable progress file (can also be set on screen)\n"
                 "Requires an interactive terminal. Controls are shown on screen.");
             return 0;
         }
         if (a == "--load" && i + 1 < argc) load_path = argv[++i];
+        else if (a == "--resume" && i + 1 < argc) resume_path = argv[++i];
         else if (a == "--backend" && i + 1 < argc) backend = argv[++i];
         else if (a == "--checkpoint" && i + 1 < argc) app.m.checkpoint = argv[++i];
         else {
@@ -84,9 +88,25 @@ int main(int argc, char** argv) {
         tui::draw(app, frame);
         tui::write_out(frame.flush());
     };
+    // The flashing search map runs off this clock (see App::now_ms).
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!resume_path.empty()) {
+        const tui::TermSize sz = tui::size();  // the map is sized from the terminal
+        app.term_cols = sz.cols;
+        app.term_rows = sz.rows;
+        std::string err;
+        if (!tui::resume_session(app, resume_path, err)) {
+            tui::leave();
+            std::fprintf(stderr, "resume failed: %s\n", err.c_str());
+            return 1;
+        }
+    }
     redraw();
     for (;;) {
         const int k = tui::read_key(100);
+        app.now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
         tui::refresh_job(app);
         if (k == tui::K_RESIZE) frame.invalidate();
         else if (k != tui::K_NONE && !tui::handle_key(app, k)) break;

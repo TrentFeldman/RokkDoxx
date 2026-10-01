@@ -26,6 +26,8 @@ public:
     virtual JobStatus poll(JobId) = 0;
     virtual std::vector<Match> results(JobId) = 0;
     virtual void cancel(JobId) = 0;
+    virtual void pause(JobId, bool on) = 0;     // see SearchService::pause
+    virtual std::string checkpoint(JobId) = 0;  // see SearchService::checkpoint
 };
 
 // `backend` selects the compute device: "" / "auto", "cpu", or "opencl:N".

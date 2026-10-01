@@ -48,6 +48,13 @@ bool load_pattern_file(const std::string& path, PatternFile& out, std::string& e
             std::string v;
             ls >> v;
             pf.all_orientations = (v != "exact");
+        } else if (kw == "checkpoint") {
+            ls >> std::ws;
+            std::getline(ls, pf.checkpoint);
+        } else if (kw == "stop_at_first") {
+            std::string v;
+            ls >> v;
+            pf.stop_first = (v == "yes");
         } else if (kw == "size") {
             ls >> declared_w >> declared_h;
             in_grid = true;
@@ -92,6 +99,8 @@ bool save_pattern_file(const std::string& path, const PatternFile& pf, std::stri
     f << "center " << pf.center_x << " " << pf.center_z << "\n";
     f << "radius " << pf.radius << "\n";
     f << "orientations " << (pf.all_orientations ? "all" : "exact") << "\n";
+    if (!pf.checkpoint.empty()) f << "checkpoint " << pf.checkpoint << "\n";
+    if (pf.stop_first) f << "stop_at_first yes\n";
     f << "size " << pf.pattern.w << " " << pf.pattern.h << "\n";
     for (int j = 0; j < pf.pattern.h; ++j) {
         for (int i = 0; i < pf.pattern.w; ++i) {

@@ -37,6 +37,8 @@ void file_to_model(const svc::PatternFile& pf, Model& m) {
     m.cz = pf.center_z;
     m.radius = pf.radius;
     m.all_orient = pf.all_orientations;
+    if (!pf.checkpoint.empty()) m.checkpoint = pf.checkpoint;  // only a session names one
+    if (pf.stop_first) m.stop_first = true;
     m.w = std::clamp(pf.pattern.w, 1, kMaxDim);
     m.h = std::clamp(pf.pattern.h, 1, kMaxDim);
     m.clear();
@@ -59,6 +61,7 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
     }
     req.region = rad == -1 ? svc::Region::world() : svc::Region::centered(cx, cz, rad);
     req.all_orientations = m.all_orient;
+    req.stop_at_first_match = m.stop_first;
     req.match_cap = 1u << 20;
     req.checkpoint_path = m.checkpoint;
     return true;
@@ -106,6 +109,15 @@ std::string matches_header(const Model& m) {
     return "# rokkdoxx matches  seed=" + m.seed + " y=" + std::to_string(m.y) +
            " size=" + std::to_string(m.w) + "x" + std::to_string(m.h) +
            "  (x z = anchor cell, ~pattern centre; mask bit g = orientation g)\n";
+}
+
+std::string format_blocks(double n) {
+    const double a = n < 0 ? -n : n;
+    char b[32];
+    if (a >= 1e6) std::snprintf(b, sizeof(b), "%.1fM", n / 1e6);
+    else if (a >= 1e4) std::snprintf(b, sizeof(b), "%.0fk", n / 1e3);
+    else std::snprintf(b, sizeof(b), "%.0f", n);
+    return b;
 }
 
 std::string orient_names(std::uint8_t mask) {

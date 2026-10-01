@@ -109,6 +109,25 @@ struct SearchRequest {
     std::uint32_t match_cap = 1u << 20;  // stop collecting after this many hits
     int tile_side = 4096;                // scheduler floor (a worker may raise it)
     std::string checkpoint_path;         // empty = no checkpointing
+
+    // Progress kept in memory, so a front-end can save a search (or continue a
+    // stopped one) without having named a file in advance. keep_checkpoint makes
+    // the job maintain its checkpoint text (SearchClient::checkpoint); resume_text
+    // starts a job from such text. Both use the checkpoint file's format, and
+    // resume_text beats checkpoint_path when it is valid for this request.
+    bool keep_checkpoint = false;
+    std::string resume_text;
+
+    // Stop as soon as a tile yields a match (the tiles already in flight finish).
+    // Tiles are scanned outward from the middle of the region, so with this the
+    // search ends as soon as it reaches the nearest match.
+    bool stop_at_first_match = false;
+
+    // A front-end that wants a picture of the search asks for a map_w x map_h
+    // overview (0 = none; clamped to the tile grid) in JobStatus::map. The
+    // region is then scanned one map cell at a time, so each cell fills in
+    // completely before the next begins.
+    int map_w = 0, map_h = 0;
 };
 
 // A place where the pattern occurs. orient_mask has bit g set for every
@@ -118,12 +137,24 @@ struct Match {
     std::uint8_t orient_mask;
 };
 
-enum class JobState { pending, running, done, cancelled, error };
+enum class JobState { pending, running, paused, done, cancelled, error };
+
+// One square of JobStatus::map: how far the search of that area has got, and
+// whether it has produced a match. The two are independent -- an area can hold
+// a match while it is still being searched.
+struct MapCell {
+    // partial: some of its tiles are done, none is being searched right now.
+    enum Phase : std::uint8_t { pending, partial, searching, done };
+    Phase phase = pending;
+    bool hit = false;
+    bool operator==(const MapCell&) const = default;
+};
 
 inline const char* to_string(JobState s) {
     switch (s) {
         case JobState::pending: return "pending";
         case JobState::running: return "running";
+        case JobState::paused: return "paused";
         case JobState::done: return "done";
         case JobState::cancelled: return "cancelled";
         case JobState::error: return "error";
@@ -132,7 +163,7 @@ inline const char* to_string(JobState s) {
 }
 
 // A snapshot of a running job. The service updates it after every tile; a
-// front-end polls it for the progress bar.
+// front-end polls it for the progress display.
 struct JobStatus {
     JobState state = JobState::pending;
     double progress = 0.0;  // 0..1
@@ -143,7 +174,14 @@ struct JobStatus {
     double rate = 0.0;   // candidate origins / second, this run (not counting resumed tiles)
     double eta_s = 0.0;  // seconds left at `rate`; 0 until the first tile lands
     bool truncated = false;
+    bool stopped_early = false;  // done, but cut short by stop_at_first_match
     std::string error;
+
+    // The search region as a map_w x map_h grid, row-major, north-west (x0, z0)
+    // first. Empty unless the request asked for one; the size can be smaller
+    // than asked (see SearchRequest::map_w) and is only known once the job runs.
+    int map_w = 0, map_h = 0;
+    std::vector<MapCell> map;
 };
 
 using JobId = std::uint64_t;

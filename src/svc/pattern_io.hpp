@@ -6,6 +6,8 @@
 //   center <x> <z>
 //   radius <int>
 //   orientations <all|exact>
+//   checkpoint <file>          (optional: a saved session -- the progress file to resume from)
+//   stop_at_first yes          (optional: end the search at the first match)
 //   size <w> <h>
 //   <h lines of w chars: '#' bedrock, 'o' not-bedrock, '.' unknown>
 #pragma once
@@ -23,6 +25,8 @@ struct PatternFile {
     std::string center_z = "0";
     std::string radius = "5000";
     bool all_orientations = true;
+    std::string checkpoint;  // empty = none (a plain pattern; a session names its progress file)
+    bool stop_first = false;
     Pattern pattern;
 };
 

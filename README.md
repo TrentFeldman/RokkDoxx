@@ -48,7 +48,7 @@ cd vcpkg
 .\bootstrap-vcpkg.bat
 .\vcpkg.exe install opencl:x64-windows
 
-REBOOT RECCOMENDED
+REBOOT RECOMMENDED
 
 cd ..
 git clone https://github.com/TrentFeldman/RokkDoxx.git
@@ -72,14 +72,15 @@ If everything worked, the final command should display your available compute ba
 Toolkit, AMD HIP SDK via `-DOpenCL_ROOT=…`, Intel oneAPI) also works instead of vcpkg.
 
 A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyway", or
-`Unblock-File`). RokkDoxx makes no network connections and only writes files you name.
+`Unblock-File`). RokkDoxx makes no network connections and only writes files you name
+(saving a session also writes `<name>.ckpt` beside it).
 
 ## Usage
 
 ### `rokktui` — interactive
 
 ```sh
-build/rokktui [--load pattern.txt] [--backend auto|cpu|opencl:N] [--checkpoint run.ckpt]
+build/rokktui [--load pattern.txt | --resume session.txt] [--backend auto|cpu|opencl:N] [--checkpoint run.ckpt]
 ```
 
 1. **Parameters.** Up/Down/Tab move, type to edit, Left/Right change, `Del` clears.
@@ -89,14 +90,31 @@ build/rokktui [--load pattern.txt] [--backend auto|cpu|opencl:N] [--checkpoint r
    - `center X/Z`, `radius` — the square to search. `radius -1` = the whole world inside the
      ±29,999,984 border.
    - `orientations` — `all 8` tries every rotation/mirror, so the picture needn't face north.
-   - `backend`, `checkpoint file` — device choice; optional resume file.
+   - `stop at first` — `yes` ends the search at the first match. It scans outward from the
+     region's center (spawn, by default), so a nearby build is found in seconds.
+   - `backend`, `checkpoint file` — device choice; optional progress file.
 2. **Pattern editor** (`Enter`). Type the grid like text: `b` bedrock, `e` empty
    (not-bedrock), `.` unknown; each moves the cursor on, wrapping to the next row, and
    `Backspace` steps back. Arrows/`hjkl` move, `space` cycles a cell. Unknown cells are
-   wildcards. `P` fills from the
-   real world at the center (a round-trip test), `C` clears, `S` saves, `Enter` searches.
-3. **Results.** Progress, rate, elapsed and ETA while running (`c` cancels), then every match
-   and the orientations that fit. `S` saves them as `x z orient_mask` lines.
+   wildcards. `P` fills from the real world at the center (a round-trip test), `C` clears,
+   `S` saves, `Enter` searches.
+3. **Search.** The region is drawn as a grid of `#` (the caption gives the blocks each covers;
+   north-west is top left), searched in a spiral from the center. Grey = not yet · **yellow**
+   (pulsing) = searching now · blue = partly done · cyan = done · **green** = holds a match
+   (flashes when found). The map flashes magenta when the search ends; windows under 18 rows
+   get a plain progress bar. Keys: `p` pause/resume · `c` cancel · `s` save session.
+4. **Results.** Matches and the orientations that fit. `S` saves them as `x z orient_mask`
+   lines, `r` continues a cancelled or stopped search, `m` brings the map back.
+
+**Save and resume.** `s` writes `NAME` (the pattern, its settings and a `checkpoint` line) and
+`NAME.ckpt` (finished tiles and matches so far). Quit whenever; later:
+
+```sh
+rokktui --resume NAME       # or headless: rokksearch --pattern NAME
+```
+
+Saves are as of the last few seconds; pause first for an exact one. A resumed session keeps
+updating its `.ckpt`.
 
 ### `rokksearch` — headless
 
@@ -108,7 +126,22 @@ rokksearch --pattern p.txt --region -1000000,1000000,-500000,500000 --orientatio
 
 Progress (with ETA) goes to stderr, matches (`x z orient_mask`) to stdout. `--json` for
 machine output, `--checkpoint FILE` to make a run resumable (Ctrl-C, then rerun),
-`--help` for the rest.
+`--first` to stop at the first match, `--help` for the rest.
+
+The search spirals out from the region's center (spawn, for `--radius -1`). With `--first`, a
+target 14k blocks from spawn takes ~0.3 s and one 3M out ~3 min, against ~6.7 h for the whole
+world.
+
+**Try it without Minecraft.** `--demo` writes a pattern file to search for:
+
+```sh
+rokksearch --demo 5m                   # random seed and spot, sized to take ~5 min here
+rokksearch --pattern demo_pattern.txt  # finds the spot it printed as "expect match"
+```
+
+Time is `90`, `90s`, `5m`, `2h`, or `max` (the whole world). Also `--out`, `--seed`, `--y -63..-60`,
+`--backend`, `--orientations exact`. The pattern is copied from the real world there and grown
+until a second match is unlikely.
 
 **Pattern file** (what `rokktui` saves):
 
@@ -131,7 +164,8 @@ o#oo#o
 at (1036, -966); `rokksearch --pattern` on it prints the single match `1038 -964 1`.
 
 A match `(x, z)` is the world position of the pattern's *anchor*: a rare cell near its
-middle, not the top-left corner.
+middle, not the top-left corner. A saved session adds `checkpoint <file>` (and
+`stop_at_first yes`) before `size`.
 
 ### `dump_bedrock` — print a region
 
@@ -175,7 +209,8 @@ Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_c
   part, so all 8 orientations cost little more than one.
 - Three tiers in one process: front-ends (`rokktui`, `rokksearch`) → `SearchService`
   (tiling, scheduling, dedup, progress, cancel, checkpoints) → one `Worker` (`CpuWorker` or
-  `OpenclWorker`).
+  `OpenclWorker`). The service scans in a spiral from the region's center, can pause, keeps its
+  progress as checkpoint text, and reports a per-area state map that `rokktui` draws.
 
 ## Performance
 
@@ -210,7 +245,10 @@ catches throttling or a device that goes wrong under heat.
 | ✅ | OpenCL GPU search | bit-plane kernel, bit-exact with the CPU |
 | ✅ | All 8 orientations | shared anchor, symmetric patterns collapsed |
 | ✅ | Whole-world search | `radius -1` |
-| ✅ | Resumable runs | `--checkpoint` |
+| ✅ | Outward search, stop at first match | nearest-to-spawn first; `--first` |
+| ✅ | Resumable runs | `--checkpoint`, or save/resume sessions |
+| ✅ | Live map, pause/resume (`rokktui`) | `p`, `s`, `r`; `rokktui --resume` |
+| ✅ | Demo searches | `rokksearch --demo` |
 | ✅ | ETA + sustained benchmark | `--benchmark-long 15` checks results stay identical |
 | ✅ | `rokktui` / `rokksearch` on Linux | |
 | 🧪 | Windows (`rokktui`, `rokksearch`, GPU) | beta |
@@ -222,9 +260,10 @@ catches throttling or a device that goes wrong under heat.
 ## Verification
 
 `ctest` runs: the generator against Java-generated RNG vectors and byte-for-byte against the
-Python reference (`test_bedrock`, `diff_test.py`); the search against a brute-force scan and
-across tile sizes (`test_search`); GPU vs CPU bit-exactness and search parity (`test_gpu`,
-needs a device); and the TUI's logic without a terminal (`test_tui`).
+Python reference (`test_bedrock`, `diff_test.py`); the search against a brute-force scan, across
+tile sizes, scan order, pause/resume and checkpoints (`test_search`); GPU vs CPU bit-exactness
+and search parity (`test_gpu`, needs a device); the TUI without a terminal, including
+pause/save/resume (`test_tui`); and `--demo` plus session resume end to end (`demo_test.py`).
 
 ## License
 

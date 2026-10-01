@@ -121,6 +121,10 @@ __kernel void match_plane(const int origin_x, const int origin_z, const int tile
 
     uint mv[8];
     uint any = 0;
+    // The host swaps everything between these markers for straight-line code with the
+    // pattern's first cells baked in (opencl_worker.cpp, specialized_source). It must
+    // set mv[] and any exactly as this loop does -- this version is also the fallback.
+    // rk:variants-begin
     for (int v = 0; v < n_variants; ++v) {
         __constant const int2 *off = var_off + (size_t)v * n_cells;
         uint m = alive;
@@ -131,6 +135,7 @@ __kernel void match_plane(const int origin_x, const int origin_z, const int tile
         mv[v] = m;
         any |= m;
     }
+    // rk:variants-end
 
     while (any) {
         const uint low = any & (0u - any);

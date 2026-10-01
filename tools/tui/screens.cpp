@@ -30,7 +30,7 @@ void status_line(const App& app, Frame& fr) {
 // ---------------------------------------------------------------------------
 
 enum Field {
-    F_SEED, F_W, F_H, F_Y, F_CX, F_CZ, F_RADIUS, F_ORIENT, F_BACKEND, F_CKPT, F_COUNT
+    F_SEED, F_W, F_H, F_Y, F_CX, F_CZ, F_RADIUS, F_ORIENT, F_STOP, F_BACKEND, F_CKPT, F_COUNT
 };
 
 const char* field_name(int f) {
@@ -43,6 +43,7 @@ const char* field_name(int f) {
         case F_CZ: return "center Z";
         case F_RADIUS: return "radius (-1=all)";
         case F_ORIENT: return "orientations";
+        case F_STOP: return "stop at first";
         case F_BACKEND: return "backend";
         case F_CKPT: return "checkpoint file";
     }
@@ -68,6 +69,8 @@ std::string field_value(const App& app, int f) {
         case F_CZ: return m.cz;
         case F_RADIUS: return m.radius == "-1" ? "-1  (whole world, center ignored)" : m.radius;
         case F_ORIENT: return m.all_orient ? "all 8" : "exact";
+        case F_STOP:
+            return m.stop_first ? "yes  (end at the first match)" : "no  (scan the whole region)";
         case F_BACKEND: return backend_text(app);
         case F_CKPT: return m.checkpoint.empty() ? "(off)" : m.checkpoint;
     }
@@ -212,6 +215,9 @@ bool handle_params(App& app, int k) {
         case F_ORIENT:
             if (step != 0 || k == ' ') m.all_orient = !m.all_orient;
             break;
+        case F_STOP:
+            if (step != 0 || k == ' ') m.stop_first = !m.stop_first;
+            break;
         case F_BACKEND:
             if (step != 0) cycle_backend(app, step);
             break;
@@ -314,19 +320,208 @@ void do_save_pattern(App& app) {
                      : ("save failed: " + err);
 }
 
-void start_search(App& app) {
+// ---------------------------------------------------------------------------
+// search map
+// ---------------------------------------------------------------------------
+//
+// While a search runs, the progress bar is a picture of the search region: a
+// grid of '#', one per area, drawn as
+//
+//     ┌─────────────┐      grey      not searched yet
+//     │ # # # # # # │      yellow    being searched now (pulses)
+//     │ # # # # # # │      blue      partly searched
+//     │ # # # # # # │      cyan      searched, nothing found (glows on arrival)
+//     │ # # # # # # │      green     holds a match (flashes when found; pulses with
+//     └─────────────┘                yellow while the area is still being searched)
+//                          magenta   the whole map flashes when the search completes
+//
+// The scan spirals out from the middle of the region, so the map fills in from
+// the centre. The service decides the areas (SearchRequest::map_w/h) and reports
+// each one's state; this code only turns states into colour. Each '#' is
+// followed by a space and terminal cells are ~twice as tall as wide, so the map
+// looks square.
+
+constexpr int kMapChromeRows = 14;  // every row of the search screen that is not a hash row
+constexpr int kMaxMapSide = 40;     // bigger than this stops looking like one picture
+constexpr int kMinMapSide = 4;
+
+constexpr long long kFlashMs = 250;       // half a flash: on for this long, then off
+constexpr long long kPopMs = 750;         // a cell that just finished blinks for this long
+constexpr long long kHitFlashMs = 3000;   // a fresh hit flashes this long, then stays lit
+constexpr long long kCelebrateMs = 3000;  // the whole map flashes this long on completion
+constexpr long long kLongAgo = -1'000'000'000;
+
+const char* kMapPending = "\x1b[2m";
+const char* kMapSearchA = "\x1b[1;93m";   // searching: bright yellow <-> yellow
+const char* kMapSearchB = "\x1b[33m";
+const char* kMapPopA = "\x1b[1;96m";      // just searched: bright cyan <-> cyan, then cyan
+const char* kMapPartial = "\x1b[94m";    // some of it searched: bright blue (turns cyan when finished)
+const char* kMapDone = "\x1b[36m";
+const char* kMapHitA = "\x1b[1;30;102m";  // hit: black on bright green <-> white on green,
+const char* kMapHitB = "\x1b[1;97;42m";   //   then black on green for good
+const char* kMapHit = "\x1b[1;30;42m";
+const char* kMapParty = "\x1b[1;95m";     // completion: bright magenta
+
+// Cells per side for a terminal of this size, or 0 if it is too small for a map.
+int pick_map_side(int cols, int rows) {
+    // Width: a box is 2 columns per cell + 3 (two borders and a space); the
+    // frame keeps one column free.
+    const int side = std::min({kMaxMapSide, rows - kMapChromeRows, (cols - 4) / 2});
+    return side >= kMinMapSide ? side : 0;
+}
+
+// Remember when each cell last changed phase and when it first showed a match,
+// so a fresh find or finish can flash from the moment it is first seen. The
+// first map seen is the baseline: whatever a resumed checkpoint already covers
+// is not "news". (A match in a cell that is being searched right now is news:
+// a fast GPU can find one before the first poll.)
+void track_map(App& app) {
+    const std::vector<svc::MapCell>& map = app.jst.map;
+    if (map.size() != app.map_prev.size()) {
+        app.map_prev = map;
+        app.phase_since.assign(map.size(), kLongAgo);
+        app.hit_since.assign(map.size(), kLongAgo);
+        for (std::size_t i = 0; i < map.size(); ++i)
+            if (map[i].hit && map[i].phase == svc::MapCell::searching) app.hit_since[i] = app.now_ms;
+        return;
+    }
+    for (std::size_t i = 0; i < map.size(); ++i) {
+        if (map[i].phase != app.map_prev[i].phase) app.phase_since[i] = app.now_ms;
+        if (map[i].hit && !app.map_prev[i].hit) app.hit_since[i] = app.now_ms;
+        app.map_prev[i] = map[i];
+    }
+}
+
+// Is the map on screen? While the job runs, always. Afterwards: through the
+// completion flash, and for good if there are no matches to list in its place.
+// `m` overrides that.
+bool map_wanted(const App& app) {
+    if (app.map_side <= 0) return false;
+    if (app.job_running) return true;
+    if (app.map_toggle >= 0) return app.map_toggle == 1;
+    return app.matches.empty() || app.now_ms - app.finished_at_ms < kCelebrateMs;
+}
+
+struct MapView {
+    int mw = 1, mh = 1;  // cells the service reports (1x1 until the job has started)
+    int scale = 0;       // hashes per cell, each way; 0 = no map fits
+    int w() const { return mw * scale; }
+    int h() const { return mh * scale; }
+};
+
+// How big the map is drawn. A coarse map (few tiles in the region) is blown up
+// to fill the space it was given. `rows` = the terminal's height.
+MapView map_view(const App& app, int cols, int rows) {
+    MapView v;
+    if (app.map_side <= 0) return v;
+    v.mw = std::max(1, app.jst.map_w);
+    v.mh = std::max(1, app.jst.map_h);
+    v.scale = std::max(1, std::min(app.map_side / v.mw, app.map_side / v.mh));
+    // The window shrank since the search began: fall back to the plain bar.
+    if (v.h() + kMapChromeRows > rows || 2 * v.w() + 3 > cols - 1) v.scale = 0;
+    return v;
+}
+
+// How one cell looks right now. `on` is the global flash beat; the ages say how
+// long ago the cell last changed phase / first showed a match.
+const char* cell_style(svc::MapCell c, long long phase_age, long long hit_age, bool on,
+                       bool celebrate) {
+    if (c.hit && (celebrate || hit_age < kHitFlashMs)) {
+        // A fresh find starts on the bright beat, so it flashes the moment it is seen.
+        const bool bright = celebrate ? on : (hit_age / kFlashMs) % 2 == 0;
+        return bright ? kMapHitA : kMapHitB;
+    }
+    switch (c.phase) {
+        case svc::MapCell::pending: return c.hit ? kMapHit : kMapPending;
+        case svc::MapCell::partial: return c.hit ? kMapHit : kMapPartial;
+        case svc::MapCell::searching:
+            if (c.hit) return on ? kMapSearchA : kMapHit;  // being searched, already holds a match
+            return on ? kMapSearchA : kMapSearchB;
+        case svc::MapCell::done:
+            if (c.hit) return kMapHit;
+            if (celebrate) return on ? kMapParty : kMapDone;
+            return phase_age < kPopMs && (phase_age / kFlashMs) % 2 == 0 ? kMapPopA : kMapDone;
+    }
+    return kMapPending;
+}
+
+// The map, its legend, and a blank row: v.h() + 4 rows.
+void draw_map(const App& app, Frame& fr, const MapView& v) {
+    const svc::JobStatus& st = app.jst;
+    const bool have = st.map_w > 0 && st.map.size() == static_cast<std::size_t>(st.map_w) * st.map_h;
+    const bool on = (app.now_ms / kFlashMs) % 2 == 0;
+    const bool celebrate =
+        st.state == svc::JobState::done && app.now_ms - app.finished_at_ms < kCelebrateMs;
+
+    const int box = 2 * v.w() + 3;
+    const std::string indent(static_cast<std::size_t>(std::max(2, (fr.cols() - 1 - box) / 2)), ' ');
+    std::string rule;
+    for (int i = 0; i < 2 * v.w() + 1; ++i) rule += "\xe2\x94\x80";  // ─
+    fr.line(indent + dim("\xe2\x94\x8c" + rule + "\xe2\x94\x90"));   // ┌ ┐
+
+    for (int j = 0; j < v.h(); ++j) {
+        std::string row = indent + dim("\xe2\x94\x82") + " ";        // │
+        for (int i = 0; i < v.w(); ++i) {
+            const std::size_t c = static_cast<std::size_t>(j / v.scale) * v.mw + i / v.scale;
+            const char* style = kMapPending;
+            if (have) {
+                const long long ps = c < app.phase_since.size() ? app.phase_since[c] : kLongAgo;
+                const long long hs = c < app.hit_since.size() ? app.hit_since[c] : kLongAgo;
+                style = cell_style(st.map[c], app.now_ms - ps, app.now_ms - hs, on, celebrate);
+            }
+            row += std::string(style) + "#" + kRst + " ";
+        }
+        fr.line(row + dim("\xe2\x94\x82"));
+    }
+    fr.line(indent + dim("\xe2\x94\x94" + rule + "\xe2\x94\x98"));   // └ ┘
+
+    // Centred under the map when it fits, else pushed left so it never clips.
+    const std::size_t len = std::string("# not yet   # searching   # partial   # clear   # match").size();
+    const std::size_t pad = std::max<std::size_t>(
+        2, std::min(indent.size(), static_cast<std::size_t>(std::max(0, fr.cols() - 1)) - len));
+    fr.line(std::string(pad, ' ') + kMapPending + "#" + kRst + " not yet   " + kMapSearchA + "#" +
+            kRst + " searching   " + kMapPartial + "#" + kRst + " partial   " + kMapDone + "#" + kRst +
+            " clear   " + kMapHit + "#" + kRst + " match");
+    fr.line();
+}
+
+// "region x .. z ..   1 # ~ 2.3M blocks": where the map is, and how much each '#' covers.
+std::string map_caption(const svc::Region& r, const MapView& v) {
+    const std::string cw = format_blocks(static_cast<double>(r.x1 - r.x0 + 1) / v.w());
+    const std::string ch = format_blocks(static_cast<double>(r.z1 - r.z0 + 1) / v.h());
+    return "  region  x " + format_blocks(static_cast<double>(r.x0)) + " .. " +
+           format_blocks(static_cast<double>(r.x1)) + "   z " +
+           format_blocks(static_cast<double>(r.z0)) + " .. " +
+           format_blocks(static_cast<double>(r.z1)) + "   1 # ~ " + cw +
+           (cw == ch ? "" : " x " + ch) + " blocks";
+}
+
+// `resume_text`: progress from an earlier run of this same search (empty = start fresh).
+void start_search(App& app, const std::string& resume_text = "") {
     svc::SearchRequest req;
     std::string err;
+    app.want_pause = false;
     app.matches.clear();
     app.result_scroll = 0;
     app.status.clear();
     app.screen = Screen::result;
     app.jst = {};
+    app.map_side = 0;
+    app.map_prev.clear();
+    app.phase_since.clear();
+    app.hit_since.clear();
+    app.map_toggle = -1;
+    app.finished_at_ms = kLongAgo;
     if (!build_request(app.m, req, err)) {
         app.jst.state = svc::JobState::error;
         app.jst.error = err;
         return;
     }
+    app.map_side = pick_map_side(app.term_cols, app.term_rows);
+    req.map_w = req.map_h = app.map_side;
+    req.keep_checkpoint = true;  // so `s` can save, and `r` continue, at any time
+    req.resume_text = resume_text;
+    app.job_region = req.region;
     try {
         app.job = app.client->submit(req);
         app.job_running = true;
@@ -410,24 +605,43 @@ std::string progress_bar(double frac, int width) {
 
 constexpr int kResultFooterRows = 5;
 
+// A stopped search can carry on: cancelled, or ended early at a match.
+bool can_continue(const App& app) {
+    return !app.job_running &&
+           (app.jst.state == svc::JobState::cancelled ||
+            (app.jst.state == svc::JobState::done && app.jst.stopped_early));
+}
+
 void draw_result(App& app, Frame& fr) {
     const svc::JobStatus& st = app.jst;
-    fr.line(hi("Search") + dim("   backend: " + app.backend_label));
-    fr.line();
+    // Sized from the whole terminal, so this comes before any row is drawn.
+    const MapView mv = map_view(app, fr.cols(), fr.rows_left());
+    const bool show_map = mv.scale > 0 && map_wanted(app);
 
+    fr.line(hi("Search") + dim("   backend: " + app.backend_label));
     if (st.state == svc::JobState::error) {
+        fr.line();
         fr.line(std::string(kAir) + "  error: " + st.error + kRst);
         fr.line();
         fr.line("  " + hi("Enter/Esc") + " back");
         return;
     }
+    fr.line(show_map ? dim(map_caption(app.job_region, mv)) : "");
 
     char b[256];
-    std::snprintf(b, sizeof(b), "  %s  %5.1f%%   %s   %.0f M/s", to_string(st.state),
-                  st.progress * 100.0, progress_bar(st.progress, 32).c_str(), st.rate / 1e6);
+    const char* label = st.stopped_early                                             ? "found, stopped"
+                        : app.want_pause && st.state == svc::JobState::running ? "pausing"
+                                                                              : to_string(st.state);
+    if (show_map)  // the map is the progress bar
+        std::snprintf(b, sizeof(b), "  %s  %5.1f%%   %.0f M/s", label, st.progress * 100.0,
+                      st.rate / 1e6);
+    else
+        std::snprintf(b, sizeof(b), "  %s  %5.1f%%   %s   %.0f M/s", label, st.progress * 100.0,
+                      progress_bar(st.progress, 32).c_str(), st.rate / 1e6);
     fr.line(b);
     std::string times = "  elapsed " + svc::format_duration(st.elapsed_s);
-    if (app.job_running) times += "    ETA " + (st.rate > 0 ? svc::format_duration(st.eta_s) : "--");
+    if (st.state == svc::JobState::paused) times += "    (paused: p to resume)";
+    else if (app.job_running) times += "    ETA " + (st.rate > 0 ? svc::format_duration(st.eta_s) : "--");
     fr.line(times);
     std::snprintf(b, sizeof(b), "  scanned %.4g / %.4g origins    matches: %llu%s",
                   static_cast<double>(st.candidates_done), static_cast<double>(st.candidates_total),
@@ -435,21 +649,25 @@ void draw_result(App& app, Frame& fr) {
     fr.line(b);
     if (!app.m.checkpoint.empty()) fr.line(dim("  checkpoint: " + app.m.checkpoint));
     fr.line();
+    if (show_map) draw_map(app, fr, mv);
 
     if (app.job_running) {
-        fr.line("  " + hi("c") + " cancel" +
-                (app.m.checkpoint.empty() ? "" : dim("  (progress is kept in the checkpoint)")));
+        const bool paused = app.want_pause || st.state == svc::JobState::paused;
+        fr.line("  " + hi("p") + (paused ? " resume   " : " pause   ") + hi("c") + " cancel   " + hi("s") +
+                " save session");
         status_line(app, fr);
         return;
     }
 
     const int total = static_cast<int>(app.matches.size());
-    if (total > 0) fr.line(dim("  anchor cell (~ pattern centre) of each match:"));
-    app.result_rows = std::max(1, fr.rows_left() - kResultFooterRows);
-    const int rows = app.result_rows;
+    // With the map up there may be no room left for the list at all.
+    const int room = std::max(0, fr.rows_left() - (total > 0 ? 1 : 0) - kResultFooterRows);
+    if (total > 0 && room > 0) fr.line(dim("  anchor cell (~ pattern centre) of each match:"));
+    const int rows = std::max(1, room);
+    app.result_rows = rows;
     app.result_scroll = std::clamp(app.result_scroll, 0, std::max(0, total - rows));
     const int start = app.result_scroll;
-    for (int k = start; k < std::min(total, start + rows); ++k) {
+    for (int k = start; k < std::min(total, start + room); ++k) {
         const svc::Match& mm = app.matches[static_cast<std::size_t>(k)];
         char lb[160];
         if (app.m.all_orient)
@@ -459,14 +677,16 @@ void draw_result(App& app, Frame& fr) {
             std::snprintf(lb, sizeof(lb), "    x = %-11d  z = %-11d", mm.x, mm.z);
         fr.line(lb);
     }
-    if (total > rows) {
+    if (room > 0 && total > rows) {
         char lb[96];
         std::snprintf(lb, sizeof(lb), "  [%d-%d of %d]  Up/Down/PgUp/PgDn/Home/End scroll", start + 1,
                       std::min(total, start + rows), total);
         fr.line(dim(lb));
     }
     fr.line();
-    fr.line("  " + hi("S") + " save matches   " + hi("Enter/Esc") + " back to pattern");
+    fr.line("  " + hi("S") + " save matches   " + hi("s") + " save session   " +
+            (can_continue(app) ? hi("r") + " continue   " : "") +
+            (mv.scale > 0 ? hi("m") + " map   " : "") + hi("Enter/Esc") + " back");
     status_line(app, fr);
 }
 
@@ -482,7 +702,54 @@ void do_save_matches(App& app) {
                    : "save failed: write error";
 }
 
+// Save the search so it can be picked up later (even after quitting): the pattern
+// file with a `checkpoint` line, plus the progress it names (<file>.ckpt). Running
+// jobs are saved as of their last few seconds; a paused or stopped one exactly.
+void do_save_session(App& app) {
+    const std::string path = app.prompt_buf;
+    if (path.empty()) return;
+    const std::string text = app.client->checkpoint(app.job);
+    if (text.empty()) {
+        app.status = "nothing to save yet: wait for the first tile (a few seconds), or pause first";
+        return;
+    }
+    const std::string ckpt = path + ".ckpt";
+    {
+        std::ofstream f(ckpt, std::ios::binary | std::ios::trunc);
+        f << text;
+        if (!f) {
+            app.status = "save failed: cannot write " + ckpt;
+            return;
+        }
+    }
+    svc::PatternFile pf = model_to_file(app.m);
+    pf.checkpoint = ckpt;
+    pf.stop_first = app.m.stop_first;
+    std::string err;
+    if (!svc::save_pattern_file(path, pf, err)) {
+        app.status = "save failed: " + err;
+        return;
+    }
+    app.session_path = path;
+    app.status = "saved -> " + path + " + " + ckpt + "   (continue later: rokktui --resume " + path + ")";
+}
+
 bool handle_result(App& app, int k) {
+    if (k == 'p' && app.job_running) {
+        app.want_pause = !app.want_pause;
+        app.client->pause(app.job, app.want_pause);
+        return true;
+    }
+    if (k == 's' && app.job != 0 && app.jst.state != svc::JobState::error) {
+        begin_prompt(app, "Save session as (continue later with: rokktui --resume FILE):", Screen::result,
+                     do_save_session);
+        app.prompt_buf = app.session_path.empty() ? "session.txt" : app.session_path;
+        return true;
+    }
+    if (k == 'r' && can_continue(app)) {
+        start_search(app, app.client->checkpoint(app.job));
+        return true;
+    }
     if (k == 'c' && app.job_running) {
         cancel_job(app);
         app.status = "cancelling...";
@@ -504,6 +771,7 @@ bool handle_result(App& app, int k) {
         case K_PGDN: app.result_scroll += page; break;
         case K_HOME: app.result_scroll = 0; break;
         case K_END: app.result_scroll = static_cast<int>(app.matches.size()); break;
+        case 'm': app.map_toggle = map_wanted(app) ? 0 : 1; break;
         case 'S':
             if (app.jst.state != svc::JobState::error)
                 begin_prompt(app, "Save matches to file:", Screen::result, do_save_matches);
@@ -554,7 +822,26 @@ bool select_backend(App& app, const std::string& id, std::string& err) {
     }
 }
 
+bool resume_session(App& app, const std::string& path, std::string& err) {
+    svc::PatternFile pf;
+    if (!svc::load_pattern_file(path, pf, err)) return false;
+    if (pf.checkpoint.empty()) {
+        err = path + " is a plain pattern, not a saved session (no checkpoint line)";
+        return false;
+    }
+    if (!std::ifstream(pf.checkpoint)) {
+        err = "the progress file " + pf.checkpoint + " (named by " + path + ") is missing";
+        return false;
+    }
+    file_to_model(pf, app.m);
+    app.session_path = path;
+    start_search(app);
+    return true;
+}
+
 void draw(App& app, Frame& fr) {
+    app.term_cols = fr.cols();
+    app.term_rows = fr.rows_left();  // nothing is drawn yet: that is the whole height
     switch (app.screen) {
         case Screen::params: draw_params(app, fr); break;
         case Screen::grid: draw_grid(app, fr); break;
@@ -577,10 +864,13 @@ void refresh_job(App& app) {
     if (!app.job_running) return;
     try {
         app.jst = app.client->poll(app.job);
+        track_map(app);
         if (app.jst.state == svc::JobState::done || app.jst.state == svc::JobState::cancelled ||
             app.jst.state == svc::JobState::error) {
             app.matches = app.client->results(app.job);
             app.job_running = false;
+            app.want_pause = false;
+            app.finished_at_ms = app.now_ms;
             if (app.jst.state == svc::JobState::cancelled) app.status = "cancelled";
         }
     } catch (const std::exception& e) {
