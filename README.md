@@ -67,7 +67,7 @@ CMake automatically selects your installed Visual Studio version. No specific ve
 If everything worked, the final command should display your available compute backends, including your OpenCL GPU.
 
 
-`--list-backends` should show an `opencl:0 … [gpu]` row. If CMake printed `OpenCL not found
+`--list-backends` should show an `opencl:N … [dedicated gpu]` (or `[integrated gpu]`) row. If CMake printed `OpenCL not found
 -- building CPU worker only`, the toolchain file wasn't picked up. A vendor SDK (CUDA
 Toolkit, AMD HIP SDK via `-DOpenCL_ROOT=…`, Intel oneAPI) also works instead of vcpkg.
 
@@ -80,7 +80,7 @@ A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyw
 ### `rokktui` — interactive
 
 ```sh
-build/rokktui [--load pattern.txt | --resume session.txt] [--backend auto|cpu|opencl:N] [--checkpoint run.ckpt]
+build/rokktui [--load pattern.txt | --resume session.txt] [--backend auto|cpu|dedicated|integrated|opencl:N] [--checkpoint run.ckpt]
 ```
 
 1. **Parameters.** Up/Down/Tab move, type to edit, Left/Right change, `Del` clears.
@@ -232,7 +232,8 @@ build/rokksearch --benchmark           # quick: exact / all-8 / all-8 symmetric
 ```
 
 Both use a fixed workload (seed 0, a 6×6 pattern), so results compare across machines;
-`--backend cpu` for the CPU, `--json` for a pasteable result. `--benchmark-long` also checks
+`--backend cpu` for the CPU (or `dedicated` / `integrated` to pick a GPU by kind, `opencl:N` by
+index; plain `auto` prefers dedicated, then integrated, then cpu), `--json` for a pasteable result. `--benchmark-long` also checks
 that every sweep returns the identical matches (count + hash) and exits 1 if not, which
 catches throttling or a device that goes wrong under heat.
 

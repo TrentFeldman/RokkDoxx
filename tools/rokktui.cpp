@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
                 "rokktui -- interactive bedrock pattern search\n"
                 "  --load FILE        preload a pattern file\n"
                 "  --resume FILE      continue a session saved with `s` on the search screen\n"
-                "  --backend ID       cpu | opencl:N | auto (can also be changed on screen)\n"
+                "  --backend ID       cpu | dedicated | integrated | opencl:N | auto (can also be changed on screen)\n"
                 "  --checkpoint FILE  resumable progress file (can also be set on screen)\n"
                 "Requires an interactive terminal. Controls are shown on screen.");
             return 0;
@@ -67,8 +67,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "backend error: %s\n", err.c_str());
             return 1;
         }
-        for (std::size_t i = 0; i < app.backends.size(); ++i)
-            if (app.backends[i].id == backend) app.backend_idx = static_cast<int>(i);
+        if (!backend.empty() && backend != "auto") {  // "dedicated" etc. -> the device it picked
+            const std::string id = svc::resolve_backend(backend).id;
+            for (std::size_t i = 0; i < app.backends.size(); ++i)
+                if (app.backends[i].id == id) app.backend_idx = static_cast<int>(i);
+        }
     }
 
     if (!tui::is_interactive()) {

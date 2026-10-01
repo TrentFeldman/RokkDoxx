@@ -46,7 +46,8 @@ namespace {
                  "  --cap <n>             max matches to keep (default 1048576)\n"
                  "  --tile <n>            tile side floor (default 4096)\n"
                  "  --checkpoint <file>   resumable progress file\n"
-                 "  --backend <id>        cpu | opencl:N | auto (default auto)\n"
+                 "  --backend <id>        cpu | dedicated | integrated | opencl:N | auto (default auto:\n"
+                 "                        dedicated GPU, else integrated GPU, else cpu)\n"
                  "  --json               machine-readable output\n"
                  "  --bench              measure the search you asked for (rate only)\n"
                  "  --benchmark          run the standard reproducible benchmark\n"
@@ -294,7 +295,8 @@ inline void print_header(const char* title, const BackendInfo& chosen) {
     std::printf("rokksearch %s v%d\n", title, kBenchVersion);
     std::printf("backend   : %s\n", chosen.label.c_str());
     if (chosen.is_gpu)
-        std::printf("device    : %s  |  %s  |  driver %s  |  %d CU\n", chosen.label.c_str(),
+        std::printf("device    : %s (%s)  |  %s  |  driver %s  |  %d CU\n", chosen.label.c_str(),
+                    chosen.integrated ? "integrated" : "dedicated",
                     chosen.version.empty() ? "OpenCL ?" : chosen.version.c_str(),
                     chosen.driver.empty() ? "?" : chosen.driver.c_str(), chosen.units);
     std::printf("host      : %s %s  |  %u threads  |  %s\n", host_os(), host_arch(),
@@ -385,25 +387,8 @@ inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, 
 // here). Returns 0, or the exit code to give up with.
 inline int open_worker(const std::string& backend_arg, BackendInfo& chosen,
                        std::unique_ptr<Worker>& worker) {
-    const auto backends = list_backends();
-    if (backends.empty()) {
-        std::fprintf(stderr, "no compute backend available\n");
-        return 1;
-    }
-    const std::string want = backend_arg.empty() ? "auto" : backend_arg;
-    auto it = want == "auto"
-                  ? std::find_if(backends.begin(), backends.end(), [](const auto& b) { return b.is_gpu; })
-                  : std::find_if(backends.begin(), backends.end(),
-                                 [&](const auto& b) { return b.id == want; });
-    if (it == backends.end()) {
-        if (want != "auto") {
-            std::fprintf(stderr, "unknown backend: %s\n", want.c_str());
-            return 2;
-        }
-        it = backends.begin();  // auto with no GPU -> cpu
-    }
-    chosen = *it;
     try {
+        chosen = resolve_backend(backend_arg);
         worker = make_worker_factory(chosen.id)();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "backend error: %s\n", e.what());
@@ -465,9 +450,10 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
     if (json) {
         std::printf("{\"benchmark_version\":%d,\"backend\":\"%s\",", kBenchVersion,
                     chosen.label.c_str());
-        std::printf("\"device\":{\"is_gpu\":%s,\"cl_version\":\"%s\",\"driver\":\"%s\",\"units\":%d},",
-                    chosen.is_gpu ? "true" : "false", chosen.version.c_str(), chosen.driver.c_str(),
-                    chosen.units);
+        std::printf("\"device\":{\"is_gpu\":%s,\"integrated\":%s,\"cl_version\":\"%s\","
+                    "\"driver\":\"%s\",\"units\":%d},",
+                    chosen.is_gpu ? "true" : "false", chosen.integrated ? "true" : "false",
+                    chosen.version.c_str(), chosen.driver.c_str(), chosen.units);
         std::printf("\"host\":{\"os\":\"%s\",\"arch\":\"%s\",\"threads\":%u,\"compiler\":\"%s\"},",
                     host_os(), host_arch(), threads, host_compiler().c_str());
         std::printf("\"pattern\":{\"w\":%d,\"h\":%d,\"seed\":%lld,\"y\":%d},", kPatW, kPatH,
@@ -668,7 +654,8 @@ int main(int argc, char** argv) {
         else if (a == "--out") out_path = val("out");
         else if (a == "--list-backends") {
             for (const auto& b : list_backends())
-                std::printf("%-10s  %s%s\n", b.id.c_str(), b.label.c_str(), b.is_gpu ? "  [gpu]" : "");
+                std::printf("%-10s  %s%s\n", b.id.c_str(), b.label.c_str(),
+                            !b.is_gpu ? "" : b.integrated ? "  [integrated gpu]" : "  [dedicated gpu]");
             return 0;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());

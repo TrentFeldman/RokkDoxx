@@ -150,6 +150,11 @@ std::vector<OpenclDevice> opencl_list_devices() {
                 d.compute_units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
             } catch (...) {
             }
+            try {
+                d.is_cpu = (devs[i].getInfo<CL_DEVICE_TYPE>() & CL_DEVICE_TYPE_CPU) != 0;
+                d.integrated = !d.is_cpu && devs[i].getInfo<CL_DEVICE_HOST_UNIFIED_MEMORY>() != CL_FALSE;
+            } catch (...) {
+            }
             out.push_back(std::move(d));
         }
     } catch (...) {

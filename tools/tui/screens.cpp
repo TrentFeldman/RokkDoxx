@@ -54,7 +54,9 @@ std::string backend_text(const App& app) {
     if (app.backend_idx < 0) return "auto  (" + app.backend_label + ")";
     const svc::BackendInfo& b = app.backends[static_cast<std::size_t>(app.backend_idx)];
     std::string s = b.id + "  " + b.label;
-    if (b.units > 0) s += "  (" + std::to_string(b.units) + (b.is_gpu ? " CUs)" : " threads)");
+    if (b.units > 0)
+        s += "  (" + std::to_string(b.units) +
+             (!b.is_gpu ? " threads)" : b.integrated ? " CUs, integrated)" : " CUs)");
     return s;
 }
 

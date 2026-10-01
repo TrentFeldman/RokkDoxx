@@ -17,6 +17,8 @@ struct OpenclDevice {
     std::string cl_version;      // CL_DEVICE_VERSION, e.g. "OpenCL 2.0 AMD-APP..."
     std::string driver_version;  // CL_DRIVER_VERSION
     int compute_units = 0;       // CL_DEVICE_MAX_COMPUTE_UNITS
+    bool is_cpu = false;         // CL_DEVICE_TYPE_CPU (e.g. pocl): not a GPU
+    bool integrated = false;     // GPU sharing host memory (iGPU/APU), by CL_DEVICE_HOST_UNIFIED_MEMORY
 };
 
 // Enumerate every OpenCL device on the host (empty if no platform / ICD).

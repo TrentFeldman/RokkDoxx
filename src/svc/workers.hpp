@@ -40,6 +40,7 @@ struct BackendInfo {
     std::string id;       // "cpu", "opencl:0", ...
     std::string label;    // human-readable
     bool is_gpu = false;
+    bool integrated = false;  // a GPU that shares host memory (iGPU / APU)
     std::string version;  // GPU: CL_DEVICE_VERSION; CPU: empty
     std::string driver;   // GPU: CL_DRIVER_VERSION; CPU: empty
     int units = 0;        // GPU: compute units; CPU: hardware threads
@@ -48,8 +49,13 @@ struct BackendInfo {
 // Every backend runnable on this build + host.
 std::vector<BackendInfo> list_backends();
 
-// A factory for backend `id`. "auto" (or empty) -> first GPU if any, else cpu.
+// Resolve a backend name to one of list_backends(). `id` is "cpu", "opencl:N",
+// "dedicated" / "integrated" (the first GPU of that kind), or "auto" (or empty):
+// dedicated GPU, else integrated GPU, else cpu.
 // Throws std::runtime_error if `id` is unknown or unavailable.
+BackendInfo resolve_backend(const std::string& id);
+
+// A factory for the backend `id` names (see resolve_backend). Throws the same way.
 WorkerFactory make_worker_factory(const std::string& id);
 
 }  // namespace rokkdoxx::svc

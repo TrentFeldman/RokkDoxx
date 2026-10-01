@@ -206,7 +206,8 @@ std::vector<BackendInfo> list_backends() {
         BackendInfo b;
         b.id = "opencl:" + std::to_string(d.index);
         b.label = d.label;
-        b.is_gpu = true;
+        b.is_gpu = !d.is_cpu;
+        b.integrated = d.integrated;
         b.version = d.cl_version;
         b.driver = d.driver_version;
         b.units = d.compute_units;
@@ -216,26 +217,48 @@ std::vector<BackendInfo> list_backends() {
     return out;
 }
 
-WorkerFactory make_worker_factory(const std::string& id) {
-    std::string want = id.empty() ? "auto" : id;
+BackendInfo resolve_backend(const std::string& id) {
+    const std::string want = id.empty() ? "auto" : id;
+    const std::vector<BackendInfo> all = list_backends();
+    auto first = [&](auto pred) -> const BackendInfo* {
+        auto it = std::find_if(all.begin(), all.end(), pred);
+        return it == all.end() ? nullptr : &*it;
+    };
+    auto dedicated = [](const BackendInfo& b) { return b.is_gpu && !b.integrated; };
+    auto integrated = [](const BackendInfo& b) { return b.is_gpu && b.integrated; };
 
-#ifdef ROKK_ENABLE_OPENCL
+    const BackendInfo* b = nullptr;
     if (want == "auto") {
-        auto devs = opencl_list_devices();
-        if (!devs.empty()) want = "opencl:" + std::to_string(devs.front().index);
+        b = first(dedicated);
+        if (!b) b = first(integrated);
+        if (!b) b = &all.front();  // the cpu entry
+    } else if (want == "dedicated") {
+        b = first(dedicated);
+    } else if (want == "integrated") {
+        b = first(integrated);
+    } else {
+        b = first([&](const BackendInfo& x) { return x.id == want; });
     }
-    if (want.rfind("opencl:", 0) == 0) {
-        const int idx = std::atoi(want.c_str() + 7);
-        return [idx] { return std::make_unique<OpenclWorker>(idx); };
-    }
-#else
-    if (want.rfind("opencl", 0) == 0)
+    if (b) return *b;
+
+#ifndef ROKK_ENABLE_OPENCL
+    if (want.rfind("opencl", 0) == 0 || want == "dedicated" || want == "integrated")
         throw std::runtime_error("this build has no OpenCL support (rebuild with ROKK_ENABLE_OPENCL)");
 #endif
+    if (want == "dedicated" || want == "integrated")
+        throw std::runtime_error("no " + want + " GPU found (see --list-backends)");
+    throw std::runtime_error("unknown backend: " + id + " (see --list-backends)");
+}
 
-    if (want == "auto" || want == "cpu") return [] { return std::make_unique<CpuWorker>(); };
-
+WorkerFactory make_worker_factory(const std::string& id) {
+    const BackendInfo b = resolve_backend(id);
+    if (b.id == "cpu") return [] { return std::make_unique<CpuWorker>(); };
+#ifdef ROKK_ENABLE_OPENCL
+    const int idx = std::atoi(b.id.c_str() + 7);  // "opencl:N"
+    return [idx] { return std::make_unique<OpenclWorker>(idx); };
+#else
     throw std::runtime_error("unknown backend: " + id);
+#endif
 }
 
 }  // namespace rokkdoxx::svc
