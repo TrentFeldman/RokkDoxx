@@ -59,6 +59,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 build\Release\rokksearch.exe --list-backends
 ```
+Please note, Windows performance is slightly worse than linux, however this only makes a large differance on full world sweeps. 
 
 CMake automatically selects your installed Visual Studio version. No specific version is required.
 
@@ -88,7 +89,7 @@ A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyw
 
 ### Build — macOS
 
-# !!!UNSUPPORTED!!! 
+## !!!UNSUPPORTED!!! 
 
 Apple deprecated OpenCL in 2018 (frozen at 1.2) and can remove it in any macOS update, and the kernel leans on
 64-bit integer math that Apple GPUs may handle slowly. It may not build, may crash, or may
@@ -118,7 +119,7 @@ brew install cmake opencl-clhpp-headers
 git clone https://github.com/TrentFeldman/RokkDoxx && cd RokkDoxx
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/rokksearch --list-backends             # want an `opencl:N … gpu` row
+build/rokksearch --list-backends             # want a `opencl:N … gpu` row
 ctest --test-dir build --output-on-failure   # the `gpu` test must pass before trusting the GPU
 ```
 
@@ -305,7 +306,7 @@ catches throttling or a device that goes wrong under heat.
 | ✅ | Demo searches | `rokksearch --demo` |
 | ✅ | ETA + sustained benchmark | `--benchmark-long 15` checks results stay identical |
 | ✅ | `rokktui` / `rokksearch` on Linux | |
-| 🧪 | Windows (`rokktui`, `rokksearch`, GPU) | beta |
+| 🧪 | Windows (`rokktui`, `rokksearch`, GPU) | beta, slight performance drop |
 | ⛔ | macOS (OpenCL) | **unsupported** — never run on a Mac |
 | ⬜ | Faster CPU all-8 | still ~0.4× exact; the GPU's bit-plane idea should apply |
 | ⬜ | Reattach to a running search | |
