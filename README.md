@@ -221,6 +221,9 @@ all-8 run; the other columns are the ~30 s quick benchmark.
 |---|---|---|---|---|---|---|
 | RX 7900 XTX | opencl | **149.0** (148.6–153.4, −2.7% first→last) | 222.1 | 157.4 | 212.8 | ROCm, 48 CU |
 | Ryzen 5 5600 | cpu | — | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 |
+| RTX 4060 Laptop GPU | opencl | - | 97.05 | 70.79 | 89.41 | CUDA, 24 CU |
+| Intel Ultra 9 185H | cpu | — | 0.97 | 0.45 | 1.10 | 22 threads, msvc 1951 |	
+| Intel Arc Graphics(9 185H) | opencl | - | 33.70 | 26.91 | 31.76 | NEO, 128 CU |
 
 A whole-world sweep (3.6·10¹⁵ candidates) depends on your gpu. time (hours) ≈ 1000 / throughput (Gcands/s)
 Dont see your gpu in the benchmarks? Estimate. Or run one! Submit a push request if you do, so I can add to the DB.
