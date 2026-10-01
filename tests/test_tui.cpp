@@ -639,6 +639,24 @@ void test_continue_after_stop() {
     check(app.matches.size() > first_count, "...having found more matches than the first stop");
 }
 
+// A running search ignores everything but p / s / c: a fat-fingered Enter must not end it.
+void test_running_search_ignores_stray_keys() {
+    std::printf("test_running_search_ignores_stray_keys\n");
+    App app;
+    slow_search(app);
+    handle_key(app, K_ENTER);
+    check(app.job_running && app.screen == Screen::result, "the search is running");
+    for (int k : std::initializer_list<int>{K_ENTER, K_ESC, 'q', 'Q', 'x', ' ', 'r', 'm', 'S', K_UP, K_DOWN, K_TAB, K_DELETE, K_BACKSPACE})
+        handle_key(app, k);
+    check(app.job_running && app.screen == Screen::result && app.jst.state != svc::JobState::cancelled,
+          "Enter / Esc / q and other stray keys change nothing");
+    handle_key(app, 'c');
+    check(pump_until(app, [&] { return !app.job_running; }), "c still cancels it");
+    check(app.jst.state == svc::JobState::cancelled, "...as a cancel");
+    handle_key(app, K_ENTER);
+    check(app.screen == Screen::grid, "and once it has stopped, Enter goes back");
+}
+
 }  // namespace
 
 void test_grid_typing() {
@@ -677,6 +695,7 @@ int main() {
     test_stop_first();
     test_pause_save_resume();
     test_continue_after_stop();
+    test_running_search_ignores_stray_keys();
     test_grid_typing();
     if (g_fail) {
         std::printf("test_tui: %d failure(s)\n", g_fail);

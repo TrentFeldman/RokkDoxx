@@ -34,6 +34,9 @@ def main(exe):
                 failures += 1
                 continue
             want = f"{m.group(1)} {m.group(2)}"
+            if not re.search(r"^center 0 0$", open(path).read(), re.M):
+                print(f"FAIL [{label}]: the region should always be centred on 0 0")
+                failures += 1
 
             t0 = time.time()
             found = run([exe, "--pattern", path, "--backend", "cpu"])

@@ -502,10 +502,10 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
 
 // ===========================================================================
 // --demo <seconds> : a search you can try without opening Minecraft. A random
-// seed and a random spot in the world; the pattern is copied from that spot (so
-// it really is there); the region is sized from this machine's measured rate so
-// the search takes about `seconds`, and the pattern grows until a second,
-// spurious match is unlikely.
+// seed and a random spot in a region centred on 0,0; the pattern is copied from
+// that spot (so it really is there); the region is sized from this machine's
+// measured rate so the search takes about `seconds`, and the pattern grows until
+// a second, spurious match is unlikely.
 // ===========================================================================
 namespace demo {
 
@@ -566,13 +566,10 @@ inline int run(const std::string& backend, const char* seed_s, int y, bool all_o
                                : std::max<std::int64_t>(
                                      64, static_cast<std::int64_t>((std::sqrt(rate * seconds * 0.9) - 1) / 2));
     const bool whole = 2 * r + 1 >= 2 * border;  // `max`, or a budget longer than the world
-    std::int64_t cx = 0, cz = 0;
-    Region region = Region::world();
-    if (!whole) {
-        cx = uniform(-border + r, border - 1 - r);
-        cz = uniform(-border + r, border - 1 - r);
-        region = Region::centered(cx, cz, r);
-    }
+    // Always centred on 0,0 (spawn), like someone who has no idea where their build is: only
+    // the planted spot below is random.
+    const std::int64_t cx = 0, cz = 0;
+    const Region region = whole ? Region::world() : Region::centered(cx, cz, r);
     const std::int64_t px = uniform(region.x0 + kMargin, region.x1 - kMargin);
     const std::int64_t pz = uniform(region.z0 + kMargin, region.z1 - kMargin);
 

@@ -755,14 +755,15 @@ bool handle_result(App& app, int k) {
         app.status = "cancelling...";
         return true;
     }
+    // While a search runs, p / s / c (above) are the only keys that do anything: a stray
+    // Enter, Esc or q must not be able to throw away hours of work. (Ctrl+C is the
+    // terminal's own kill and never reaches here.)
+    if (app.job_running) return true;
     if (k == K_ENTER || k == K_ESC || k == 'q') {
-        cancel_job(app);
-        app.job_running = false;
         app.screen = Screen::grid;
         app.status.clear();
         return true;
     }
-    if (app.job_running) return true;
     const int page = app.result_rows;
     switch (k) {
         case K_UP: --app.result_scroll; break;
