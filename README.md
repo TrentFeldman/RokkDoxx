@@ -75,6 +75,56 @@ A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyw
 `Unblock-File`). RokkDoxx makes no network connections and only writes files you name
 (saving a session also writes `<name>.ckpt` beside it).
 
+**Reading the Linux commands below on Windows.** Run them in CMD from the `RokkDoxx` folder
+(File Explorer → click the address bar → type `cmd` → Enter), with these swaps:
+
+| README says | On Windows |
+|---|---|
+| `build/rokktui`, `rokksearch …`, `build/dump_bedrock …` | `build\Release\rokktui.exe`, `build\Release\rokksearch.exe …`, `build\Release\dump_bedrock.exe …` (`/` in paths becomes `\`) |
+| `cmake --build build`, `ctest --test-dir build` | add `--config Release` / `-C Release`, as in the steps above |
+| `./build.sh` | not available — use CMake |
+| `# …` after a command, a leading `$ ` | don't type them |
+| `ls`, `cat f`, `cp a b`, `rm -rf d` | `dir`, `type f`, `copy a b`, `rmdir /s /q d` |
+
+### Build — macOS
+
+# !!!UNSUPPORTED!!! 
+
+Apple deprecated OpenCL in 2018 (frozen at 1.2) and can remove it in any macOS update, and the kernel leans on
+64-bit integer math that Apple GPUs may handle slowly. It may not build, may crash, or may
+quietly give wrong answers — the `gpu` test below is the check. No support is promised. If the GPU
+path fails, `--backend cpu` still works. Use at your own risk. This section is more of a "What-If" than a 
+supported feature. 
+
+**Before you start** — macOS ships none of this except Terminal (Spotlight → "Terminal"). Run
+these in it, Intel or Apple Silicon:
+
+1. **Command Line Tools** (compiler, `git`, Python 3; a dialog opens, takes a few minutes):
+   ```sh
+   xcode-select --install
+   ```
+2. **Homebrew**, the package manager — *not* included with macOS:
+   ```sh
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+   On Apple Silicon it ends by printing two commands (`echo … >> ~/.zprofile`, then
+   `eval "$(/opt/homebrew/bin/brew shellenv)"`): run them, then quit and reopen Terminal.
+   `brew --version` should now work.
+
+Then:
+
+```sh
+brew install cmake opencl-clhpp-headers
+git clone https://github.com/TrentFeldman/RokkDoxx && cd RokkDoxx
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+build/rokksearch --list-backends             # want an `opencl:N … gpu` row
+ctest --test-dir build --output-on-failure   # the `gpu` test must pass before trusting the GPU
+```
+
+Without `opencl-clhpp-headers` CMake says so and builds CPU only. `./build.sh` also works
+(`ROKK_OPENCL=1` for the GPU).
+
 ## Usage
 
 ### `rokktui` — interactive
@@ -256,6 +306,7 @@ catches throttling or a device that goes wrong under heat.
 | ✅ | ETA + sustained benchmark | `--benchmark-long 15` checks results stay identical |
 | ✅ | `rokktui` / `rokksearch` on Linux | |
 | 🧪 | Windows (`rokktui`, `rokksearch`, GPU) | beta |
+| ⛔ | macOS (OpenCL) | **unsupported** — never run on a Mac |
 | ⬜ | Faster CPU all-8 | still ~0.4× exact; the GPU's bit-plane idea should apply |
 | ⬜ | Reattach to a running search | |
 | ⬜ | Multi-Y patterns | several layers in one pattern |

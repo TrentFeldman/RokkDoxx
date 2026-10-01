@@ -24,12 +24,17 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 #define CL_HPP_ENABLE_EXCEPTIONS
 #define CL_HPP_TARGET_OPENCL_VERSION 120
 #define CL_HPP_MINIMUM_OPENCL_VERSION 120
 #define CL_TARGET_OPENCL_VERSION 120  // silences the <CL/cl.h> "defaulting to 300" pragma
 #define NOMINMAX                      // in case an SDK header pulls in <windows.h>
+#define CL_SILENCE_DEPRECATION        // macOS: Apple deprecated OpenCL (it still works, at 1.2)
+// Apple ships only the C headers; the C++ bindings are Khronos's (brew install
+// opencl-clhpp-headers), which pull in <OpenCL/opencl.h> on macOS by themselves.
 #if __has_include(<CL/opencl.hpp>)
 #include <CL/opencl.hpp>
 #else
@@ -95,6 +100,19 @@ std::string specialized_source(const SearchPlan& plan) {
 // the global size to be a multiple of a non-null local size -- so it is padded
 // up. Both kernels bounds-check, which makes the padding work-items harmless.
 std::size_t round_up(std::size_t v, std::size_t mult) { return ((v + mult - 1) / mult) * mult; }
+
+// Work-group shape for the plane kernels: 32x8 (measured fastest on a 7900 XTX),
+// halved until it fits `limit` -- the most work-items either kernel can launch
+// with. Most GPUs allow 256+, but Apple's OpenCL can cap a kernel lower, and its
+// CPU device allows 1; an oversized group is a hard CL_INVALID_WORK_GROUP_SIZE.
+std::pair<std::size_t, std::size_t> fit_local(std::size_t limit) {
+    std::size_t w = 32, h = 8;
+    while (w * h > limit && w * h > 1) {
+        if (h > 1) h /= 2;
+        else w /= 2;
+    }
+    return {w, h};
+}
 
 std::vector<cl::Device> flat_devices(std::vector<std::string>* labels = nullptr) {
     std::vector<cl::Device> all;
@@ -197,13 +215,25 @@ struct OpenclWorker::Impl {
     // past kPlaneHaloMax -- a huge, sparse pattern -- uses k_search instead.
     static constexpr int kChunk = 16384;
     static constexpr int kPlaneHaloMax = 1024;
-    static constexpr int kLocalW = 32, kLocalH = 8;  // measured fastest on a 7900 XTX
+    std::size_t local_w = 32, local_h = 8;  // see fit_local; set by pick_local()
     cl::Kernel k_fill, k_match;
     cl::Program specialized_program;  // the current pattern's match_plane (one at a time)
     std::string specialized_src;      // its source, so an unchanged pattern isn't rebuilt
     cl::Buffer buf_plane[kSlots];
     bool use_plane = false;
     int halo_w = 0, halo_h = 0;
+
+    // Call whenever k_fill / k_match change: the specialized match_plane can
+    // have a smaller launch limit than the generic one.
+    void pick_local() {
+        std::size_t limit = 256;  // unqueryable: assume the old default
+        try {
+            limit = std::min(k_fill.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(device),
+                             k_match.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(device));
+        } catch (const cl::Error&) {
+        }
+        std::tie(local_w, local_h) = fit_local(limit);
+    }
 };
 
 OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
@@ -233,6 +263,7 @@ OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
     impl_->k_dump = cl::Kernel(impl_->program, "dump_plane");
     impl_->k_fill = cl::Kernel(impl_->program, "fill_plane");
     impl_->k_match = cl::Kernel(impl_->program, "match_plane");
+    impl_->pick_local();
 }
 
 OpenclWorker::~OpenclWorker() {
@@ -322,6 +353,7 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
         } catch (const std::exception&) {
             impl_->k_match = cl::Kernel(impl_->program, "match_plane");  // oh-shit fallback: generic, silently
         }
+        impl_->pick_local();
     }
 }
 
@@ -343,7 +375,8 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
 
     if (impl_->use_plane) {
         const int hw = impl_->halo_w, hh = impl_->halo_h;
-        const cl::NDRange local(Impl::kLocalW, Impl::kLocalH);
+        const std::size_t lw = impl_->local_w, lh = impl_->local_h;
+        const cl::NDRange local(lw, lh);
         for (int cz = 0; cz < tile.h; cz += Impl::kChunk)
             for (int cx = 0; cx < tile.w; cx += Impl::kChunk) {
                 const std::int64_t x0 = tile.x0 + cx, z0 = tile.z0 + cz;
@@ -365,7 +398,7 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
                 f.setArg(a++, impl_->buf_plane[slot]);
                 impl_->queue[slot].enqueueNDRangeKernel(
                     f, cl::NullRange,
-                    cl::NDRange(round_up(words_w, Impl::kLocalW), round_up(rows, Impl::kLocalH)), local);
+                    cl::NDRange(round_up(words_w, lw), round_up(rows, lh)), local);
 
                 cl::Kernel& m = impl_->k_match;
                 a = 0;
@@ -388,7 +421,7 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
                 m.setArg(a++, impl_->buf_orient[slot]);
                 impl_->queue[slot].enqueueNDRangeKernel(
                     m, cl::NullRange,
-                    cl::NDRange(round_up((w + 31) / 32, Impl::kLocalW), round_up(h, Impl::kLocalH)), local);
+                    cl::NDRange(round_up((w + 31) / 32, lw), round_up(h, lh)), local);
             }
         return;
     }

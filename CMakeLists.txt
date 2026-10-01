@@ -33,6 +33,16 @@ set(SVC_SOURCES
 set(ROKK_HAVE_OPENCL FALSE)
 if(ROKK_ENABLE_OPENCL)
   find_package(OpenCL QUIET)
+  # macOS ships OpenCL's C headers only; the C++ bindings (CL/opencl.hpp) come from
+  # Homebrew (opencl-clhpp-headers). Without them, fall back to CPU rather than fail.
+  if(OpenCL_FOUND AND APPLE)
+    find_path(ROKK_CLHPP_DIR NAMES CL/opencl.hpp CL/cl2.hpp
+              HINTS /opt/homebrew/include /usr/local/include)
+    if(NOT ROKK_CLHPP_DIR)
+      message(STATUS "OpenCL C++ headers not found (brew install opencl-clhpp-headers)")
+      set(OpenCL_FOUND FALSE)
+    endif()
+  endif()
   if(OpenCL_FOUND)
     set(ROKK_HAVE_OPENCL TRUE)
     list(APPEND SVC_SOURCES src/svc/opencl_worker.cpp)
@@ -63,6 +73,9 @@ if(ROKK_HAVE_OPENCL)
   target_compile_definitions(rokksvc PUBLIC ROKK_ENABLE_OPENCL)
   target_link_libraries(rokksvc PUBLIC OpenCL::OpenCL)
   target_include_directories(rokksvc PRIVATE "${CMAKE_BINARY_DIR}/generated")
+  if(ROKK_CLHPP_DIR)
+    target_include_directories(rokksvc PRIVATE "${ROKK_CLHPP_DIR}")
+  endif()
 endif()
 
 # --- tools ---------------------------------------------------------------

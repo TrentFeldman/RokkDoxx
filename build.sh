@@ -17,7 +17,7 @@ SVC=(
   src/svc/client.cpp
   src/svc/pattern_io.cpp
 )
-LINK=()
+LINK=(-lm)  # never empty: macOS's bash 3.2 errors on "${empty[@]}" under `set -u`
 GPU_TEST=""
 if [[ "${ROKK_OPENCL:-0}" == "1" ]]; then
   # Embed the kernel text (same as CMake's configure_file step).
@@ -33,7 +33,13 @@ if [[ "${ROKK_OPENCL:-0}" == "1" ]]; then
 
   FLAGS+=(-DROKK_ENABLE_OPENCL -Ibuild/generated)
   SVC+=(src/svc/opencl_worker.cpp)
-  LINK+=(-lOpenCL)
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # Apple ships only OpenCL's C headers; the C++ ones come from Homebrew.
+    LINK+=(-framework OpenCL)
+    FLAGS+=(-I"$(brew --prefix 2>/dev/null || echo /opt/homebrew)/include")
+  else
+    LINK+=(-lOpenCL)
+  fi
   GPU_TEST="build/test_gpu"
 fi
 
