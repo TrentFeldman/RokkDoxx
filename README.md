@@ -91,6 +91,8 @@ A freshly built unsigned `.exe` may trigger SmartScreen ("More info → Run anyw
 
 ## !!!UNSUPPORTED!!! 
 
+This works, but is slow, is a headache, and not supported. You will most likley have to debug yourself. 
+
 Apple deprecated OpenCL in 2018 (frozen at 1.2) and can remove it in any macOS update, and the kernel leans on
 64-bit integer math that Apple GPUs may handle slowly. It may not build, may crash, or may
 quietly give wrong answers — the `gpu` test below is the check. No support is promised. If the GPU
@@ -275,6 +277,8 @@ all-8 run; the other columns are the ~30 s quick benchmark.
 | RTX 4060 Laptop GPU | opencl | - | 97.05 | 70.79 | 89.41 | CUDA, 24 CU |
 | Intel Ultra 9 185H | cpu | — | 0.97 | 0.45 | 1.10 | 22 threads, msvc 1951 |	
 | Intel Arc Graphics(9 185H) | opencl | - | 33.70 | 26.91 | 31.76 | NEO, 128 CU |
+| Apple M5 GPU | opencl | **25.19** (25.92–19.87, −19.1% first→last) | 40.51 | 25.90 | 40.23 | OpenCL, 10 CU |
+| Apple M5 CPU | opencl | - | 1.11 | 0.55 | 1.22 | 10 Threads, Clang |
 
 A whole-world sweep (3.6·10¹⁵ candidates) depends on your gpu. time (hours) ≈ 1000 / throughput (Gcands/s)
 Dont see your gpu in the benchmarks? Estimate. Or run one! Submit a push request if you do, so I can add to the DB.
