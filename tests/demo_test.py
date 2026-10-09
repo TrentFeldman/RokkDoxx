@@ -25,7 +25,8 @@ def main(exe):
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "demo.txt")
-        for extra in ([], ["--orientations", "exact"], ["--y", "-62"]):
+        for extra in ([], ["--orientations", "exact"], ["--y", "-62"], ["--edition", "bedrock"],
+                      ["--edition", "bedrock", "--y", "-61", "--orientations", "exact"]):
             label = " ".join(extra) or "defaults"
             made = run([exe, "--demo", str(BUDGET), "--backend", "cpu", "--out", path] + extra)
             m = re.search(r"expect match: (-?\d+) (-?\d+)", made.stdout)
@@ -94,6 +95,9 @@ def main(exe):
         # Layers that are all bedrock / all air can't make a distinctive pattern.
         if run([exe, "--demo", "1", "--y", "-59", "--backend", "cpu", "--out", path]).returncode != 2:
             print("FAIL: --y -59 should be rejected")
+            failures += 1
+        if run([exe, "--demo", "1", "--edition", "bedrock", "--y", "-63", "--backend", "cpu", "--out", path]).returncode != 2:
+            print("FAIL: --y -63 should be rejected on Bedrock (it is solid there)")
             failures += 1
     return failures
 

@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "check.hpp"
 #include "svc/client.hpp"
 #include "tui/frame.hpp"
 #include "tui/model.hpp"
@@ -20,14 +21,6 @@ using namespace rokkdoxx;
 using namespace rokkdoxx::tui;
 
 namespace {
-
-int g_fail = 0;
-void check(bool ok, const std::string& what) {
-    if (!ok) {
-        std::printf("  FAIL: %s\n", what.c_str());
-        ++g_fail;
-    }
-}
 
 void test_file_round_trip() {
     Model a;
@@ -39,13 +32,15 @@ void test_file_round_trip() {
     a.cz = "250";
     a.radius = "77";
     a.all_orient = false;
+    a.edition = svc::Edition::bedrock;
     a.at(0, 0) = svc::Cell::bedrock;
     a.at(4, 2) = svc::Cell::not_bedrock;
     a.at(10, 10) = svc::Cell::bedrock;  // outside w x h: not part of the pattern
 
     Model b;
     file_to_model(model_to_file(a), b);
-    check(b.seed == a.seed && b.w == 5 && b.h == 3 && b.y == -61, "round trip: header fields");
+    check(b.seed == a.seed && b.w == 5 && b.h == 3 && b.y == -61 && b.edition == svc::Edition::bedrock,
+          "round trip: header fields");
     check(b.cx == "-100" && b.cz == "250" && b.radius == "77" && !b.all_orient,
           "round trip: region + orientation");
     check(b.at(0, 0) == svc::Cell::bedrock && b.at(4, 2) == svc::Cell::not_bedrock &&
@@ -85,8 +80,9 @@ void test_build_request_errors() {
 // Paint from the world, then search for it: the spot we painted from must come
 // back, reported (post Step 9) at the anchor cell -- somewhere inside the
 // pattern's footprint.
-void test_fill_and_find(bool all_orient) {
+void test_fill_and_find(bool all_orient, svc::Edition edition = svc::Edition::java) {
     Model m;
+    m.edition = edition;
     m.seed = "0";
     m.w = 6;
     m.h = 6;
@@ -116,8 +112,9 @@ void test_fill_and_find(bool all_orient) {
     for (const svc::Match& mm : client->results(id))
         if (mm.x >= 137 && mm.x < 137 + 6 && mm.z >= -251 && mm.z < -251 + 6 && (mm.orient_mask & 1))
             found = true;
-    check(found, all_orient ? "all-8: painted spot is found (identity bit, anchor in footprint)"
-                            : "exact: painted spot is found (anchor in footprint)");
+    check(found, std::string(edition == svc::Edition::bedrock ? "bedrock " : "") +
+                     (all_orient ? "all-8: painted spot is found (identity bit, anchor in footprint)"
+                                 : "exact: painted spot is found (anchor in footprint)"));
 }
 
 void test_format_matches() {
@@ -487,6 +484,32 @@ void test_stop_first() {
           "a job that stopped early says so instead of 'done'");
 }
 
+// The edition toggle: on the params screen and carried into the request. On
+// Bedrock the seed row says it is unused, and -63 is solid there.
+void test_edition_toggle() {
+    App app;
+    app.screen = Screen::params;
+    auto selected_row = [&] {
+        for (const auto& [row, text] : screen_rows(render(app)))
+            if (text.find("\xe2\x96\xb6") != std::string::npos) return text;  // the selection arrow
+        return std::string();
+    };
+    auto shown = [&](const std::string& s) { return render(app).find(s) != std::string::npos; };
+    for (int i = 0; i < 20 && selected_row().find("edition") == std::string::npos; ++i) handle_key(app, K_DOWN);
+    check(selected_row().find("Java") != std::string::npos, "the edition is on the params screen, Java by default");
+    handle_key(app, K_RIGHT);
+    check(app.m.edition == svc::Edition::bedrock && shown("not used on Bedrock"),
+          "Right switches to Bedrock and marks the seed unused");
+    app.m.y = -63;
+    check(shown("solid everywhere"), "on Bedrock y -63 is all bedrock");
+    app.m.at(0, 0) = svc::Cell::bedrock;
+    svc::SearchRequest req;
+    std::string err;
+    check(build_request(app.m, req, err) && req.edition == svc::Edition::bedrock, "the request carries the edition");
+    handle_key(app, ' ');
+    check(app.m.edition == svc::Edition::java && !shown("not used on Bedrock"), "space switches back to Java");
+}
+
 // --- pause, save a session, continue later ---------------------------------
 
 // A CPU search of ~1.5 s with one planted match, so there is time to pause in the middle.
@@ -683,6 +706,7 @@ int main() {
     test_build_request_errors();
     test_fill_and_find(false);
     test_fill_and_find(true);
+    test_fill_and_find(true, svc::Edition::bedrock);
     test_format_matches();
     test_clip_visible();
     test_frame_diff();
@@ -693,14 +717,10 @@ int main() {
     test_map_celebration();
     test_map_end_to_end();
     test_stop_first();
+    test_edition_toggle();
     test_pause_save_resume();
     test_continue_after_stop();
     test_running_search_ignores_stray_keys();
     test_grid_typing();
-    if (g_fail) {
-        std::printf("test_tui: %d failure(s)\n", g_fail);
-        return 1;
-    }
-    std::printf("test_tui: all passed\n");
-    return 0;
+    return report();
 }

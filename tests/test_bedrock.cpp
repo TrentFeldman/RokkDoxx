@@ -1,4 +1,5 @@
-// Unit + known-answer tests for the Minecraft 26.2 bedrock-floor generator.
+// Unit + known-answer tests for the Minecraft 26.2 bedrock-floor generator
+// (Java Edition; Bedrock Edition's is test_bedrock_edition).
 //
 // RNG vectors are Java-generated (from Xevion/seedcrack-portal's
 // TestVectorGenerator.java, MC 1.21.4 -- identical code path to 26.2).
@@ -8,29 +9,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
+#include "check.hpp"
 #include "gen/bedrock.hpp"
-#include "gen/positional_random.hpp"
-#include "gen/xoroshiro128pp.hpp"
+#include "gen/bedrock_core.h"
 
 namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const std::string& what) {
-    if (!ok) {
-        std::printf("  FAIL: %s\n", what.c_str());
-        ++g_failures;
-    }
-}
 
 void expect_u64(std::uint64_t got, std::uint64_t want, const std::string& what) {
     if (got != want) {
         std::printf("  FAIL: %s: got 0x%016llx want 0x%016llx\n", what.c_str(),
                     (unsigned long long)got, (unsigned long long)want);
-        ++g_failures;
+        ++g_fail;
     }
 }
 
@@ -38,8 +31,13 @@ void expect_i64(std::int64_t got, std::int64_t want, const std::string& what) {
     if (got != want) {
         std::printf("  FAIL: %s: got %lld want %lld\n", what.c_str(), (long long)got,
                     (long long)want);
-        ++g_failures;
+        ++g_fail;
     }
+}
+
+// Java nextFloat(): next(24) * 0x1.0p-24f. Exact: the shifted value is < 2^24.
+float next_float(rk_u64* lo, rk_u64* hi) {
+    return static_cast<float>(rk_xoro_next(lo, hi) >> 40) * 5.9604645e-8f;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,9 +58,10 @@ void test_seed_upgrade() {
         {INT64_MIN, -6382634648412944878LL, 5448932524140013571LL},
     };
     for (const auto& c : cases) {
-        auto x = rokkdoxx::Xoroshiro128PP::from_seed(static_cast<std::uint64_t>(c.seed));
-        expect_i64(static_cast<std::int64_t>(x.lo), c.lo, "upgrade lo seed " + std::to_string(c.seed));
-        expect_i64(static_cast<std::int64_t>(x.hi), c.hi, "upgrade hi seed " + std::to_string(c.seed));
+        rk_u64 lo, hi;
+        rk_xoro_seed(static_cast<std::uint64_t>(c.seed), &lo, &hi);
+        expect_i64(static_cast<std::int64_t>(lo), c.lo, "upgrade lo seed " + std::to_string(c.seed));
+        expect_i64(static_cast<std::int64_t>(hi), c.hi, "upgrade hi seed " + std::to_string(c.seed));
     }
 }
 
@@ -79,10 +78,11 @@ void test_next_long() {
         {-1, -8676505878415342125LL, -868585888688873692LL, -6331679347063163302LL},
     };
     for (const auto& c : cases) {
-        auto x = rokkdoxx::Xoroshiro128PP::from_seed(static_cast<std::uint64_t>(c.seed));
-        expect_i64(static_cast<std::int64_t>(x.next()), c.n1, "nextLong1 seed " + std::to_string(c.seed));
-        expect_i64(static_cast<std::int64_t>(x.next()), c.n2, "nextLong2 seed " + std::to_string(c.seed));
-        expect_i64(static_cast<std::int64_t>(x.next()), c.n3, "nextLong3 seed " + std::to_string(c.seed));
+        rk_u64 lo, hi;
+        rk_xoro_seed(static_cast<std::uint64_t>(c.seed), &lo, &hi);
+        expect_i64(static_cast<std::int64_t>(rk_xoro_next(&lo, &hi)), c.n1, "nextLong1 seed " + std::to_string(c.seed));
+        expect_i64(static_cast<std::int64_t>(rk_xoro_next(&lo, &hi)), c.n2, "nextLong2 seed " + std::to_string(c.seed));
+        expect_i64(static_cast<std::int64_t>(rk_xoro_next(&lo, &hi)), c.n3, "nextLong3 seed " + std::to_string(c.seed));
     }
 }
 
@@ -100,10 +100,11 @@ void test_next_float() {
         {-1, 0.529645622f, 0.952913821f, 0.656758964f},
     };
     for (const auto& c : cases) {
-        auto x = rokkdoxx::Xoroshiro128PP::from_seed(static_cast<std::uint64_t>(c.seed));
-        check(std::fabs(x.next_float() - c.f1) < 1e-6f, "nextFloat1 seed " + std::to_string(c.seed));
-        check(std::fabs(x.next_float() - c.f2) < 1e-6f, "nextFloat2 seed " + std::to_string(c.seed));
-        check(std::fabs(x.next_float() - c.f3) < 1e-6f, "nextFloat3 seed " + std::to_string(c.seed));
+        rk_u64 lo, hi;
+        rk_xoro_seed(static_cast<std::uint64_t>(c.seed), &lo, &hi);
+        check(std::fabs(next_float(&lo, &hi) - c.f1) < 1e-6f, "nextFloat1 seed " + std::to_string(c.seed));
+        check(std::fabs(next_float(&lo, &hi) - c.f2) < 1e-6f, "nextFloat2 seed " + std::to_string(c.seed));
+        check(std::fabs(next_float(&lo, &hi) - c.f3) < 1e-6f, "nextFloat3 seed " + std::to_string(c.seed));
     }
 }
 
@@ -124,7 +125,7 @@ void test_block_pos_seed() {
         {2147483647, -60, -2147483648, 5223223232237LL},
     };
     for (const auto& c : cases) {
-        expect_i64(rokkdoxx::block_pos_seed(c.x, c.y, c.z), c.want,
+        expect_i64(static_cast<std::int64_t>(rk_block_pos_seed(c.x, c.y, c.z)), c.want,
                    "getSeed(" + std::to_string(c.x) + "," + std::to_string(c.y) + "," +
                        std::to_string(c.z) + ")");
     }
@@ -196,6 +197,48 @@ void test_counts_reference() {
     }
 }
 
+// Bedrock Edition, read back from Bedrock Dedicated Server 1.26.52.3: each
+// digit is a column's top bedrock layer + 63, rows z = z0.., columns x = x0..
+// The worlds had different seeds (comments); the floor does not use them. The
+// last three sit past 2^24, where odd rows and columns repeat a neighbour.
+void test_bedrock_edition() {
+    std::printf("test_bedrock_edition\n");
+    struct C {
+        int x0, z0;
+        const char* tops[4];
+    };
+    const C cases[] = {
+        {0, 0, {"0032322011212010", "3003033030203031", "1230201003320302", "0111010231220321"}},  // 12345
+        {-64, -61, {"1203131301113301", "3111333020301131", "0202230332232232", "1133100201120312"}},  // 999
+        {1234560, -7654320, {"3113002133130113", "2232031323030122", "3012102012330001", "0032303131221231"}},  // 777
+        {5000013, 123460, {"3100003003013012", "1030212202302332", "2203212003112311", "3011120033120222"}},  // 8819392414030687460
+        {16777208, -16777220, {"3021220111311102", "3021220111311102", "2103113200133333", "2321000022033312"}},  // 5
+        {-29999104, 29998912, {"1111112111322202", "1111112111322202", "1101110111033300", "3303330222300031"}},  // -4242
+    };
+    const rokkdoxx::BedrockGenerator a(0, rokkdoxx::Edition::bedrock), b(-77, rokkdoxx::Edition::bedrock);
+    for (const C& c : cases)
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 16; ++i)
+                for (int y = -64; y <= -59; ++y) {
+                    const bool want = y <= -63 + (c.tops[j][i] - '0');
+                    const int x = c.x0 + i, z = c.z0 + j;
+                    check(a.is_bedrock_floor(x, y, z) == want && b.is_bedrock_floor(x, y, z) == want,
+                          "bedrock edition " + std::to_string(x) + " " + std::to_string(y) + " " + std::to_string(z));
+                }
+
+    // rk_be_chunk_rows walks MT19937 with cursors; std::mt19937 is the textbook one.
+    std::mt19937 pick(1);
+    for (int t = 0; t < 50; ++t) {
+        const int cx = static_cast<int>(pick()) >> 6, cz = static_cast<int>(pick()) >> 6;
+        std::mt19937 mt(static_cast<std::uint32_t>(cx) * 341872712u + static_cast<std::uint32_t>(cz) * 132899541u);
+        std::uint32_t rows[16];
+        rk_be_chunk_rows(cx, cz, 2, rows);  // y = -61: bedrock iff draw % 4 >= 2
+        bool ok = true;
+        for (int k = 0; k < 256; ++k) ok = ok && ((rows[k & 15] >> (k >> 4)) & 1u) == (mt() % 4 >= 2);
+        check(ok, "chunk " + std::to_string(cx) + "," + std::to_string(cz) + " vs std::mt19937");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -207,11 +250,6 @@ int main() {
     test_gradient_shape();
     test_grid_fingerprints();
     test_counts_reference();
-
-    if (g_failures == 0) {
-        std::printf("\nALL PASS\n");
-        return 0;
-    }
-    std::printf("\n%d FAILURE(S)\n", g_failures);
-    return 1;
+    test_bedrock_edition();
+    return report();
 }

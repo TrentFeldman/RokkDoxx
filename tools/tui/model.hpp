@@ -18,10 +18,11 @@ namespace rokkdoxx::tui {
 
 namespace svc = rokkdoxx::svc;
 
-constexpr int kMaxDim = 32;
+using svc::kMaxDim;
 
 struct Model {
-    std::string seed = "0";
+    svc::Edition edition = svc::Edition::java;
+    std::string seed = "0";  // Java only
     int w = 8, h = 8;
     int y = -60;
     std::string cx = "0", cz = "0", radius = "5000";
@@ -53,7 +54,7 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err);
 bool fill_from_world(Model& m, std::string& err);
 
 // Chance a block at this Y of the bedrock floor is bedrock.
-double bedrock_probability(int y);
+double bedrock_probability(svc::Edition edition, int y);
 
 // Candidate origins the search area covers (radius -1 = the whole world); -1
 // if the radius isn't valid.

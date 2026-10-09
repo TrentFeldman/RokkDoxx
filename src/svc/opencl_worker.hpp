@@ -29,7 +29,6 @@ public:
     explicit OpenclWorker(int device_index);
     ~OpenclWorker() override;
 
-    std::string name() const override;
     void configure(const WorkerConfig& cfg) override;
     std::vector<Match> run_tile(const Tile& tile) override;
     bool truncated() const override;

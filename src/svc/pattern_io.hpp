@@ -1,6 +1,7 @@
 // The on-disk pattern format shared by rokktui and rokksearch:
 //
 //   # rokkdoxx pattern
+//   edition bedrock            (optional: Bedrock Edition's floor; the default is Java)
 //   seed <string>
 //   y <int>
 //   center <x> <z>
@@ -19,6 +20,7 @@
 namespace rokkdoxx::svc {
 
 struct PatternFile {
+    Edition edition = Edition::java;
     std::string seed = "0";
     int y = -60;
     std::string center_x = "0";

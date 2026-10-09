@@ -14,11 +14,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "gen/bedrock.hpp"
+#include "gen/bedrock_core.h"  // rk_mix_stafford13 (benchmark digest), rk_be_coord (demo)
 #include "svc/client.hpp"
 #include "svc/pattern_io.hpp"
 #include "svc/search_service.hpp"  // TileScheduler, for the benchmark
@@ -32,11 +34,14 @@ namespace {
 [[noreturn]] void usage(int code) {
     std::fprintf(code ? stderr : stdout,
                  "usage: rokksearch [options]\n"
+                 "  --edition <e>         java (default) or bedrock; Bedrock Edition's floor is the\n"
+                 "                        same in every world, so it needs no --seed\n"
                  "  --seed <s>            world seed (numeric or text)\n"
                  "  --y <n>               bedrock plane, -64..-59 (default -60)\n"
                  "  --size <WxH>          pattern size when not loading a file\n"
-                 "  --pattern <file>      load a .txt pattern (sets seed/y/center/radius too); a session\n"
-                 "                        saved by rokktui (`s`) also resumes from its progress file\n"
+                 "  --pattern <file>      load a .txt pattern (sets edition/seed/y/center/radius too);\n"
+                 "                        a session saved by rokktui (`s`) also resumes from its\n"
+                 "                        progress file\n"
                  "  --center <x,z>        search-region center\n"
                  "  --radius <r>          search-region half-extent (blocks); -1 = whole world\n"
                  "  --region <x0,x1,z0,z1> explicit search region (overrides center/radius)\n"
@@ -51,7 +56,8 @@ namespace {
                  "  --json               machine-readable output\n"
                  "  --bench              measure the search you asked for (rate only)\n"
                  "  --benchmark          run the standard reproducible benchmark\n"
-                 "                       (fixed workload; ignores --seed/--pattern/--region)\n"
+                 "                       (fixed workload; ignores --seed/--pattern/--region;\n"
+                 "                       --edition bedrock benchmarks Bedrock Edition's floor)\n"
                  "  --benchmark-seconds <f>  target seconds per phase (default 2.0)\n"
                  "  --benchmark-iters <n>    measured iterations per phase (default 5)\n"
                  "  --benchmark-long <min>   sustained all-8 load for <min> minutes (15 = the\n"
@@ -60,7 +66,7 @@ namespace {
                  "  --demo <time>         write a pattern file to try without Minecraft: a random\n"
                  "                        seed and spot, sized so searching for it takes about <time>\n"
                  "                        on this machine: 90 or 90s, 5m, 2h; 'max' = the whole world\n"
-                 "                        (uses --seed/--y/--orientations/--backend if given)\n"
+                 "                        (uses --edition/--seed/--y/--orientations/--backend if given)\n"
                  "  --out <file>          where --demo writes (default demo_pattern.txt)\n"
                  "  --list-backends\n");
     std::exit(code);
@@ -110,18 +116,8 @@ constexpr long long kMaxCandidates = 500'000'000'000LL;  // clamp per phase
 // orientations -- the all-8 worst case.
 constexpr int kPatW = 6, kPatH = 6, kFillX = 137, kFillZ = -251;
 
-inline Pattern standard_pattern() {
-    rokkdoxx::BedrockGenerator gen(kSeed);
-    Pattern p;
-    p.w = kPatW;
-    p.h = kPatH;
-    p.cells.assign(static_cast<std::size_t>(kPatW) * kPatH, Cell::unknown);
-    for (int j = 0; j < kPatH; ++j)
-        for (int i = 0; i < kPatW; ++i)
-            p.cells[static_cast<std::size_t>(j) * kPatW + i] =
-                gen.is_bedrock_floor(kFillX + i, kPlaneY, kFillZ + j) ? Cell::bedrock
-                                                                      : Cell::not_bedrock;
-    return p;
+inline Pattern standard_pattern(Edition edition) {
+    return world_patch(kSeed, kPlaneY, kFillX, kFillZ, kPatW, kPatH, edition);
 }
 
 // A deliberately D4-symmetric pattern: a bedrock "plus" centred in a 5x5 grid.
@@ -201,6 +197,15 @@ inline long calibrate_from(long r, double elapsed, double target_s,
     return radius_for(rate * target_s, cap);
 }
 
+// Warm up, then size the workload: a radius-3000 probe, then one sweep per target,
+// each extrapolating the radius that takes that many seconds.
+inline long calibrate(Worker& w, int tile_side, std::initializer_list<double> targets,
+                      double cap = static_cast<double>(kMaxCandidates)) {
+    long r = 3000;
+    for (double t : targets) r = calibrate_from(r, sweep(w, Region::centered(0, 0, r), tile_side), t, cap);
+    return r;
+}
+
 struct PhaseResult {
     const char* name;
     int orientations;
@@ -219,16 +224,7 @@ inline PhaseResult run_phase(Worker& w, const char* name, const std::vector<Know
     cfg.all_orientations = all_orient;
     w.configure(cfg);
 
-    // Warm up (clocks, caches, driver), then calibrate: probe -> extrapolate to
-    // ~target_s -> one refine sweep at that size -> extrapolate again. Two
-    // rounds because the per-candidate rate drifts a little with region size.
-    double e = sweep(w, Region::centered(0, 0, 3000), tile_side);          // discarded
-    long r = calibrate_from(3000, e, 0.4);
-    e = sweep(w, Region::centered(0, 0, r), tile_side);                    // discarded (warm)
-    r = calibrate_from(r, e, target_s);
-    e = sweep(w, Region::centered(0, 0, r), tile_side);                    // discarded
-    r = calibrate_from(r, e, target_s);
-
+    const long r = calibrate(w, tile_side, {0.4, target_s, target_s});
     const long long cand = candidates_of(r);
     const Region region = Region::centered(0, 0, r);
 
@@ -291,6 +287,11 @@ inline std::string host_compiler() {
     return buf;
 }
 
+// "seed 0" / "Bedrock Edition": whose floor the benchmark searches.
+inline std::string workload_world(Edition edition) {
+    return edition == Edition::bedrock ? "Bedrock Edition" : "seed " + std::to_string(kSeed);
+}
+
 inline void print_header(const char* title, const BackendInfo& chosen) {
     std::printf("rokksearch %s v%d\n", title, kBenchVersion);
     std::printf("backend   : %s\n", chosen.label.c_str());
@@ -313,16 +314,13 @@ constexpr double kLongSweepS = 30.0;
 inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, bool json,
                     const BackendInfo& chosen) {
     using clock = std::chrono::steady_clock;
-    cfg.knowns = standard_pattern().knowns();
+    cfg.knowns = standard_pattern(cfg.edition).knowns();
     cfg.all_orientations = true;
     w.configure(cfg);
 
     // Calibrate the sweep size (capped at the whole world).
     const double world = 4.0 * static_cast<double>(Region::kWorldBorder) * Region::kWorldBorder;
-    double e = sweep(w, Region::centered(0, 0, 3000), tile_side);
-    long r = calibrate_from(3000, e, 2.0, world);
-    e = sweep(w, Region::centered(0, 0, r), tile_side);
-    r = calibrate_from(r, e, kLongSweepS, world);
+    const long r = calibrate(w, tile_side, {2.0, kLongSweepS}, world);
     const Region region = Region::centered(0, 0, r);
     const long long cand = candidates_of(r);
 
@@ -330,8 +328,8 @@ inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, 
     FILE* out = json ? stderr : stdout;
     if (!json) {
         print_header("long benchmark", chosen);
-        std::printf("workload  : all-8, %dx%d pattern, seed %lld at y %d, r=%ld (%.2e cand/sweep)\n",
-                    kPatW, kPatH, static_cast<long long>(kSeed), kPlaneY, r, static_cast<double>(cand));
+        std::printf("workload  : all-8, %dx%d pattern, %s at y %d, r=%ld (%.2e cand/sweep)\n", kPatW, kPatH,
+                    workload_world(cfg.edition).c_str(), kPlaneY, r, static_cast<double>(cand));
         std::printf("duration  : %s\n\n", format_duration(minutes * 60).c_str());
     }
 
@@ -397,33 +395,17 @@ inline int open_worker(const std::string& backend_arg, BackendInfo& chosen,
     return 0;
 }
 
-// The benchmark's fixed seed and plane; callers add the pattern and orientations.
-inline WorkerConfig standard_config() {
-    rokkdoxx::BedrockGenerator gen(kSeed);
-    WorkerConfig cfg;
-    cfg.derived_lo = gen.derived_lo();
-    cfg.derived_hi = gen.derived_hi();
-    cfg.plane_y = kPlaneY;
-    cfg.threshold = gen.threshold(kPlaneY);
-    cfg.match_cap = 1u << 20;
-    return cfg;
-}
-
 // Candidates/second for the search `cfg` describes, in about 1.5 s: a warm-up,
 // then two calibration rounds (the rate drifts a little with region size).
 inline double measure_rate(Worker& w, const WorkerConfig& cfg) {
     w.configure(cfg);
     const int tile_side = std::max(4096, w.preferred_tile_side());
-    double e = sweep(w, Region::centered(0, 0, 3000), tile_side);
-    long r = calibrate_from(3000, e, 0.4);
-    e = sweep(w, Region::centered(0, 0, r), tile_side);
-    r = calibrate_from(r, e, 1.0);
-    e = sweep(w, Region::centered(0, 0, r), tile_side);
-    return static_cast<double>(candidates_of(r)) / e;
+    const long r = calibrate(w, tile_side, {0.4, 1.0});
+    return static_cast<double>(candidates_of(r)) / sweep(w, Region::centered(0, 0, r), tile_side);
 }
 
 inline int run(const std::string& backend_arg, bool json, double target_s, int iters,
-               double long_minutes) {
+               double long_minutes, Edition edition) {
     if (target_s <= 0.05) target_s = 0.05;
     if (iters < 1) iters = 1;
 
@@ -431,9 +413,9 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
     std::unique_ptr<Worker> worker;
     if (const int rc = open_worker(backend_arg, chosen, worker)) return rc;
 
-    const std::vector<KnownCell> asym = standard_pattern().knowns();
+    const std::vector<KnownCell> asym = standard_pattern(edition).knowns();
     const std::vector<KnownCell> sym = symmetric_pattern().knowns();
-    const WorkerConfig base = standard_config();
+    const WorkerConfig base = worker_config(kSeed, kPlaneY, edition);
 
     const int tile_side = std::max(4096, worker->preferred_tile_side());
     if (long_minutes > 0) return run_long(*worker, base, tile_side, long_minutes, json, chosen);
@@ -456,7 +438,8 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
                     chosen.version.c_str(), chosen.driver.c_str(), chosen.units);
         std::printf("\"host\":{\"os\":\"%s\",\"arch\":\"%s\",\"threads\":%u,\"compiler\":\"%s\"},",
                     host_os(), host_arch(), threads, host_compiler().c_str());
-        std::printf("\"pattern\":{\"w\":%d,\"h\":%d,\"seed\":%lld,\"y\":%d},", kPatW, kPatH,
+        std::printf("\"pattern\":{\"edition\":\"%s\",\"w\":%d,\"h\":%d,\"seed\":%lld,\"y\":%d},",
+                    edition == Edition::bedrock ? "bedrock" : "java", kPatW, kPatH,
                     static_cast<long long>(kSeed), kPlaneY);
         std::printf("\"phases\":[");
         for (int i = 0; i < kNumPhases; ++i) {
@@ -472,8 +455,8 @@ inline int run(const std::string& backend_arg, bool json, double target_s, int i
     }
 
     print_header("benchmark", chosen);
-    std::printf("pattern   : %dx%d asymmetric + 5x5 symmetric plus, seed %lld at y %d\n\n", kPatW,
-                kPatH, static_cast<long long>(kSeed), kPlaneY);
+    std::printf("pattern   : %dx%d asymmetric + 5x5 symmetric plus, %s at y %d\n\n", kPatW, kPatH,
+                workload_world(edition).c_str(), kPlaneY);
     for (const PhaseResult& p : phases) {
         std::printf("%-9s : %7.2f Gcand/s  (median of %d; min %.2f, max %.2f)   "
                     "r=%ld, %.2e cand, %.2f s\n",
@@ -498,10 +481,12 @@ namespace demo {
 constexpr double kMaxExtraMatches = 0.1;  // expected spurious matches we tolerate
 constexpr int kMargin = 40;               // the planted spot stays this far inside the region
 
-inline int run(const std::string& backend, const char* seed_s, int y, bool all_orient,
+inline int run(const std::string& backend, Edition edition, const char* seed_s, int y, bool all_orient,
                double seconds, bool max, const std::string& out_path) {
-    if (y < -63 || y > -60) {
-        std::fprintf(stderr, "--demo needs --y in -63..-60 (the other layers are all bedrock or all air)\n");
+    const bool be = edition == Edition::bedrock;
+    if (y < (be ? -62 : -63) || y > -60) {
+        std::fprintf(stderr, "--demo needs --y in %s..-60 (the other layers are all bedrock or all air)\n",
+                     be ? "-62" : "-63");
         return 2;
     }
     std::mt19937_64 rng(std::random_device{}() ^
@@ -511,22 +496,20 @@ inline int run(const std::string& backend, const char* seed_s, int y, bool all_o
         return lo + static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(hi - lo + 1));
     };
 
-    rokkdoxx::BedrockGenerator gen(seed);
+    rokkdoxx::BedrockGenerator gen(seed, edition);
     const double pb = static_cast<double>(gen.threshold(y)) / 16777216.0;  // P(bedrock)
 
     // `s` x `s` of the world at (fx, fz), as a fully known pattern; `p` = the
-    // chance a random spot matches it (one orientation).
+    // chance a random spot matches it (one orientation). Past 2^24 Bedrock
+    // Edition repeats columns (rk_be_coord), so each one counts once.
     auto copy_world = [&](int fx, int fz, int s, double& p) {
-        Pattern pat;
-        pat.w = pat.h = s;
-        pat.cells.assign(static_cast<std::size_t>(s) * s, Cell::not_bedrock);
+        Pattern pat = world_patch(seed, y, fx, fz, s, s, edition);
+        std::set<std::pair<int, int>> seen;
         p = 1.0;
         for (int j = 0; j < s; ++j)
-            for (int i = 0; i < s; ++i) {
-                const bool bed = gen.is_bedrock_floor(fx + i, y, fz + j);
-                if (bed) pat.cells[static_cast<std::size_t>(j) * s + i] = Cell::bedrock;
-                p *= bed ? pb : 1.0 - pb;
-            }
+            for (int i = 0; i < s; ++i)
+                if (!be || seen.insert({rk_be_coord(fx + i), rk_be_coord(fz + j)}).second)
+                    p *= pat.at(i, j) == Cell::bedrock ? pb : 1.0 - pb;
         return pat;
     };
 
@@ -536,14 +519,9 @@ inline int run(const std::string& backend, const char* seed_s, int y, bool all_o
     std::unique_ptr<Worker> worker;
     if (const int rc = bmark::open_worker(backend, chosen, worker)) return rc;
     std::fprintf(stderr, "measuring speed on %s ...\n", chosen.label.c_str());
-    WorkerConfig cfg;
-    cfg.derived_lo = gen.derived_lo();
-    cfg.derived_hi = gen.derived_hi();
-    cfg.plane_y = y;
-    cfg.threshold = gen.threshold(y);
+    WorkerConfig cfg = worker_config(seed, y, edition);
     cfg.all_orientations = all_orient;
-    double unused;
-    cfg.knowns = copy_world(137, -251, 8, unused).knowns();
+    cfg.knowns = world_patch(seed, y, 137, -251, 8, 8, edition).knowns();
     const double rate = bmark::measure_rate(*worker, cfg);  // candidates / second
 
     // A random square of the world with ~seconds * rate candidates (10% spare).
@@ -572,6 +550,7 @@ inline int run(const std::string& backend, const char* seed_s, int y, bool all_o
         pf.pattern = copy_world(fx, fz, s, p);
         extra = area * (all_orient ? 8 : 1) * p;
     }
+    pf.edition = edition;
     pf.seed = std::to_string(seed);
     pf.y = y;
     pf.center_x = std::to_string(cx);
@@ -587,7 +566,8 @@ inline int run(const std::string& backend, const char* seed_s, int y, bool all_o
     // Matches are reported at the pattern's anchor cell, not its corner.
     const SearchPlan plan = build_search_plan(pf.pattern.knowns(), gen.threshold(y), all_orient);
     std::printf("wrote       : %s\n", out_path.c_str());
-    std::printf("seed        : %lld   (y %d)\n", static_cast<long long>(seed), y);
+    if (be) std::printf("edition     : Bedrock (no seed)   (y %d)\n", y);
+    else std::printf("seed        : %lld   (y %d)\n", static_cast<long long>(seed), y);
     std::printf("speed       : %.1f Gcand/s on %s (%s)\n", rate / 1e9, chosen.label.c_str(),
                 all_orient ? "all 8 orientations" : "exact");
     std::printf("search      : %s, %.2e candidates, about %s\n",
@@ -611,6 +591,7 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);  // don't die if the reader of stdout goes away
 #endif
     std::string pattern_path, checkpoint, backend;
+    const char* edition_s = nullptr;
     const char *seed_s = nullptr, *size_s = nullptr, *center_s = nullptr, *radius_s = nullptr,
                *region_s = nullptr, *orient_s = nullptr;
     int y = -60;
@@ -631,6 +612,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help") usage(0);
+        else if (a == "--edition") edition_s = val("edition");
         else if (a == "--seed") seed_s = val("seed");
         else if (a == "--y") { y = std::atoi(val("y")); have_y = true; }
         else if (a == "--size") size_s = val("size");
@@ -663,6 +645,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (edition_s && std::strcmp(edition_s, "java") != 0 && std::strcmp(edition_s, "bedrock") != 0) {
+        std::fprintf(stderr, "--edition wants java or bedrock (got '%s')\n", edition_s);
+        return 2;
+    }
+    const Edition edition = edition_s && std::strcmp(edition_s, "bedrock") == 0 ? Edition::bedrock : Edition::java;
+
     if (demo_arg) {
         double seconds;
         bool max;
@@ -670,14 +658,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "--demo wants a time like 90, 90s, 5m, 2h, or max (got '%s')\n", demo_arg);
             return 2;
         }
-        return demo::run(backend, seed_s, y, !orient_s || std::strcmp(orient_s, "exact") != 0, seconds,
-                         max, out_path);
+        return demo::run(backend, edition, seed_s, y, !orient_s || std::strcmp(orient_s, "exact") != 0,
+                         seconds, max, out_path);
     }
 
     if (benchmark) {
         if (seed_s || !pattern_path.empty() || region_s || center_s)
             std::fprintf(stderr, "note: --benchmark uses a fixed workload; search args ignored\n");
-        return bmark::run(backend, json, benchmark_seconds, benchmark_iters, benchmark_long);
+        return bmark::run(backend, json, benchmark_seconds, benchmark_iters, benchmark_long, edition);
     }
 
     SearchRequest req;
@@ -689,6 +677,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         req.pattern = pf.pattern;
+        req.edition = pf.edition;
         req.seed = seed_from_string(pf.seed);
         if (!have_y) y = pf.y;
         if (!center_s && !region_s) {
@@ -702,6 +691,7 @@ int main(int argc, char** argv) {
         if (pf.stop_first) first = true;
     }
 
+    if (edition_s) req.edition = edition;
     if (seed_s) req.seed = seed_from_string(seed_s);
     req.plane_y = y;
     if (orient_s) req.all_orientations = std::strcmp(orient_s, "exact") != 0;

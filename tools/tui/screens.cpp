@@ -30,11 +30,12 @@ void status_line(const App& app, Frame& fr) {
 // ---------------------------------------------------------------------------
 
 enum Field {
-    F_SEED, F_W, F_H, F_Y, F_CX, F_CZ, F_RADIUS, F_ORIENT, F_STOP, F_BACKEND, F_CKPT, F_COUNT
+    F_EDITION, F_SEED, F_W, F_H, F_Y, F_CX, F_CZ, F_RADIUS, F_ORIENT, F_STOP, F_BACKEND, F_CKPT, F_COUNT
 };
 
 const char* field_name(int f) {
     switch (f) {
+        case F_EDITION: return "edition";
         case F_SEED: return "seed";
         case F_W: return "width";
         case F_H: return "height";
@@ -63,7 +64,9 @@ std::string backend_text(const App& app) {
 std::string field_value(const App& app, int f) {
     const Model& m = app.m;
     switch (f) {
-        case F_SEED: return m.seed;
+        case F_EDITION:
+            return m.edition == svc::Edition::bedrock ? "Bedrock  (the same floor in every world)" : "Java";
+        case F_SEED: return m.edition == svc::Edition::bedrock ? m.seed + "  (not used on Bedrock)" : m.seed;
         case F_W: return std::to_string(m.w);
         case F_H: return std::to_string(m.h);
         case F_Y: return std::to_string(m.y);
@@ -97,10 +100,11 @@ void draw_params(const App& app, Frame& fr) {
     fr.line();
     {
         const int y = app.m.y;
+        const double p = bedrock_probability(app.m.edition, y);
         char b[160];
-        std::snprintf(b, sizeof(b), "  Y=%d  ->  P(bedrock) = %.2f   %s", y, bedrock_probability(y),
-                      (y <= -64)   ? "(solid everywhere -- nothing to match)"
-                      : (y >= -59) ? "(air everywhere -- nothing to match)"
+        std::snprintf(b, sizeof(b), "  Y=%d  ->  P(bedrock) = %.2f   %s", y, p,
+                      (p >= 1)     ? "(solid everywhere -- nothing to match)"
+                      : (p <= 0)   ? "(air everywhere -- nothing to match)"
                       : (y == -60) ? "(recommended: most detail per cell)"
                                    : "");
         fr.line(dim(b));
@@ -207,6 +211,10 @@ bool handle_params(App& app, int k) {
     }
     const int step = (k == K_LEFT) ? -1 : (k == K_RIGHT) ? 1 : 0;
     switch (app.field) {
+        case F_EDITION:
+            if (step != 0 || k == ' ')
+                m.edition = m.edition == svc::Edition::java ? svc::Edition::bedrock : svc::Edition::java;
+            break;
         case F_SEED: edit_text(m.seed, k, false, false); break;
         case F_W: m.w = std::clamp(m.w + step, 1, kMaxDim); break;
         case F_H: m.h = std::clamp(m.h + step, 1, kMaxDim); break;
@@ -267,8 +275,9 @@ void draw_grid(App& app, Frame& fr) {
         }
 
     char hdr[256];
-    std::snprintf(hdr, sizeof(hdr), "Pattern  %dx%d  Y=%d  %s   seed %s   center (%lld,%lld) r=%lld",
-                  m.w, m.h, m.y, m.all_orient ? "all-orient" : "exact", m.seed.c_str(), cx, cz, r);
+    const std::string world = m.edition == svc::Edition::bedrock ? "Bedrock" : "seed " + m.seed;
+    std::snprintf(hdr, sizeof(hdr), "Pattern  %dx%d  Y=%d  %s   %s   center (%lld,%lld) r=%lld",
+                  m.w, m.h, m.y, m.all_orient ? "all-orient" : "exact", world.c_str(), cx, cz, r);
     fr.line(hi(hdr));
     fr.line();
 

@@ -21,7 +21,11 @@
 #include <string_view>
 #include <vector>
 
+#include "gen/bedrock.hpp"
+
 namespace rokkdoxx::svc {
+
+using rokkdoxx::Edition;
 
 // --- pattern -----------------------------------------------------------------
 
@@ -54,6 +58,12 @@ struct Pattern {
         return out;
     }
 };
+
+inline constexpr int kMaxDim = 32;  // largest pattern side; the search refuses bigger
+
+// A fully known w x h pattern copied from the world at (x0, z0). (workers.cpp)
+Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h,
+                    Edition edition = Edition::java);
 
 // D4, the eight ways to lay a 2D shape onto a grid: 4 rotations, each with or
 // without a mirror. A screenshot is rarely aligned to world north, so the
@@ -101,7 +111,8 @@ struct Region {
 // --- request / result -----------------------------------------------------
 
 struct SearchRequest {
-    std::int64_t seed = 0;
+    Edition edition = Edition::java;
+    std::int64_t seed = 0;  // Java only: Bedrock Edition's floor is the same in every world
     int plane_y = -60;  // which bedrock layer the pattern is on, -64..-59
     Pattern pattern;
     Region region{};
@@ -211,7 +222,8 @@ struct Tile {
 // Everything a worker needs that stays constant for the whole job. The service
 // derives these from the SearchRequest once, up front (see search_service.cpp).
 struct WorkerConfig {
-    std::uint64_t derived_lo = 0;  // per-seed generator state, low 64 bits
+    Edition edition = Edition::java;
+    std::uint64_t derived_lo = 0;  // per-seed generator state, low 64 bits (Java)
     std::uint64_t derived_hi = 0;  // ... high 64 bits
     int plane_y = -60;
     std::uint32_t threshold = 0;   // bedrock iff bits24_at(...) < threshold
@@ -219,6 +231,9 @@ struct WorkerConfig {
     bool all_orientations = true;
     std::uint32_t match_cap = 1u << 20;
 };
+
+// A WorkerConfig with the per-seed part filled in; callers add the pattern. (workers.cpp)
+WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition = Edition::java);
 
 // --- search plan (shared prep for both workers) ---------------------------
 //
@@ -246,7 +261,7 @@ struct SearchPlan {
     std::vector<std::uint8_t> variant_mask; // [n_variants]  OR of (1u << g)
 };
 
-// `all_orientations == false` -> a single variant (identity only).
+// `all_orientations == false` -> a single variant (identity only). `knowns` must not be empty.
 SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
                              bool all_orientations);
 
@@ -255,7 +270,6 @@ SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t thresh
 class Worker {
 public:
     virtual ~Worker() = default;
-    virtual std::string name() const = 0;
     virtual void configure(const WorkerConfig& cfg) = 0;
 
     // Matches whose origin lies inside `tile`. May stop early once match_cap is

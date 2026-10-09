@@ -5,8 +5,7 @@
 // Responsibilities:
 //   - TileScheduler: cut the search region into tiles, hand them out, and
 //     remember which are finished (so a job can resume from a checkpoint file).
-//   - ResultSink: gather per-tile matches, deduplicate by (x, z), OR together
-//     the orientation masks.
+//   - ResultSink: gather per-tile matches up to the match cap.
 //   - SearchService: the job registry + the per-job loop that pumps tiles
 //     through a Worker, updates JobStatus, and honours cancellation.
 // Not this file's job: the compute (workers.*, opencl_worker.*) or the
@@ -43,8 +42,6 @@ public:
     TileScheduler(Region region, int tile_side, int map_w = 1, int map_h = 1);
 
     int tile_count() const { return n_; }
-    int effective_tile_side() const { return tile_side_; }
-    long long total_candidates() const { return region_.candidates(); }
 
     // Fill `out` with the next unfinished tile (and mark it in flight); false
     // when none remain.
@@ -67,15 +64,13 @@ public:
     // was written for a different request (see request_fingerprint).
     // `out_matches`/`matches` carry the matches found before the checkpoint
     // was written, so a resumed run doesn't lose or need to re-find them for
-    // tiles it's about to skip as already-done. The path versions are the
-    // stream versions over a file; a failed read changes nothing.
+    // tiles it's about to skip as already-done. load_checkpoint is
+    // read_checkpoint over a file; a failed read changes nothing.
     bool read_checkpoint(std::istream& in, std::uint64_t fingerprint, std::vector<Match>& out_matches);
     void write_checkpoint(std::ostream& out, std::uint64_t fingerprint,
                           const std::vector<Match>& matches) const;
     bool load_checkpoint(const std::string& path, std::uint64_t fingerprint,
                          std::vector<Match>& out_matches);
-    void save_checkpoint(const std::string& path, std::uint64_t fingerprint,
-                         const std::vector<Match>& matches) const;
 
 private:
     Tile tile_at(int index) const;
@@ -101,25 +96,21 @@ std::uint64_t request_fingerprint(const SearchRequest& req);
 
 // --- ResultSink ----------------------------------------------------------
 
+// No dedup: every origin is in exactly one tile, and the worker ORs its orientations.
 class ResultSink {
 public:
     explicit ResultSink(std::uint32_t cap) : cap_(cap) {}
 
     void add(const std::vector<Match>& tile_matches);
 
-    std::uint64_t count() const { return by_pos_.size(); }
+    std::uint64_t count() const { return matches_.size(); }
     bool truncated() const { return truncated_; }
 
-    // Deduplicated, sorted by (z, then x).
+    // Sorted by (z, then x).
     std::vector<Match> snapshot() const;
 
 private:
-    // One 64-bit key per origin: x in the high half, z in the low half.
-    static std::uint64_t key(int x, int z) {
-        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
-               static_cast<std::uint32_t>(z);
-    }
-    std::unordered_map<std::uint64_t, std::uint8_t> by_pos_;  // key -> OR of orient masks
+    std::vector<Match> matches_;
     std::uint32_t cap_;
     bool truncated_ = false;
 };
@@ -147,9 +138,6 @@ public:
     // or if the request did not set keep_checkpoint). Refreshed every few seconds
     // while running, exactly when paused, and when the job ends.
     std::string checkpoint(JobId id) const;
-
-    // Label of a freshly created worker (for UIs). Cheap.
-    std::string backend_name() const;
 
 private:
     struct Job;

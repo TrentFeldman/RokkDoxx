@@ -21,7 +21,6 @@ class CpuWorker : public Worker {
 public:
     explicit CpuWorker(unsigned threads = 0);  // 0 -> hardware_concurrency
 
-    std::string name() const override;
     void configure(const WorkerConfig& cfg) override;
     std::vector<Match> run_tile(const Tile& tile) override;
     bool truncated() const override { return truncated_.load(); }

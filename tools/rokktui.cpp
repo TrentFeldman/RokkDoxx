@@ -1,6 +1,7 @@
 // rokktui -- interactive front-end for RokkDoxx.
 //
-//   * enter a world seed (numeric, or a text seed hashed the way Minecraft does)
+//   * pick Java or Bedrock Edition; for Java, enter the world seed (numeric, or a
+//     text seed hashed the way Minecraft does)
 //   * choose the pattern size (width x height), the Y layer, and orientations
 //   * pick the compute backend and, optionally, a checkpoint file to resume from
 //   * paint the bedrock pattern on a grid (bedrock / not-bedrock / unknown)

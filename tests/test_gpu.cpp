@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "check.hpp"
 #include "gen/bedrock.hpp"
 #include "svc/opencl_worker.hpp"
 #include "svc/search_service.hpp"
@@ -20,14 +21,6 @@
 using namespace rokkdoxx::svc;
 
 namespace {
-
-int g_fail = 0;
-void check(bool ok, const std::string& what) {
-    if (!ok) {
-        std::printf("  FAIL: %s\n", what.c_str());
-        ++g_fail;
-    }
-}
 
 struct Case {
     std::int64_t seed;
@@ -99,13 +92,7 @@ void test_search_parity() {
             SearchRequest req;
             req.seed = p.seed;
             req.plane_y = p.y;
-            req.pattern.w = p.w;
-            req.pattern.h = p.h;
-            req.pattern.cells.assign(static_cast<std::size_t>(p.w) * p.h, Cell::unknown);
-            for (int j = 0; j < p.h; ++j)
-                for (int i = 0; i < p.w; ++i)
-                    req.pattern.cells[static_cast<std::size_t>(j) * p.w + i] =
-                        gen.is_bedrock_floor(p.cx + i, p.y, p.cz + j) ? Cell::bedrock : Cell::not_bedrock;
+            req.pattern = world_patch(p.seed, p.y, p.cx, p.cz, p.w, p.h);
             req.region = Region::centered(p.cx + 1, p.cz + 1, p.radius);
             req.all_orientations = all;
             const std::string tag = "seed " + std::to_string(p.seed) + (all ? " all-8" : " exact");
@@ -138,7 +125,6 @@ void test_random_patterns() {
         const std::int64_t seed = static_cast<std::int64_t>(rng());
         const int y = -63 + static_cast<int>(rng() % 4), cx = static_cast<int>(rng() % 20001) - 10000,
                   cz = static_cast<int>(rng() % 20001) - 10000;
-        rokkdoxx::BedrockGenerator gen(seed);
         std::vector<int> cells(w * h);
         std::iota(cells.begin(), cells.end(), 0);
         std::shuffle(cells.begin(), cells.end(), rng);
@@ -146,14 +132,8 @@ void test_random_patterns() {
         SearchRequest req;
         req.seed = seed;
         req.plane_y = y;
-        req.pattern.w = w;
-        req.pattern.h = h;
-        req.pattern.cells.assign(static_cast<std::size_t>(w) * h, Cell::unknown);
-        for (int n = 0; n < k; ++n) {
-            const int i = cells[n] % w, j = cells[n] / w;
-            req.pattern.cells[cells[n]] =
-                gen.is_bedrock_floor(cx + i, y, cz + j) ? Cell::bedrock : Cell::not_bedrock;
-        }
+        req.pattern = world_patch(seed, y, cx, cz, w, h);
+        for (int n = k; n < w * h; ++n) req.pattern.cells[cells[n]] = Cell::unknown;  // keep k cells
         req.region = Region::centered(cx + 4, cz + 4, 250);
         req.all_orientations = t % 3 != 0;
         const std::string tag = "random #" + std::to_string(t) + " (" + std::to_string(k) + " cells, y " +
@@ -166,8 +146,8 @@ void test_random_patterns() {
 }
 
 // Three known cells spread `reach` blocks apart inside an otherwise-unknown
-// grid. reach 200 runs the bit-plane kernels with a big halo; reach 1025 is
-// past OpenclWorker's kPlaneHaloMax, so it exercises the search_tile fallback.
+// grid, so fill_plane has to draw a wide halo. Reach 15 (a 31x31 grid) is as
+// far as this shape goes inside the 32x32 pattern limit.
 void test_large_halo(int reach) {
     std::printf("test_large_halo(%d)\n", reach);
     const std::int64_t seed = 999;
@@ -201,6 +181,39 @@ void test_large_halo(int reach) {
                           std::to_string(gpu.size()) + " gpu)");
 }
 
+// Bedrock Edition, CPU vs GPU: centres near 0, on both +/-2^24 edges, and in
+// the float-rounded far band past them (remap_plane_be); patterns of random
+// cells from an 8x8 or 31x31 grid, so the halo and the chunk-pair alignment vary.
+void test_bedrock_parity() {
+    std::printf("test_bedrock_parity\n");
+    const int centres[][2] = {{0, 0},     {-5000, 70000},        {16777216, -16777216},
+                              {-16777216, 16777200}, {-29999000, 29999000}, {25000000, 3}};
+    std::mt19937_64 rng(20261008);
+    int t = 0;
+    for (const auto& c : centres)
+        for (int y : {-62, -61, -60}) {
+            const int n = t % 2 ? 31 : 8, k = 6 + static_cast<int>(rng() % 7);
+            SearchRequest req;
+            req.edition = Edition::bedrock;
+            req.plane_y = y;
+            req.pattern = world_patch(0, y, c[0] - n / 2, c[1] - n / 2, n, n, Edition::bedrock);
+            std::vector<int> cells(static_cast<std::size_t>(n) * n);
+            std::iota(cells.begin(), cells.end(), 0);
+            std::shuffle(cells.begin(), cells.end(), rng);
+            for (std::size_t i = static_cast<std::size_t>(k); i < cells.size(); ++i)
+                req.pattern.cells[static_cast<std::size_t>(cells[i])] = Cell::unknown;
+            req.region = Region::centered(c[0], c[1], 300);
+            req.all_orientations = t++ % 3 != 0;
+            const std::string tag = "bedrock " + std::to_string(c[0]) + "," + std::to_string(c[1]) + " y " +
+                                    std::to_string(y) + " (" + std::to_string(k) + " of " + std::to_string(n) +
+                                    "x" + std::to_string(n) + ")";
+            auto cpu = run(make_worker_factory("cpu"), req);
+            auto gpu = run([] { return std::make_unique<OpenclWorker>(0); }, req);
+            check(!cpu.empty() && cpu == gpu, tag + " parity (" + std::to_string(cpu.size()) + " cpu vs " +
+                                                  std::to_string(gpu.size()) + " gpu)");
+        }
+}
+
 }  // namespace
 
 int main() {
@@ -219,13 +232,7 @@ int main() {
     }
     test_search_parity();
     test_random_patterns();
-    test_large_halo(200);
-    test_large_halo(1025);
-
-    if (g_fail == 0) {
-        std::printf("\nALL PASS\n");
-        return 0;
-    }
-    std::printf("\n%d FAILURE(S)\n", g_fail);
-    return 1;
+    test_large_halo(15);
+    test_bedrock_parity();
+    return report();
 }

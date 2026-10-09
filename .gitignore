@@ -37,5 +37,3 @@ out/
 /.claude/
 
 /docs-internal/
-
-*.sock

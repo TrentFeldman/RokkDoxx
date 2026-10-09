@@ -11,9 +11,9 @@ namespace {
 class InProcessClient : public SearchClient {
 public:
     explicit InProcessClient(const std::string& backend)
-        : svc_(make_worker_factory(backend)) {}
+        : label_(resolve_backend(backend).label), svc_(make_worker_factory(backend)) {}
 
-    std::string backend_name() override { return svc_.backend_name(); }
+    std::string backend_name() override { return label_; }
     JobId submit(const SearchRequest& r) override { return svc_.submit(r); }
     JobStatus poll(JobId id) override { return svc_.poll(id); }
     std::vector<Match> results(JobId id) override { return svc_.results(id); }
@@ -22,6 +22,7 @@ public:
     std::string checkpoint(JobId id) override { return svc_.checkpoint(id); }
 
 private:
+    std::string label_;
     SearchService svc_;
 };
 

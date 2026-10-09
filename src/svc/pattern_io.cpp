@@ -7,10 +7,6 @@
 
 namespace rokkdoxx::svc {
 
-namespace {
-constexpr int kMaxDim = 32;
-}
-
 bool load_pattern_file(const std::string& path, PatternFile& out, std::string& err) {
     std::ifstream f(path);
     if (!f) {
@@ -35,7 +31,11 @@ bool load_pattern_file(const std::string& path, PatternFile& out, std::string& e
         std::istringstream ls(line);
         std::string kw;
         ls >> kw;
-        if (kw == "seed") {
+        if (kw == "edition") {
+            std::string v;
+            ls >> v;
+            pf.edition = v == "bedrock" ? Edition::bedrock : Edition::java;
+        } else if (kw == "seed") {
             ls >> std::ws;
             std::getline(ls, pf.seed);
         } else if (kw == "y") {
@@ -94,6 +94,7 @@ bool save_pattern_file(const std::string& path, const PatternFile& pf, std::stri
         return false;
     }
     f << "# rokkdoxx pattern\n";
+    if (pf.edition == Edition::bedrock) f << "edition bedrock\n";
     f << "seed " << pf.seed << "\n";
     f << "y " << pf.y << "\n";
     f << "center " << pf.center_x << " " << pf.center_z << "\n";

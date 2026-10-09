@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "check.hpp"
 #include "gen/bedrock.hpp"
 #include "svc/pattern_io.hpp"
 #include "svc/search_service.hpp"
@@ -23,29 +24,29 @@ using namespace rokkdoxx::svc;
 
 namespace {
 
-int g_fail = 0;
-void check(bool ok, const std::string& what) {
-    if (!ok) {
-        std::printf("  FAIL: %s\n", what.c_str());
-        ++g_fail;
+SearchService make_service() { return SearchService(make_worker_factory("cpu")); }
+
+JobStatus wait_for(SearchService& svc, JobId id, JobState want, double timeout_s = 20) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        JobStatus st = svc.poll(id);
+        if (st.state == want || st.state == JobState::error) return st;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) return st;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
-SearchService make_service() { return SearchService(make_worker_factory("cpu")); }
+std::map<std::pair<int, int>, std::uint8_t> as_map(const std::vector<Match>& ms) {
+    std::map<std::pair<int, int>, std::uint8_t> out;
+    for (const Match& m : ms) out[{m.x, m.z}] = m.orient_mask;
+    return out;
+}
 
 std::vector<Match> run(SearchService& svc, const SearchRequest& req) {
-    JobId id = svc.submit(req);
-    for (;;) {
-        JobStatus st = svc.poll(id);
-        if (st.state == JobState::done) check(st.eta_s == 0.0, "a finished job has no ETA left");
-        if (st.state == JobState::done || st.state == JobState::cancelled) break;
-        if (st.state == JobState::error) {
-            std::printf("  FAIL: job error: %s\n", st.error.c_str());
-            ++g_fail;
-            return {};
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+    const JobId id = svc.submit(req);
+    const JobStatus st = wait_for(svc, id, JobState::done, 600);
+    check(st.state == JobState::done, "job finishes " + st.error);
+    check(st.eta_s == 0.0, "a finished job has no ETA left");
     return svc.results(id);
 }
 
@@ -54,7 +55,7 @@ std::vector<Match> run(SearchService& svc, const SearchRequest& req) {
 // checkable) and does a plain 8-orientation scan, keyed to the anchor's world
 // position -- the worker's output contract.
 std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
-    rokkdoxx::BedrockGenerator gen(req.seed);
+    rokkdoxx::BedrockGenerator gen(req.seed, req.edition);
     const auto knowns = req.pattern.knowns();
     const std::uint32_t thr = gen.threshold(req.plane_y);
     const SearchPlan plan = build_search_plan(knowns, thr, req.all_orientations);
@@ -85,19 +86,6 @@ std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
     return out;
 }
 
-Pattern fill_pattern(std::int64_t seed, int y, int cx, int cz, int w, int h) {
-    rokkdoxx::BedrockGenerator gen(seed);
-    Pattern p;
-    p.w = w;
-    p.h = h;
-    p.cells.assign(static_cast<std::size_t>(w) * h, Cell::unknown);
-    for (int j = 0; j < h; ++j)
-        for (int i = 0; i < w; ++i)
-            p.cells[static_cast<std::size_t>(j) * w + i] =
-                gen.is_bedrock_floor(cx + i, y, cz + j) ? Cell::bedrock : Cell::not_bedrock;
-    return p;
-}
-
 void test_roundtrip_and_equiv() {
     std::printf("test_roundtrip_and_equiv\n");
     auto svc = make_service();
@@ -107,7 +95,7 @@ void test_roundtrip_and_equiv() {
     SearchRequest req;
     req.seed = seed;
     req.plane_y = y;
-    req.pattern = fill_pattern(seed, y, cx, cz, 6, 6);
+    req.pattern = world_patch(seed, y, cx, cz, 6, 6);
     req.region = Region::centered(cx + 2, cz + 2, 400);  // center not aligned with the pattern origin
     req.all_orientations = true;
     req.tile_side = 4096;
@@ -117,9 +105,7 @@ void test_roundtrip_and_equiv() {
 
     check(got.size() == want.size(),
           "match count " + std::to_string(got.size()) + " vs brute " + std::to_string(want.size()));
-    std::map<std::pair<int, int>, std::uint8_t> gm;
-    for (auto& m : got) gm[{m.x, m.z}] = m.orient_mask;
-    check(gm == want, "match sets identical");
+    check(as_map(got) == want, "match sets identical");
 
     // The fill origin under identity: the anchor cell sits at (cx, cz) + anchor
     // offset (matches report the anchor's world position).
@@ -132,13 +118,45 @@ void test_roundtrip_and_equiv() {
     check(found_origin, "identity orientation found at the fill origin");
 }
 
+// Bedrock Edition: the CPU worker's chunk-at-a-time path equals the brute force
+// (one generator call per cell), near 0 and across the 2^24 edge where columns
+// start to repeat; 9-block tiles put the pattern across many tile edges.
+void test_bedrock_equiv() {
+    std::printf("test_bedrock_equiv\n");
+    auto svc = make_service();
+    for (const int c : {-40, 16777216})
+        for (const int tile : {4096, 9}) {
+            SearchRequest req;
+            req.edition = Edition::bedrock;
+            req.seed = 12345;  // not used
+            req.plane_y = -61;
+            req.pattern = world_patch(0, -61, c, -c, 4, 5, Edition::bedrock);
+            req.pattern.cells[3] = Cell::unknown;
+            req.region = Region::centered(c + 1, -c + 2, 60);
+            req.tile_side = tile;
+            const auto want = brute(req);
+            check(!want.empty() && as_map(run(svc, req)) == want,
+                  "bedrock at " + std::to_string(c) + ", tile " + std::to_string(tile) + ": " +
+                      std::to_string(want.size()) + " brute-force matches");
+        }
+
+    SearchRequest req;
+    req.pattern = world_patch(0, -60, 0, 0, 3, 3);
+    const std::uint64_t java = request_fingerprint(req);
+    req.edition = Edition::bedrock;
+    check(request_fingerprint(req) != java, "a Java checkpoint does not resume a Bedrock search");
+    req.region = Region::centered(33554400, 0, 1);
+    const JobStatus st = wait_for(svc, svc.submit(req), JobState::done);
+    check(st.state == JobState::error, "Bedrock searches past +/-2^25 are refused");
+}
+
 void test_tiling_invariant() {
     std::printf("test_tiling_invariant\n");
     auto svc = make_service();
     SearchRequest req;
     req.seed = 42;
     req.plane_y = -61;
-    req.pattern = fill_pattern(42, -61, -50, 77, 5, 8);
+    req.pattern = world_patch(42, -61, -50, 77, 5, 8);
     req.region = Region::centered(-48, 80, 300);
     req.all_orientations = true;
 
@@ -147,11 +165,9 @@ void test_tiling_invariant() {
     req.tile_side = 7;  // pathological: pattern crosses many tile edges
     auto small = run(svc, req);
 
-    std::map<std::pair<int, int>, std::uint8_t> a, b;
-    for (auto& m : big) a[{m.x, m.z}] = m.orient_mask;
-    for (auto& m : small) b[{m.x, m.z}] = m.orient_mask;
-    check(a == b, "tile size does not change results (" + std::to_string(a.size()) + " vs " +
-                      std::to_string(b.size()) + ")");
+    check(as_map(big) == as_map(small) && big.size() == small.size(),
+          "tile size does not change results (" + std::to_string(big.size()) + " vs " +
+              std::to_string(small.size()) + ")");
 }
 
 void test_cancel() {
@@ -160,7 +176,7 @@ void test_cancel() {
     SearchRequest req;
     req.seed = 1;
     req.plane_y = -60;
-    req.pattern = fill_pattern(1, -60, 0, 0, 4, 4);
+    req.pattern = world_patch(1, -60, 0, 0, 4, 4);
     req.region = Region::centered(0, 0, 4'000'000);  // ~6e13 candidates
     JobId id = svc.submit(req);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -197,7 +213,9 @@ void test_scheduler_checkpoint() {
         s1.mark_done(t);
         ++marked;
     }
-    s1.save_checkpoint(path, fp, saved_matches);
+    std::ofstream out(path);
+    s1.write_checkpoint(out, fp, saved_matches);
+    out.close();
 
     // The whole point of persisting matches: a resumed run must not lose (or
     // need to re-find) matches from tiles it's about to skip as already-done.
@@ -402,7 +420,9 @@ void test_scheduler_map() {
         part.next(t);
         part.mark_done(t);
     }
-    part.save_checkpoint(path, fp, {});
+    std::ofstream out(path);
+    part.write_checkpoint(out, fp, {});
+    out.close();
     TileScheduler r(region, 100, 3, 2);
     std::vector<Match> restored;
     check(r.load_checkpoint(path, fp, restored), "checkpoint loads");
@@ -423,7 +443,7 @@ void test_service_map() {
     SearchRequest req;
     req.seed = seed;
     req.plane_y = y;
-    req.pattern = fill_pattern(seed, y, cx, cz, 5, 5);
+    req.pattern = world_patch(seed, y, cx, cz, 5, 5);
     req.region = Region::centered(cx + 2, cz + 2, 450);  // 901 blocks -> 10 x 10 tiles of 100
     req.tile_side = 100;
     req.map_w = req.map_h = 4;
@@ -453,9 +473,7 @@ void test_service_map() {
     const auto results = svc.results(id);
     check(!results.empty(), "the search found something to mark");
     // Scanning in a different order must not change what is found.
-    std::map<std::pair<int, int>, std::uint8_t> got;
-    for (const Match& m : results) got[{m.x, m.z}] = m.orient_mask;
-    check(got == brute(req), "spiral scan finds exactly what brute force finds");
+    check(as_map(results) == brute(req), "spiral scan finds exactly what brute force finds");
     for (const Match& m : results) {
         const int tx = static_cast<int>((m.x - req.region.x0) / 100);
         const int tz = static_cast<int>((m.z - req.region.z0) / 100);
@@ -468,22 +486,14 @@ void test_service_map() {
     req.checkpoint_path = "test_map_svc.ckpt";
     std::remove(req.checkpoint_path.c_str());
     run(svc, req);  // writes the checkpoint
-    const JobId id3 = svc.submit(req);
-    do {
-        st = svc.poll(id3);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (st.state != JobState::done && st.state != JobState::error);
+    st = wait_for(svc, svc.submit(req), JobState::done);
     check(st.map == want, "a fully resumed job shows the same map, hits included");
     std::remove(req.checkpoint_path.c_str());
     req.checkpoint_path.clear();
 
     // Not asking for a map costs nothing and reports nothing.
     req.map_w = req.map_h = 0;
-    const JobId id2 = svc.submit(req);
-    do {
-        st = svc.poll(id2);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (st.state != JobState::done && st.state != JobState::error);
+    st = wait_for(svc, svc.submit(req), JobState::done);
     check(st.map.empty() && st.map_w == 0, "no map unless asked for");
 }
 
@@ -497,7 +507,7 @@ void test_stop_at_first() {
     SearchRequest req;
     req.seed = seed;
     req.plane_y = y;
-    req.pattern = fill_pattern(seed, y, cx - 6, cz - 6, 12, 12);  // 12x12: unique in this region
+    req.pattern = world_patch(seed, y, cx - 6, cz - 6, 12, 12);  // 12x12: unique in this region
     req.region = Region::centered(cx, cz, 450);                   // 10 x 10 tiles of 100
     req.tile_side = 100;
     req.checkpoint_path = "test_stop.ckpt";
@@ -514,11 +524,7 @@ void test_stop_at_first() {
 
     req.stop_at_first_match = true;
     JobId id = svc.submit(req);
-    JobStatus st;
-    do {
-        st = svc.poll(id);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (st.state != JobState::done && st.state != JobState::error);
+    JobStatus st = wait_for(svc, id, JobState::done);
     check(st.state == JobState::done && st.stopped_early, "stops early once a tile has a match");
     check(has_planted(svc.results(id)), "...with the planted match in the results");
     check(st.candidates_done * 5 < st.candidates_total,
@@ -528,10 +534,7 @@ void test_stop_at_first() {
     // The same job resumed from its checkpoint carries on (restored matches must not stop it
     // again at once) and completes the region; with one match in the region it ends normally.
     id = svc.submit(req);
-    do {
-        st = svc.poll(id);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (st.state != JobState::done && st.state != JobState::error);
+    st = wait_for(svc, id, JobState::done);
     check(st.state == JobState::done && !st.stopped_early && st.progress == 1.0,
           "a resumed job finishes the rest of the region");
     check(has_planted(svc.results(id)), "...and still reports the match found before the stop");
@@ -541,10 +544,7 @@ void test_stop_at_first() {
     req.stop_at_first_match = false;
     req.checkpoint_path.clear();
     id = svc.submit(req);
-    do {
-        st = svc.poll(id);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (st.state != JobState::done && st.state != JobState::error);
+    st = wait_for(svc, id, JobState::done);
     check(!st.stopped_early && st.progress == 1.0 && has_planted(svc.results(id)),
           "without the flag the whole region is searched");
 }
@@ -556,27 +556,11 @@ SearchRequest pausable_request() {
     SearchRequest req;
     req.seed = 99;
     req.plane_y = -60;
-    req.pattern = fill_pattern(99, -60, 5000, -7000, 9, 9);
+    req.pattern = world_patch(99, -60, 5000, -7000, 9, 9);
     req.region = Region::centered(5004, -6996, 15000);
     req.tile_side = 1024;
     req.all_orientations = false;
     return req;
-}
-
-JobStatus wait_for(SearchService& svc, JobId id, JobState want, double timeout_s = 20) {
-    const auto t0 = std::chrono::steady_clock::now();
-    for (;;) {
-        JobStatus st = svc.poll(id);
-        if (st.state == want || st.state == JobState::error) return st;
-        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) return st;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-}
-
-std::map<std::pair<int, int>, std::uint8_t> as_map(const std::vector<Match>& ms) {
-    std::map<std::pair<int, int>, std::uint8_t> out;
-    for (const Match& m : ms) out[{m.x, m.z}] = m.orient_mask;
-    return out;
 }
 
 void test_pause_resume() {
@@ -704,7 +688,7 @@ void test_pattern_io_roundtrip() {
     pf.center_z = "100";
     pf.radius = "400";
     pf.all_orientations = false;
-    pf.pattern = fill_pattern(2024, -60, 100, 100, 5, 5);  // ~any layout incl. leading '#'
+    pf.pattern = world_patch(2024, -60, 100, 100, 5, 5);  // ~any layout incl. leading '#'
     const std::string path = "test_pat.tmp";
     std::string err;
     check(save_pattern_file(path, pf, err), "save ok");
@@ -714,13 +698,19 @@ void test_pattern_io_roundtrip() {
     check(got.pattern.w == 5 && got.pattern.h == 5, "dims preserved");
     check(got.pattern.cells == pf.pattern.cells, "cells preserved (no '#'-row loss)");
     check(got.pattern.knowns().size() == 25, "all 25 cells known after round-trip");
-    check(got.checkpoint.empty() && !got.stop_first, "a plain pattern has no session keys");
+    check(got.checkpoint.empty() && !got.stop_first && got.edition == Edition::java,
+          "a plain pattern has no session keys, and is Java");
     {
         std::ifstream f(path);
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        check(text.find("checkpoint") == std::string::npos && text.find("stop_at_first") == std::string::npos,
+        check(text.find("checkpoint") == std::string::npos && text.find("stop_at_first") == std::string::npos &&
+                  text.find("edition") == std::string::npos,
               "...and none are written for it (existing files stay byte-identical)");
     }
+    pf.edition = Edition::bedrock;
+    check(save_pattern_file(path, pf, err) && load_pattern_file(path, got, err) && got.edition == Edition::bedrock,
+          "a Bedrock Edition pattern says so");
+    pf.edition = Edition::java;
 
     // A saved session: the same file plus the progress file it names (path may have spaces).
     pf.checkpoint = "my saves/run 1.ckpt";
@@ -786,9 +776,8 @@ void test_search_plan() {
 
     // End-to-end: symmetric plus, seed with real bedrock, brute vs service.
     auto svc = make_service();
-    rokkdoxx::BedrockGenerator gen(555);
     const int y = -60, cx = -700, cz = 900;
-    Pattern fp = fill_pattern(555, y, cx, cz, 5, 5);  // 5x5 real config (asymmetric)
+    Pattern fp = world_patch(555, y, cx, cz, 5, 5);  // 5x5 real config (asymmetric)
     SearchRequest req;
     req.seed = 555;
     req.plane_y = y;
@@ -797,11 +786,12 @@ void test_search_plan() {
     req.all_orientations = true;
     auto got = run(svc, req);
     auto want = brute(req);
-    std::map<std::pair<int, int>, std::uint8_t> gm;
-    for (auto& m : got) gm[{m.x, m.z}] = m.orient_mask;
-    check(gm == want, "plan search == brute (" + std::to_string(gm.size()) + " vs " +
-                          std::to_string(want.size()) + ")");
-    (void)gen;
+    check(as_map(got) == want, "plan search == brute (" + std::to_string(got.size()) + " vs " +
+                                  std::to_string(want.size()) + ")");
+
+    req.pattern = world_patch(555, y, cx, cz, kMaxDim + 1, kMaxDim + 1);
+    check(wait_for(svc, svc.submit(req), JobState::done).state == JobState::error,
+          "a pattern bigger than 32x32 is refused");
 }
 
 }  // namespace
@@ -809,6 +799,7 @@ void test_search_plan() {
 int main() {
     test_roundtrip_and_equiv();
     test_tiling_invariant();
+    test_bedrock_equiv();
     test_search_plan();
     test_format_duration();
     test_cancel();
@@ -820,10 +811,5 @@ int main() {
     test_pause_resume();
     test_checkpoint_text();
     test_pattern_io_roundtrip();
-    if (g_fail == 0) {
-        std::printf("\nALL PASS\n");
-        return 0;
-    }
-    std::printf("\n%d FAILURE(S)\n", g_fail);
-    return 1;
+    return report();
 }

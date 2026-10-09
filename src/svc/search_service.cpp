@@ -11,8 +11,6 @@
 #include <sstream>
 #include <thread>
 
-#include "gen/bedrock.hpp"
-
 namespace rokkdoxx::svc {
 
 // ==========================================================================
@@ -30,6 +28,7 @@ std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
 std::uint64_t request_fingerprint(const SearchRequest& req) {
     std::uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
     h = mix(h, static_cast<std::uint64_t>(req.seed));
+    if (req.edition == Edition::bedrock) h = mix(h, 1);  // only then, so Java checkpoints stay valid
     h = mix(h, static_cast<std::uint64_t>(req.plane_y));
     h = mix(h, static_cast<std::uint64_t>(req.region.x0));
     h = mix(h, static_cast<std::uint64_t>(req.region.x1));
@@ -235,12 +234,6 @@ bool TileScheduler::read_checkpoint(std::istream& f, std::uint64_t fingerprint,
     return true;
 }
 
-void TileScheduler::save_checkpoint(const std::string& path, std::uint64_t fingerprint,
-                                    const std::vector<Match>& matches) const {
-    std::ofstream f(path, std::ios::trunc);
-    if (f) write_checkpoint(f, fingerprint, matches);
-}
-
 void TileScheduler::write_checkpoint(std::ostream& f, std::uint64_t fingerprint,
                                      const std::vector<Match>& matches) const {
     f << "rokkdoxx-checkpoint 2 " << fingerprint << "\ndone";
@@ -267,25 +260,13 @@ void TileScheduler::write_checkpoint(std::ostream& f, std::uint64_t fingerprint,
 
 void ResultSink::add(const std::vector<Match>& tile_matches) {
     for (const Match& m : tile_matches) {
-        // Same origin from another tile/orientation: merge the masks.
-        auto [it, inserted] = by_pos_.try_emplace(key(m.x, m.z), m.orient_mask);
-        if (!inserted) {
-            it->second |= m.orient_mask;
-        } else if (by_pos_.size() > cap_) {
-            by_pos_.erase(it);
-            truncated_ = true;
-        }
+        if (matches_.size() < cap_) matches_.push_back(m);
+        else truncated_ = true;
     }
 }
 
 std::vector<Match> ResultSink::snapshot() const {
-    std::vector<Match> out;
-    out.reserve(by_pos_.size());
-    for (const auto& [k, mask] : by_pos_) {
-        const int x = static_cast<int>(static_cast<std::uint32_t>(k >> 32));
-        const int z = static_cast<int>(static_cast<std::uint32_t>(k));
-        out.push_back({x, z, mask});
-    }
+    std::vector<Match> out = matches_;
     std::sort(out.begin(), out.end(), [](const Match& a, const Match& b) {
         return a.z != b.z ? a.z < b.z : a.x < b.x;
     });
@@ -299,7 +280,6 @@ std::vector<Match> ResultSink::snapshot() const {
 // One job owns its own worker thread. `status` and `results` are guarded by
 // `mu`; `cancel` is a plain atomic the run loop checks between tiles.
 struct SearchService::Job {
-    JobId id = 0;
     SearchRequest req;
     std::atomic<bool> cancel{false};
     std::atomic<bool> pause{false};
@@ -328,16 +308,10 @@ SearchService::~SearchService() {
         if (j->th.joinable()) j->th.join();
 }
 
-std::string SearchService::backend_name() const {
-    auto w = factory_();
-    return w ? w->name() : "none";
-}
-
 JobId SearchService::submit(const SearchRequest& req) {
     auto job = std::make_unique<Job>();
     std::lock_guard<std::mutex> lk(mu_);
     const JobId id = next_id_++;
-    job->id = id;
     job->req = req;
     job->status.state = JobState::pending;
     job->status.candidates_total = req.region.candidates();
@@ -405,15 +379,17 @@ void SearchService::run(Job* job) noexcept {
         if (!req.region.valid()) return set_err("empty region");
         if (req.plane_y < -64 || req.plane_y > -59)
             return set_err("plane y must be in [-64, -59]");
+        if (req.pattern.w > kMaxDim || req.pattern.h > kMaxDim)
+            return set_err("pattern is bigger than " + std::to_string(kMaxDim) + "x" + std::to_string(kMaxDim));
         if (req.pattern.knowns().empty()) return set_err("pattern has no known cells");
+        // Past 2^25 the float rounding in Bedrock Edition's floor (rk_be_coord)
+        // moves a column more than one block, which the GPU path does not allow for.
+        if (req.edition == Edition::bedrock &&
+            std::max({-req.region.x0, req.region.x1, -req.region.z0, req.region.z1}) > (1 << 25) - kMaxDim)
+            return set_err("Bedrock Edition searches must stay within +/-33,554,400");
 
         // Turn the seed + plane into the handful of constants the worker needs.
-        BedrockGenerator gen(req.seed);
-        WorkerConfig cfg;
-        cfg.derived_lo = gen.derived_lo();
-        cfg.derived_hi = gen.derived_hi();
-        cfg.plane_y = req.plane_y;
-        cfg.threshold = gen.threshold(req.plane_y);
+        WorkerConfig cfg = worker_config(req.seed, req.plane_y, req.edition);
         cfg.knowns = req.pattern.knowns();
         cfg.all_orientations = req.all_orientations;
         cfg.match_cap = req.match_cap;
@@ -491,9 +467,9 @@ void SearchService::run(Job* job) noexcept {
         double paused_total = 0.0;  // seconds spent paused: not counted in elapsed / rate
 
         // Bookkeeping for one *completed* tile -- called at drain time, which
-        // lags dispatch order by up to one tile. That
-        // lag is fine: TileScheduler::mark_done/ResultSink::add are already
-        // idempotent/order-independent, and progress stays monotonic.
+        // lags dispatch order by up to one tile. That lag is fine: neither
+        // TileScheduler::mark_done nor ResultSink::add cares about order, and
+        // progress stays monotonic.
         bool stop = false;  // stop_at_first_match: no new tiles once one has a match
         auto on_tile_done = [&](const Tile& done, const std::vector<Match>& m) {
             if (req.stop_at_first_match && !m.empty()) stop = true;

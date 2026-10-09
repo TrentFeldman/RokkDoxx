@@ -5,8 +5,9 @@
 // compiled at runtime, so the GPU runs the exact same generation math as the
 // CPU. Per tile: zero the match counter; for each kChunk x kChunk piece run
 // fill_plane (draw every block of the piece plus the pattern's halo once, one
-// bit each) then match_plane (32 candidates per work-item, tested with word
-// ops); then read back the match count and that many matches. Drawing each
+// bit each; Bedrock Edition: fill_plane_be + remap_plane_be) then match_plane
+// (32 candidates per work-item, tested with word ops); then read back the
+// match count and that many matches. Drawing each
 // block once is what makes all 8 orientations nearly as cheap as one.
 // OpenclWorker::preferred_tile_side() asks the scheduler for large
 // (16384-block) tiles to keep the fixed per-dispatch cost small.
@@ -14,10 +15,8 @@
 // match_plane is rebuilt per pattern with the first cells' offsets baked in as
 // literals (specialized_source); if that build fails the generic kernel is used.
 //
-// A pattern whose halo exceeds kPlaneHaloMax falls back to search_tile (every
-// work-item recomputes every cell it needs), so the plane buffer stays
-// bounded. begin_tile()/end_tile() ping-pong two buffer/queue slots so one
-// tile's dispatch can overlap another's read-back; run_tile() is the fully
+// begin_tile()/end_tile() ping-pong two buffer/queue slots so one tile's
+// dispatch can overlap another's read-back; run_tile() is the fully
 // synchronous single-slot form.
 #include "opencl_worker.hpp"
 
@@ -156,21 +155,13 @@ std::vector<OpenclDevice> opencl_list_devices() {
             OpenclDevice d;
             d.index = static_cast<int>(i);
             d.label = labels[i];
-            try {
-                d.cl_version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
-            } catch (...) {
-            }
-            try {
-                d.driver_version = trimmed(devs[i].getInfo<CL_DRIVER_VERSION>());
-            } catch (...) {
-            }
-            try {
-                d.compute_units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
-            } catch (...) {
-            }
+            // Kind first: if a later query throws, "auto" can still pick by it.
             try {
                 d.is_cpu = (devs[i].getInfo<CL_DEVICE_TYPE>() & CL_DEVICE_TYPE_CPU) != 0;
                 d.integrated = !d.is_cpu && devs[i].getInfo<CL_DEVICE_HOST_UNIFIED_MEMORY>() != CL_FALSE;
+                d.compute_units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
+                d.cl_version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
+                d.driver_version = trimmed(devs[i].getInfo<CL_DRIVER_VERSION>());
             } catch (...) {
             }
             out.push_back(std::move(d));
@@ -190,9 +181,7 @@ struct OpenclWorker::Impl {
     cl::Context ctx;
     cl::CommandQueue queue[kSlots];
     cl::Program program;
-    cl::Kernel k_search;
     cl::Kernel k_dump;
-    std::string label;
 
     WorkerConfig cfg;
     int n_cells = 1;
@@ -209,18 +198,18 @@ struct OpenclWorker::Impl {
     int next_begin = 0;  // slot the next begin_tile() dispatches into
     int next_end = 0;    // slot the next end_tile() drains
 
-    // Bit-plane path (fill_plane + match_plane). A tile is processed in
-    // kChunk x kChunk pieces so the per-slot plane buffer has a fixed size
-    // (~34 MB at halo 31) whatever tile side the scheduler picked. A halo
-    // past kPlaneHaloMax -- a huge, sparse pattern -- uses k_search instead.
+    // fill_plane + match_plane. A tile is processed in kChunk x kChunk pieces so
+    // the per-slot plane buffer has a fixed size (~34 MB at halo 31, the most a
+    // 32x32 pattern can reach) whatever tile side the scheduler picked.
     static constexpr int kChunk = 16384;
-    static constexpr int kPlaneHaloMax = 1024;
     std::size_t local_w = 32, local_h = 8;  // see fit_local; set by pick_local()
+    std::size_t be_local_w = 32, be_local_h = 8;  // the same for the Bedrock Edition kernels
     cl::Kernel k_fill, k_match;
+    cl::Kernel k_fill_be, k_remap_be;  // Bedrock Edition's fill: chunks into buf_raw, then remap
     cl::Program specialized_program;  // the current pattern's match_plane (one at a time)
     std::string specialized_src;      // its source, so an unchanged pattern isn't rebuilt
     cl::Buffer buf_plane[kSlots];
-    bool use_plane = false;
+    cl::Buffer buf_raw[kSlots];  // Bedrock Edition only
     int halo_w = 0, halo_h = 0;
 
     // Call whenever k_fill / k_match change: the specialized match_plane can
@@ -237,14 +226,12 @@ struct OpenclWorker::Impl {
 };
 
 OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
-    std::vector<std::string> labels;
-    auto devs = flat_devices(&labels);
+    auto devs = flat_devices();
     if (devs.empty()) throw std::runtime_error("no OpenCL devices found");
     if (device_index < 0 || device_index >= static_cast<int>(devs.size()))
         throw std::runtime_error("OpenCL device index out of range");
 
     impl_->device = devs[static_cast<std::size_t>(device_index)];
-    impl_->label = labels[static_cast<std::size_t>(device_index)];
     impl_->ctx = cl::Context(impl_->device);
     for (int i = 0; i < Impl::kSlots; ++i) impl_->queue[i] = cl::CommandQueue(impl_->ctx, impl_->device);
 
@@ -259,26 +246,23 @@ OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
         }
         throw std::runtime_error("OpenCL kernel build failed:\n" + log);
     }
-    impl_->k_search = cl::Kernel(impl_->program, "search_tile");
     impl_->k_dump = cl::Kernel(impl_->program, "dump_plane");
     impl_->k_fill = cl::Kernel(impl_->program, "fill_plane");
     impl_->k_match = cl::Kernel(impl_->program, "match_plane");
+    impl_->k_fill_be = cl::Kernel(impl_->program, "fill_plane_be");
+    impl_->k_remap_be = cl::Kernel(impl_->program, "remap_plane_be");
     impl_->pick_local();
-}
-
-OpenclWorker::~OpenclWorker() {
-    // Make sure no GPU op is still in flight before the buffers/queues in
-    // impl_ get torn down (the pump loop always drains before returning, but
-    // this is cheap insurance against an early-exit/exception path).
-    if (impl_) {
-        try {
-            for (auto& q : impl_->queue) q.finish();
-        } catch (...) {
-        }
+    std::size_t be_limit = 256;
+    try {
+        be_limit = std::min(impl_->k_fill_be.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(impl_->device),
+                            impl_->k_remap_be.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(impl_->device));
+    } catch (const cl::Error&) {
     }
+    std::tie(impl_->be_local_w, impl_->be_local_h) = fit_local(be_limit);
 }
 
-std::string OpenclWorker::name() const { return "opencl: " + impl_->label; }
+// = default: OpenCL keeps objects alive until their queued commands finish.
+OpenclWorker::~OpenclWorker() = default;
 
 bool OpenclWorker::truncated() const { return impl_->trunc.load(); }
 
@@ -332,127 +316,136 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     const std::int64_t halo_h = std::max(max_dz, -min_dz);
     impl_->halo_w = static_cast<int>(halo_w);
     impl_->halo_h = static_cast<int>(halo_h);
-    impl_->use_plane = halo_w <= Impl::kPlaneHaloMax && halo_h <= Impl::kPlaneHaloMax;
-    if (impl_->use_plane) {
-        const std::size_t words = (Impl::kChunk + 2 * halo_w + 31) / 32 + 1;
-        const std::size_t rows = Impl::kChunk + 2 * halo_h;
-        for (int i = 0; i < Impl::kSlots; ++i)
-            impl_->buf_plane[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint));
-
-        // ~200 ms the first time a pattern is seen (the driver caches repeats).
-        try {
-            const std::string src = specialized_source(plan);
-            if (src.empty()) throw std::runtime_error("kernel markers missing");
-            if (src != impl_->specialized_src) {
-                cl::Program p(impl_->ctx, src);
-                p.build("-cl-std=CL1.2");
-                impl_->specialized_program = p;
-                impl_->specialized_src = src;
-            }
-            impl_->k_match = cl::Kernel(impl_->specialized_program, "match_plane");
-        } catch (const std::exception&) {
-            impl_->k_match = cl::Kernel(impl_->program, "match_plane");  // oh-shit fallback: generic, silently
-        }
-        impl_->pick_local();
+    // Bedrock Edition's plane starts on a chunk-pair boundary: up to 31 / 15 more
+    // halo on the low side, and buf_raw holds whole chunks plus a row.
+    const bool be = cfg.edition == Edition::bedrock;
+    const std::size_t pad = be ? 32 : 0;
+    const std::size_t words = (Impl::kChunk + 2 * halo_w + 31 + pad) / 32 + 1;
+    const std::size_t rows = Impl::kChunk + 2 * halo_h + pad;
+    for (int i = 0; i < Impl::kSlots; ++i) {
+        impl_->buf_plane[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint));
+        impl_->buf_raw[i] = be ? cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint))
+                               : cl::Buffer();
     }
+
+    // ~200 ms the first time a pattern is seen (the driver caches repeats).
+    try {
+        const std::string src = specialized_source(plan);
+        if (src.empty()) throw std::runtime_error("kernel markers missing");
+        if (src != impl_->specialized_src) {
+            cl::Program p(impl_->ctx, src);
+            p.build("-cl-std=CL1.2");
+            impl_->specialized_program = p;
+            impl_->specialized_src = src;
+        }
+        impl_->k_match = cl::Kernel(impl_->specialized_program, "match_plane");
+    } catch (const std::exception&) {
+        impl_->k_match = cl::Kernel(impl_->program, "match_plane");  // oh-shit fallback: generic, silently
+    }
+    impl_->pick_local();
 }
 
-// Zero the counter and launch the kernel(s) into `slot`, non-blocking. Setting
+// Zero the counter and launch the kernels into `slot`, non-blocking. Setting
 // kernel args and enqueueing happen back-to-back on this thread, so reusing
 // one cl::Kernel object across slots and pieces is safe: OpenCL captures a
 // kernel's argument values at enqueue time, not at execution time, so a later
 // setArg() (for the other slot) can never retroactively change a command
 // that's already been enqueued.
 void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
-    // Blocking: this is a 4-byte write, negligible cost either way, and a
-    // non-blocking write here would need the source pointer to stay valid
-    // until the driver actually performs the DMA -- `zero` being a stack
-    // local that dies when this function returns would then be a real
-    // dangling-pointer bug (the double-buffering win comes from not blocking
-    // on the multi-KB *read-back*, not from this).
-    cl_uint zero = 0;
-    impl_->queue[slot].enqueueWriteBuffer(impl_->buf_count[slot], CL_TRUE, 0, sizeof(cl_uint), &zero);
+    impl_->queue[slot].enqueueFillBuffer(impl_->buf_count[slot], cl_uint{0}, 0, sizeof(cl_uint));
 
-    if (impl_->use_plane) {
-        const int hw = impl_->halo_w, hh = impl_->halo_h;
-        const std::size_t lw = impl_->local_w, lh = impl_->local_h;
-        const cl::NDRange local(lw, lh);
-        for (int cz = 0; cz < tile.h; cz += Impl::kChunk)
-            for (int cx = 0; cx < tile.w; cx += Impl::kChunk) {
-                const std::int64_t x0 = tile.x0 + cx, z0 = tile.z0 + cz;
-                const int w = std::min(Impl::kChunk, tile.w - cx);
-                const int h = std::min(Impl::kChunk, tile.h - cz);
-                const int words_w = (w + 2 * hw + 31) / 32 + 1;
-                const int rows = h + 2 * hh;
+    const int hw = impl_->halo_w, hh = impl_->halo_h;
+    const std::size_t lw = impl_->local_w, lh = impl_->local_h;
+    const cl::NDRange local(lw, lh);
+    for (int cz = 0; cz < tile.h; cz += Impl::kChunk)
+        for (int cx = 0; cx < tile.w; cx += Impl::kChunk) {
+            const std::int64_t x0 = tile.x0 + cx, z0 = tile.z0 + cz;
+            const int w = std::min(Impl::kChunk, tile.w - cx);
+            const int h = std::min(Impl::kChunk, tile.h - cz);
+            const bool be = impl_->cfg.edition == Edition::bedrock;
+            // The plane's corner, and so the halo match_plane is told about on the
+            // low side: Bedrock Edition's is rounded down to a chunk pair.
+            const std::int64_t px = be ? (x0 - hw) & ~std::int64_t{31} : x0 - hw;
+            const std::int64_t pz = be ? (z0 - hh) & ~std::int64_t{15} : z0 - hh;
+            const int lo_w = static_cast<int>(x0 - px), lo_h = static_cast<int>(z0 - pz);
+            const int words_w = (w + lo_w + hw + 31) / 32 + 1;
+            const int rows = h + lo_h + hh;
 
+            cl_uint a = 0;
+            if (be) {
+                const int raw_rows = (rows + 1 + 15) / 16 * 16;
+                // Within +/-2^24 the remap is a copy: fill the plane directly.
+                const int kNear = 1 << 24;
+                const bool near = px >= -kNear && px + 32 * words_w <= kNear && pz >= -kNear &&
+                                  pz + raw_rows <= kNear;
+                cl::Kernel& f = impl_->k_fill_be;
+                f.setArg(a++, static_cast<cl_int>(impl_->cfg.plane_y));
+                f.setArg(a++, static_cast<cl_int>(px));
+                f.setArg(a++, static_cast<cl_int>(pz));
+                f.setArg(a++, static_cast<cl_int>(words_w));
+                f.setArg(a++, static_cast<cl_int>(raw_rows));
+                f.setArg(a++, near ? impl_->buf_plane[slot] : impl_->buf_raw[slot]);
+                const std::size_t bw = impl_->be_local_w, bh = impl_->be_local_h;
+                impl_->queue[slot].enqueueNDRangeKernel(
+                    f, cl::NullRange, cl::NDRange(round_up(words_w, bw), round_up(raw_rows / 16, bh)),
+                    cl::NDRange(bw, bh));
+                if (!near) {
+                    cl::Kernel& r = impl_->k_remap_be;
+                    a = 0;
+                    r.setArg(a++, static_cast<cl_int>(px));
+                    r.setArg(a++, static_cast<cl_int>(pz));
+                    r.setArg(a++, static_cast<cl_int>(words_w));
+                    r.setArg(a++, static_cast<cl_int>(rows));
+                    r.setArg(a++, impl_->buf_raw[slot]);
+                    r.setArg(a++, impl_->buf_plane[slot]);
+                    impl_->queue[slot].enqueueNDRangeKernel(
+                        r, cl::NullRange, cl::NDRange(round_up(words_w, bw), round_up(rows, bh)),
+                        cl::NDRange(bw, bh));
+                }
+            } else {
                 cl::Kernel& f = impl_->k_fill;
-                cl_uint a = 0;
                 f.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
                 f.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
                 f.setArg(a++, static_cast<cl_int>(impl_->cfg.plane_y));
                 f.setArg(a++, static_cast<cl_uint>(impl_->cfg.threshold));
-                f.setArg(a++, static_cast<cl_int>(x0 - hw));
-                f.setArg(a++, static_cast<cl_int>(z0 - hh));
+                f.setArg(a++, static_cast<cl_int>(px));
+                f.setArg(a++, static_cast<cl_int>(pz));
                 f.setArg(a++, static_cast<cl_int>(words_w));
                 f.setArg(a++, static_cast<cl_int>(rows));
                 f.setArg(a++, impl_->buf_plane[slot]);
                 impl_->queue[slot].enqueueNDRangeKernel(
                     f, cl::NullRange,
                     cl::NDRange(round_up(words_w, lw), round_up(rows, lh)), local);
-
-                cl::Kernel& m = impl_->k_match;
-                a = 0;
-                m.setArg(a++, static_cast<cl_int>(x0));
-                m.setArg(a++, static_cast<cl_int>(z0));
-                m.setArg(a++, static_cast<cl_int>(w));
-                m.setArg(a++, static_cast<cl_int>(h));
-                m.setArg(a++, static_cast<cl_int>(hw));
-                m.setArg(a++, static_cast<cl_int>(hh));
-                m.setArg(a++, static_cast<cl_int>(words_w));
-                m.setArg(a++, impl_->buf_plane[slot]);
-                m.setArg(a++, static_cast<cl_int>(impl_->n_cells));
-                m.setArg(a++, static_cast<cl_int>(impl_->n_variants));
-                m.setArg(a++, impl_->buf_var_off);
-                m.setArg(a++, impl_->buf_want);
-                m.setArg(a++, impl_->buf_var_mask);
-                m.setArg(a++, static_cast<cl_uint>(impl_->cap));
-                m.setArg(a++, impl_->buf_count[slot]);
-                m.setArg(a++, impl_->buf_xz[slot]);
-                m.setArg(a++, impl_->buf_orient[slot]);
-                impl_->queue[slot].enqueueNDRangeKernel(
-                    m, cl::NullRange,
-                    cl::NDRange(round_up((w + 31) / 32, lw), round_up(h, lh)), local);
             }
-        return;
-    }
 
-    cl::Kernel& k = impl_->k_search;
-    cl_uint a = 0;
-    k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_lo));
-    k.setArg(a++, static_cast<cl_ulong>(impl_->cfg.derived_hi));
-    k.setArg(a++, static_cast<cl_int>(impl_->cfg.plane_y));
-    k.setArg(a++, static_cast<cl_uint>(impl_->cfg.threshold));
-    k.setArg(a++, static_cast<cl_int>(tile.x0));
-    k.setArg(a++, static_cast<cl_int>(tile.z0));
-    k.setArg(a++, static_cast<cl_int>(tile.w));
-    k.setArg(a++, static_cast<cl_int>(tile.h));
-    k.setArg(a++, static_cast<cl_int>(impl_->n_cells));
-    k.setArg(a++, static_cast<cl_int>(impl_->n_variants));
-    k.setArg(a++, impl_->buf_var_off);
-    k.setArg(a++, impl_->buf_want);
-    k.setArg(a++, impl_->buf_var_mask);
-    k.setArg(a++, static_cast<cl_uint>(impl_->cap));
-    k.setArg(a++, impl_->buf_count[slot]);
-    k.setArg(a++, impl_->buf_xz[slot]);
-    k.setArg(a++, impl_->buf_orient[slot]);
-    impl_->queue[slot].enqueueNDRangeKernel(
-        k, cl::NullRange,
-        cl::NDRange(static_cast<std::size_t>(tile.w), static_cast<std::size_t>(tile.h)), cl::NullRange);
+            cl::Kernel& m = impl_->k_match;
+            a = 0;
+            m.setArg(a++, static_cast<cl_int>(x0));
+            m.setArg(a++, static_cast<cl_int>(z0));
+            m.setArg(a++, static_cast<cl_int>(w));
+            m.setArg(a++, static_cast<cl_int>(h));
+            m.setArg(a++, static_cast<cl_int>(lo_w));
+            m.setArg(a++, static_cast<cl_int>(lo_h));
+            m.setArg(a++, static_cast<cl_int>(words_w));
+            m.setArg(a++, impl_->buf_plane[slot]);
+            m.setArg(a++, static_cast<cl_int>(impl_->n_cells));
+            m.setArg(a++, static_cast<cl_int>(impl_->n_variants));
+            m.setArg(a++, impl_->buf_var_off);
+            m.setArg(a++, impl_->buf_want);
+            m.setArg(a++, impl_->buf_var_mask);
+            m.setArg(a++, static_cast<cl_uint>(impl_->cap));
+            m.setArg(a++, impl_->buf_count[slot]);
+            m.setArg(a++, impl_->buf_xz[slot]);
+            m.setArg(a++, impl_->buf_orient[slot]);
+            impl_->queue[slot].enqueueNDRangeKernel(
+                m, cl::NullRange,
+                cl::NDRange(round_up((w + 31) / 32, lw), round_up(h, lh)), local);
+        }
 }
 
 // Blocking read-back of whatever `slot`'s kernel found. The blocking
 // enqueueReadBuffer call is enough by itself to wait for that slot's queue to
-// finish (in-order queue: the read is ordered after the write+kernel), so no
+// finish (in-order queue: the read is ordered after the fill + kernels), so no
 // separate finish()/wait is needed here.
 std::vector<Match> OpenclWorker::read_results(int slot) {
     cl_uint n = 0;
@@ -477,7 +470,7 @@ std::vector<Match> OpenclWorker::read_results(int slot) {
 
 std::vector<Match> OpenclWorker::run_tile(const Tile& tile) {
     // Fully synchronous single-slot path (the pump uses begin/end_tile). The
-    // blocking read in read_results() waits for this slot's write+kernel too
+    // blocking read in read_results() waits for this slot's fill + kernels too
     // (in-order queue).
     enqueue_search(0, tile);
     return read_results(0);

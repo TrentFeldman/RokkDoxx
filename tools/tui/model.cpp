@@ -15,6 +15,7 @@ bool parse_i64(const std::string& s, long long& out) {
 
 svc::PatternFile model_to_file(const Model& m) {
     svc::PatternFile pf;
+    pf.edition = m.edition;
     pf.seed = m.seed;
     pf.y = m.y;
     pf.center_x = m.cx;
@@ -31,6 +32,7 @@ svc::PatternFile model_to_file(const Model& m) {
 }
 
 void file_to_model(const svc::PatternFile& pf, Model& m) {
+    m.edition = pf.edition;
     m.seed = pf.seed;
     m.y = pf.y;
     m.cx = pf.center_x;
@@ -52,6 +54,7 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
         err = "center X/Z and radius must be integers (radius >= 0, or -1 for the whole world)";
         return false;
     }
+    req.edition = m.edition;
     req.seed = svc::seed_from_string(m.seed);
     req.plane_y = m.y;
     req.pattern = model_to_file(m).pattern;
@@ -73,7 +76,7 @@ bool fill_from_world(Model& m, std::string& err) {
         err = "set integer center X/Z first";
         return false;
     }
-    BedrockGenerator gen(svc::seed_from_string(m.seed));
+    BedrockGenerator gen(svc::seed_from_string(m.seed), m.edition);
     for (int j = 0; j < m.h; ++j)
         for (int i = 0; i < m.w; ++i)
             m.at(i, j) = gen.is_bedrock_floor(static_cast<int>(cx + i), m.y, static_cast<int>(cz + j))
@@ -82,10 +85,8 @@ bool fill_from_world(Model& m, std::string& err) {
     return true;
 }
 
-double bedrock_probability(int y) {
-    if (y <= -64) return 1.0;
-    if (y >= -59) return 0.0;
-    return 1.0 - (y + 64) / 5.0;
+double bedrock_probability(svc::Edition edition, int y) {
+    return BedrockGenerator(0, edition).threshold(y) / 16777216.0;
 }
 
 double search_candidates(const Model& m) {
@@ -106,7 +107,8 @@ std::string format_matches(const std::vector<svc::Match>& matches) {
 }
 
 std::string matches_header(const Model& m) {
-    return "# rokkdoxx matches  seed=" + m.seed + " y=" + std::to_string(m.y) +
+    return "# rokkdoxx matches  " + (m.edition == svc::Edition::bedrock ? "bedrock" : "seed=" + m.seed) +
+           " y=" + std::to_string(m.y) +
            " size=" + std::to_string(m.w) + "x" + std::to_string(m.h) +
            "  (x z = anchor cell, ~pattern centre; mask bit g = orientation g)\n";
 }

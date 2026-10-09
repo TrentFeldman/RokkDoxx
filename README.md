@@ -1,14 +1,15 @@
 # RokkDoxx
 
-**v1.0.0 - First stable release**
+**v1.1.0 - Bedrock Edition**
 
 **Got Bedrock? Get Locations.**
 
 RokkDoxx reproduces Minecraft 26.2's Overworld bedrock-floor generation as a plain function
 and searches the world for a bedrock pattern without running the game. Give it a seed and a
-picture of some bedrock; it returns every `(x, z)` where that pattern occurs. A GPU
-(OpenCL) sweeps the whole 60M x 60M world in hours; a CPU handles a few thousand blocks
-around a rough location in seconds.
+picture of some bedrock; it returns every `(x, z)` where that pattern occurs. Java Edition by
+default; Bedrock Edition too (`--edition bedrock`), where the floor is the same in every
+world, so no seed is needed. A GPU (OpenCL) sweeps the whole 60M x 60M world in hours; a CPU
+handles a few thousand blocks around a rough location in seconds.
 
 The scope is deliberately narrow: one Overworld bedrock-floor layer per pattern.
 
@@ -21,6 +22,13 @@ whole-world sweeps, resumable checkpoints, the interactive `rokktui`, the headle
 
 Linux is the primary supported platform. Windows works and remains beta; macOS OpenCL is
 unsupported.
+
+## v1.1.0
+
+RokkDoxx 1.1 adds Bedrock Edition. Its floor is the same in every world, so a search needs no
+seed: `--edition bedrock` in `rokksearch`, or `edition` in `rokktui`. The generator is bit-exact
+with Bedrock Dedicated Server 1.26.52, on CPU and GPU. Bedrock patterns, benchmarks and demos
+work the same way as Java ones.
 
 ## Build - Linux
 
@@ -149,9 +157,11 @@ build/rokktui [--load pattern.txt | --resume session.txt] [--backend auto|cpu|de
 ```
 
 1. **Parameters.** Up/Down/Tab move, type to edit, Left/Right change, `Del` clears.
-   - `seed` - number or text (text is hashed like Minecraft does).
+   - `edition` - `Java` or `Bedrock`.
+   - `seed` - number or text (text is hashed like Minecraft does). Not used on Bedrock.
    - `width`/`height` - pattern size, up to 32x32.
    - `Y layer` - `-64 ... -59`. Use `-60`: it has the most detail (P(bedrock) = 0.2).
+     On Bedrock, `-64` and `-63` are solid and `-62 ... -60` have P = 0.75, 0.5, 0.25.
    - `center X/Z`, `radius` - the square to search. `radius -1` = the whole world inside the
      +/-29,999,984 border.
    - `orientations` - `all 8` tries every rotation/mirror, so the picture needn't face north.
@@ -189,9 +199,10 @@ rokksearch --pattern p.txt --center 0,0 --radius 2000000 --backend opencl:0
 rokksearch --pattern p.txt --region -1000000,1000000,-500000,500000 --orientations exact
 ```
 
-Progress (with ETA) goes to stderr, matches (`x z orient_mask`) to stdout. `--json` for
-machine output, `--checkpoint FILE` to make a run resumable (Ctrl-C, then rerun),
-`--first` to stop at the first match, `--help` for the rest.
+Progress (with ETA) goes to stderr, matches (`x z orient_mask`) to stdout.
+`--edition bedrock` searches Bedrock Edition's floor (or put `edition bedrock` in the pattern
+file). `--json` for machine output, `--checkpoint FILE` to make a run resumable (Ctrl-C, then
+rerun), `--first` to stop at the first match, `--help` for the rest.
 
 The search spirals out from the region's center (spawn, for `--radius -1`). With `--first`, a
 target 14k blocks from spawn takes ~0.3 s and one 3M out ~3 min, against ~6.7 h for the whole
@@ -204,9 +215,9 @@ rokksearch --demo 5m                   # random seed and spot, sized to take ~5 
 rokksearch --pattern demo_pattern.txt  # finds the spot it printed as "expect match"
 ```
 
-Time is `90`, `90s`, `5m`, `2h`, or `max` (the whole world). Also `--out`, `--seed`, `--y -63..-60`,
-`--backend`, `--orientations exact`. The pattern is copied from the real world there and grown
-until a second match is unlikely.
+Time is `90`, `90s`, `5m`, `2h`, or `max` (the whole world). Also `--out`, `--seed`,
+`--y -63..-60` (`-62..-60` with `--edition bedrock`), `--backend`, `--orientations exact`. The
+pattern is copied from the real world there and grown until a second match is unlikely.
 
 **Pattern file** (what `rokktui` saves):
 
@@ -230,9 +241,9 @@ at (1036, -966); `rokksearch --pattern` on it prints the single match `1038 -964
 
 A match `(x, z)` is the world position of the pattern's *anchor*: a rare cell near its
 middle, not the top-left corner. A saved session adds `checkpoint <file>` (and
-`stop_at_first yes`) before `size`.
+`stop_at_first yes`) before `size`; a Bedrock Edition pattern starts with `edition bedrock`.
 
-### `dump_bedrock` - print a region
+### `dump_bedrock` - print a region (Java Edition)
 
 ```sh
 $ build/dump_bedrock <seed> <x0> <z0> <width> <height> [y|all]
@@ -254,6 +265,7 @@ Rows are z (south = down), columns x (east = right), `X` = bedrock.
 #include "gen/bedrock.hpp"
 rokkdoxx::BedrockGenerator gen(12345);
 bool b = gen.is_bedrock_floor(100, -61, -40);
+rokkdoxx::BedrockGenerator be(0, rokkdoxx::Edition::bedrock);  // seed not used
 ```
 
 Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_client("auto")`.
@@ -264,6 +276,13 @@ Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_c
   `y = -64` always bedrock, `-63 ... -60` with probability 0.8 ... 0.2, `>= -59` never. It depends
   only on seed and coordinates (no biome, terrain or structures), so no game engine is needed.
 - The RNG is Xoroshiro128++ positional randomness, unchanged since Java 1.18.
+- Bedrock Edition is a different generator, worked out from Bedrock Dedicated Server 1.26.52
+  and checked block for block against it: `y = -64` and `-63` are solid, and each column's top
+  is `-63 + r`, `r = 0 ... 3`. For chunk `(cx, cz)`, `r` is MT19937 seeded with
+  `cx * 341872712 + cz * 132899541` (32-bit), one draw per column (x-major), mod 4. No world
+  seed. Past +/-16,777,216 the game reads columns at float-rounded positions, so odd x / z show
+  a neighbour's column; RokkDoxx does the same. The GPU draws it a chunk pair per work-item into
+  the same bit-plane.
 - Vanilla places bedrock when `(double)nextFloat() < prob`. The host precomputes
   `threshold = ceil(prob * 2^24)` and every device compares `bits24 < threshold`: integer-only,
   no fp64, so the GPU is bit-exact with the CPU.
@@ -273,7 +292,7 @@ Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_c
   then 32 candidates are tested at a time with word operations. Generation is the expensive
   part, so all 8 orientations cost little more than one.
 - Three tiers in one process: front-ends (`rokktui`, `rokksearch`) -> `SearchService`
-  (tiling, scheduling, dedup, progress, cancel, checkpoints) -> one `Worker` (`CpuWorker` or
+  (tiling, scheduling, progress, cancel, checkpoints) -> one `Worker` (`CpuWorker` or
   `OpenclWorker`). The service scans in a spiral from the region's center, can pause, keeps its
   progress as checkpoint text, and reports a per-area state map that `rokktui` draws.
 
@@ -282,17 +301,19 @@ Link `rokkdoxx_gen`; for searches, link `rokksvc` and use `rokkdoxx::svc::make_c
 `G` = 10^9 candidate origins per second. The standard figure is the 15-minute sustained
 all-8 run; the other columns are the ~30 s quick benchmark.
 
-| machine | backend | **sustained all-8 G** (15 min) | exact G | all-8 G | all-8 sym G | notes |
-|---|---|---|---|---|---|---|
-| RX 7900 XTX | opencl | **149.0** (148.6-153.4, -2.7% first->last) | 222.1 | 157.4 | 212.8 | ROCm, 48 CU |
-| Ryzen 5 5600 | cpu | - | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 |
-| RX 9060 XT | opencl | **76.85** (75.00-77.50, +3.0% first->last) | 98.91 | 76.31 | 88.30 | AMD-APP 3679.0, 16 CU |
-| Ryzen 5 7600X3D | cpu | - | 1.25 | 0.48 | 1.18 | 12 threads, msvc 1951 |
-| RTX 4060 Laptop GPU | opencl | - | 97.05 | 70.79 | 89.41 | CUDA, 24 CU |
-| Intel Ultra 9 185H | cpu | - | 0.97 | 0.45 | 1.10 | 22 threads, msvc 1951 |
-| Intel Arc Graphics (Ultra 9 185H) | opencl | - | 33.70 | 26.91 | 31.76 | NEO, 128 CU |
-| Apple M5 GPU | opencl | **25.19** (25.92-19.87, -19.1% first->last) | 40.51 | 25.90 | 40.23 | OpenCL, 10 CU |
-| Apple M5 CPU | cpu | - | 1.11 | 0.55 | 1.22 | 10 threads, Clang |
+| machine | backend | version | **sustained all-8 G** (15 min) | exact G | all-8 G | all-8 sym G | notes |
+|---|---|---|---|---|---|---|---|
+| RX 7900 XTX | opencl | v1.0 | **149.0** (148.6-153.4, -2.7% first->last) | 222.1 | 157.4 | 212.8 | ROCm, 48 CU |
+| Ryzen 5 5600 | cpu | v1.0 | - | 1.42 | 0.61 | 1.43 | 12 threads, gcc 16 |
+| RX 9060 XT | opencl | v1.0 | **76.85** (75.00-77.50, +3.0% first->last) | 98.91 | 76.31 | 88.30 | AMD-APP 3679.0, 16 CU |
+| Ryzen 5 7600X3D | cpu | v1.0 | - | 1.25 | 0.48 | 1.18 | 12 threads, msvc 1951 |
+| RTX 4060 Laptop GPU | opencl | v1.0 | - | 97.05 | 70.79 | 89.41 | CUDA, 24 CU |
+| Intel Ultra 9 185H | cpu | v1.0 | - | 0.97 | 0.45 | 1.10 | 22 threads, msvc 1951 |
+| Intel Arc Graphics (Ultra 9 185H) | opencl | v1.0 | - | 33.70 | 26.91 | 31.76 | NEO, 128 CU |
+| Apple M5 GPU | opencl | v1.0 | **25.19** (25.92-19.87, -19.1% first->last) | 40.51 | 25.90 | 40.23 | OpenCL, 10 CU |
+| Apple M5 CPU | cpu | v1.0 | - | 1.11 | 0.55 | 1.22 | 10 threads, Clang |
+| RX 7900 XTX | opencl | v1.1 | - | 270.9 | 174.4 | 242.8 | **Bedrock Edition**, ROCm, 48 CU |
+| Ryzen 5 5600 | cpu | v1.1 | - | 0.72 | 0.41 | 0.72 | **Bedrock Edition**, 12 threads, gcc 16 |
 
 A whole-world sweep (3.6e15 candidates) depends on your GPU. Time (hours) ~= 1000 / throughput (Gcands/s).
 Don't see your GPU in the benchmarks? Estimate it or run one. Submit a pull request with the result so it can be added to the table.
@@ -303,10 +324,11 @@ build/rokksearch --benchmark-long 15   # standard: sustained all-8, ~30 s sweeps
 build/rokksearch --benchmark           # quick: exact / all-8 / all-8 symmetric
 ```
 
-Both use a fixed workload (seed 0, a 6x6 pattern), so results compare across machines;
-`--backend cpu` for the CPU (or `dedicated` / `integrated` to pick a GPU by kind, `opencl:N` by
-index; plain `auto` prefers dedicated, then integrated, then cpu), `--json` for a pasteable result. `--benchmark-long` also checks
-that every sweep returns the identical matches (count + hash) and exits 1 if not, which
+Both use a fixed workload (seed 0, a 6x6 pattern), so results compare across machines
+(`--edition bedrock` runs it on Bedrock Edition's floor); `--backend cpu` for the CPU (or
+`dedicated` / `integrated` to pick a GPU by kind, `opencl:N` by index; plain `auto` prefers
+dedicated, then integrated, then cpu), `--json` for a pasteable result. `--benchmark-long` also
+checks that every sweep returns the identical matches (count + hash) and exits 1 if not, which
 catches throttling or a device that goes wrong under heat.
 
 ## Status
@@ -314,6 +336,7 @@ catches throttling or a device that goes wrong under heat.
 | | Feature | Notes |
 |:-:|---|---|
 | [x] | Overworld bedrock-floor generation | bit-exact vs Java RNG vectors + a Python reference |
+| [x] | Bedrock Edition floor | `--edition bedrock`; bit-exact vs Bedrock Dedicated Server 1.26.52 |
 | [x] | CPU search | multi-threaded |
 | [x] | OpenCL GPU search | bit-plane kernel, bit-exact with the CPU |
 | [x] | All 8 orientations | shared anchor, symmetric patterns collapsed |
@@ -334,7 +357,8 @@ catches throttling or a device that goes wrong under heat.
 ## Verification
 
 `ctest` runs: the generator against Java-generated RNG vectors and byte-for-byte against the
-Python reference (`test_bedrock`, `diff_test.py`); the search against a brute-force scan, across
+Python reference, and Bedrock Edition's against floors read back from Bedrock Dedicated Server
+(`test_bedrock`, `diff_test.py`); the search against a brute-force scan, across
 tile sizes, scan order, pause/resume and checkpoints (`test_search`); GPU vs CPU bit-exactness
 and search parity (`test_gpu`, needs a device); the TUI without a terminal, including
 pause/save/resume (`test_tui`); and `--demo` plus session resume end to end (`demo_test.py`).

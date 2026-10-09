@@ -7,6 +7,7 @@
 #include <tuple>
 #include <utility>
 
+#include "gen/bedrock.hpp"
 #include "gen/bedrock_core.h"
 
 #ifdef ROKK_ENABLE_OPENCL
@@ -15,24 +16,37 @@
 
 namespace rokkdoxx::svc {
 
-// --- search plan ----------------------------------------------------------
+// --- search prep ----------------------------------------------------------
+
+Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h, Edition edition) {
+    const BedrockGenerator gen(seed, edition);
+    Pattern p;
+    p.w = w;
+    p.h = h;
+    p.cells.resize(static_cast<std::size_t>(w) * h);
+    for (int j = 0; j < h; ++j)
+        for (int i = 0; i < w; ++i)
+            p.cells[static_cast<std::size_t>(j) * w + i] =
+                gen.is_bedrock_floor(x0 + i, y, z0 + j) ? Cell::bedrock : Cell::not_bedrock;
+    return p;
+}
+
+WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition) {
+    const BedrockGenerator gen(seed, edition);
+    WorkerConfig cfg;
+    cfg.edition = edition;
+    cfg.derived_lo = gen.derived_lo();
+    cfg.derived_hi = gen.derived_hi();
+    cfg.plane_y = plane_y;
+    cfg.threshold = gen.threshold(plane_y);
+    return cfg;
+}
 
 SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
                              bool all_orientations) {
     SearchPlan plan;
     const bool bedrock_rare = threshold <= (1u << 23);
     const std::uint8_t rare_want = bedrock_rare ? 1 : 0;
-
-    // Nothing constrains the search -> "match any bedrock block".
-    if (knowns.empty()) {
-        plan.n_cells = 1;
-        plan.n_variants = 1;
-        plan.want = {1};
-        plan.off_x = {0};
-        plan.off_z = {0};
-        plan.variant_mask = {static_cast<std::uint8_t>(all_orientations ? 0xFF : 0x01)};
-        return plan;
-    }
 
     // Fail-fast order: rarer cell type first, so a wrong candidate is usually
     // rejected on cell 1 (of each variant).
@@ -120,8 +134,6 @@ CpuWorker::CpuWorker(unsigned threads) : threads_(threads) {
     if (threads_ == 0) threads_ = 1;
 }
 
-std::string CpuWorker::name() const { return "cpu (" + std::to_string(threads_) + " threads)"; }
-
 void CpuWorker::configure(const WorkerConfig& cfg) {
     cfg_ = cfg;
     plan_ = build_search_plan(cfg.knowns, cfg.threshold, cfg.all_orientations);
@@ -141,9 +153,41 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     const SearchPlan& p = plan_;
     const int nc = p.n_cells;
 
+    auto java_bed = [&](std::int64_t x, std::int64_t z) {
+        return static_cast<int>(rk_bits24_at(dlo, dhi, static_cast<int>(x), y, static_cast<int>(z)) < thr);
+    };
+
+    // Bedrock Edition makes a whole chunk at a time, so draw every chunk the
+    // pattern can reach from this tile first: 16 row masks each (bedrock_core.h).
+    std::vector<std::uint32_t> chunks;
+    int c0x = 0, c0z = 0, ncx = 0;
+    if (cfg_.edition == Edition::bedrock) {
+        const auto [lox, hix] = std::minmax_element(p.off_x.begin(), p.off_x.end());
+        const auto [loz, hiz] = std::minmax_element(p.off_z.begin(), p.off_z.end());
+        c0x = rk_be_coord(static_cast<int>(tile.x0 + *lox)) >> 4;
+        c0z = rk_be_coord(static_cast<int>(tile.z0 + *loz)) >> 4;
+        ncx = (rk_be_coord(static_cast<int>(tile.x0 + tile.w - 1 + *hix)) >> 4) - c0x + 1;
+        const int ncz = (rk_be_coord(static_cast<int>(tile.z0 + tile.h - 1 + *hiz)) >> 4) - c0z + 1;
+        chunks.resize(static_cast<std::size_t>(ncx) * ncz * 16);
+        std::vector<std::thread> fill;
+        for (int t = 0; t < T; ++t)
+            fill.emplace_back([&, t] {
+                for (int j = t; j < ncz; j += T)
+                    for (int i = 0; i < ncx; ++i)
+                        rk_be_chunk_rows(c0x + i, c0z + j, y + 63,
+                                         &chunks[(static_cast<std::size_t>(j) * ncx + i) * 16]);
+            });
+        for (auto& th : fill) th.join();
+    }
+    auto be_bed = [&](std::int64_t x, std::int64_t z) {
+        const int sx = rk_be_coord(static_cast<int>(x)), sz = rk_be_coord(static_cast<int>(z));
+        const std::size_t c = static_cast<std::size_t>((sz >> 4) - c0z) * ncx + ((sx >> 4) - c0x);
+        return static_cast<int>((chunks[c * 16 + (sz & 15)] >> (sx & 15)) & 1u);
+    };
+
     // Thread t handles every T-th row of the tile (z = t, t+T, t+2T, ...).
     // (x, z) is the candidate world position of the anchor cell (plan cell 0).
-    auto work = [&](int t) {
+    auto work = [&](int t, auto bed) {
         auto& out = buckets[static_cast<std::size_t>(t)];
         for (int dz = t; dz < tile.h; dz += T) {
             const std::int64_t z = tile.z0 + dz;
@@ -151,8 +195,7 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
                 const std::int64_t x = tile.x0 + dx;
 
                 // Shared anchor: one test rejects every orientation at once.
-                const int abed = rk_bits24_at(dlo, dhi, static_cast<int>(x), y,
-                                              static_cast<int>(z)) < thr;
+                const int abed = bed(x, z);
                 if (abed != static_cast<int>(p.want[0])) continue;
 
                 std::uint8_t mask = 0;
@@ -161,9 +204,7 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
                     const std::int32_t* oz = &p.off_z[static_cast<std::size_t>(v) * nc];
                     bool ok = true;
                     for (int c = 1; c < nc; ++c) {
-                        const int bed = rk_bits24_at(dlo, dhi, static_cast<int>(x + ox[c]), y,
-                                                     static_cast<int>(z + oz[c])) < thr;
-                        if (bed != static_cast<int>(p.want[c])) {
+                        if (bed(x + ox[c], z + oz[c]) != static_cast<int>(p.want[c])) {
                             ok = false;
                             break;  // first mismatch -> this variant fails
                         }
@@ -182,7 +223,9 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
 
     std::vector<std::thread> pool;
     pool.reserve(static_cast<std::size_t>(T));
-    for (int t = 0; t < T; ++t) pool.emplace_back(work, t);
+    for (int t = 0; t < T; ++t)
+        if (cfg_.edition == Edition::bedrock) pool.emplace_back([&, t] { work(t, be_bed); });
+        else pool.emplace_back([&, t] { work(t, java_bed); });
     for (auto& th : pool) th.join();
 
     std::vector<Match> merged;
@@ -197,8 +240,8 @@ std::vector<BackendInfo> list_backends() {
     {
         BackendInfo cpu;
         cpu.id = "cpu";
-        cpu.label = CpuWorker().name();
-        cpu.units = static_cast<int>(std::thread::hardware_concurrency());
+        cpu.units = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));  // as CpuWorker
+        cpu.label = "cpu (" + std::to_string(cpu.units) + " threads)";
         out.push_back(std::move(cpu));
     }
 #ifdef ROKK_ENABLE_OPENCL
