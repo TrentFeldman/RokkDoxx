@@ -110,6 +110,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    {
+        const tui::TermSize sz = tui::size();
+        if (resume_path.empty() && sz.cols >= tui::kSplashNeedCols && sz.rows >= tui::kSplashNeedRows)
+            app.screen = tui::Screen::splash;
+    }
     redraw();
     // One tick: wait up to 100 ms for a key, advance the animation clock, pull
     // the job's latest status, apply the key, repaint (only changed rows go

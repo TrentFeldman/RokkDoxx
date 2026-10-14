@@ -705,6 +705,32 @@ void test_grid_typing() {
           "the last cell holds the cursor");
 }
 
+// The start-up banner: drawn only when asked for, fits the size rokktui requires, and any key
+// moves on to the parameters.
+void test_splash() {
+    App app;
+    app.screen = Screen::splash;
+    const auto rows = screen_rows(render(app, kSplashNeedCols, kSplashNeedRows));
+    check(!rows.empty() && rows.rbegin()->first <= kSplashNeedRows, "the banner and its prompt fit the minimum terminal");
+    bool prompt = false, logo = false;
+    for (const auto& [row, text] : rows) {
+        prompt |= text.find("press any key") != std::string::npos;
+        logo |= text.find("\xe2\x96\x88\xe2\x96\x88") != std::string::npos;  // block characters
+    }
+    check(prompt && logo, "the banner shows the logo and a prompt");
+    check(App().screen == Screen::params, "a fresh App still starts on the parameters");
+    // It moves: the frames differ over time, and within the first pass the beam stops on a spot.
+    const std::string first = render(app, kSplashNeedCols, kSplashNeedRows);
+    bool moved = false, locked = false;
+    for (app.now_ms = 100; app.now_ms < 6000; app.now_ms += 100) {
+        const std::string f = render(app, kSplashNeedCols, kSplashNeedRows);
+        moved |= f != first;
+        locked |= f.find("pattern locked") != std::string::npos;
+    }
+    check(moved && locked, "the banner animates and the beam locks onto a spot");
+    check(handle_key(app, 'q') && app.screen == Screen::params, "any key (even q) goes on to the parameters");
+}
+
 int main() {
     test_file_round_trip();
     test_build_request_errors();
@@ -726,5 +752,6 @@ int main() {
     test_continue_after_stop();
     test_running_search_ignores_stray_keys();
     test_grid_typing();
+    test_splash();
     return report();
 }

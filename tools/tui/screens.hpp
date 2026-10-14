@@ -25,8 +25,9 @@ namespace rokkdoxx::tui {
 //   params --Enter--> grid --Enter--> result (start_search)
 //   grid --Tab--> params      result --Enter/Esc/q, once stopped--> grid
 //   params `L`, grid `S`, result `S`/`s` --> prompt --Enter/Esc--> back
+//   splash (rokktui's first screen, when the terminal is big enough) --any key--> params
 //   quit: q / Esc on params, q on grid (never while a search runs)
-enum class Screen { params, grid, result, prompt };
+enum class Screen { params, grid, result, prompt, splash };
 
 // All of rokktui's state: the Model being edited, UI cursors, the search
 // client and the job being shown, and the map animation bookkeeping. One App
@@ -88,6 +89,9 @@ bool select_backend(App& app, const std::string& id, std::string& err);
 // (term_cols/rows, used to size the next search's map) and the result list's
 // page height.
 void draw(App& app, Frame& fr);
+
+// Rows and columns the start-up banner needs (rokktui.cpp starts on Screen::splash only if the terminal has them).
+constexpr int kSplashNeedRows = 23, kSplashNeedCols = 79;
 
 // Handle one key. Returns false when the user asked to quit.
 bool handle_key(App& app, int key);
