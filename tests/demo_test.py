@@ -99,6 +99,10 @@ def main(exe):
         if run([exe, "--demo", "1", "--edition", "bedrock", "--y", "-63", "--backend", "cpu", "--out", path]).returncode != 2:
             print("FAIL: --y -63 should be rejected on Bedrock (it is solid there)")
             failures += 1
+        for bad in ("-3x4", "0x5", "33x1", "99999999x99999999", "8"):
+            if run([exe, "--size", bad, "--center", "0,0", "--backend", "cpu"]).returncode != 2:
+                print(f"FAIL: --size {bad!r} should be rejected")
+                failures += 1
     return failures
 
 

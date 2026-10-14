@@ -259,11 +259,26 @@ RK_INLINE void rk_be_chunk_rows(rk_i32 cx, rk_i32 cz, rk_i32 need, rk_u32 *rows)
 /* The game reads the column at the block position rounded through a float, so
  * past +/-2^24 an odd x or z shows its neighbour's column.
  * (A float has a 24-bit mantissa: beyond 2^24 only even integers are
- * representable, beyond 2^25 only multiples of 4, and so on. The cast rounds
- * to nearest, ties to even.) Callers convert BOTH x and z through this before
- * picking the chunk and the bit. The service refuses Bedrock Edition regions
- * past +/-2^25 because the GPU's remap_plane_be only handles the one-block
- * shift of the 2^24..2^25 band. */
-RK_INLINE rk_i32 rk_be_coord(rk_i32 v) { return (rk_i32)(float)v; }
+ * representable, beyond 2^25 only multiples of 4, and so on. The game's cast
+ * rounds to nearest, ties to even.) Callers convert BOTH x and z through this
+ * before picking the chunk and the bit. The service refuses Bedrock Edition
+ * regions past +/-2^25 because the GPU's remap_plane_be only handles the
+ * one-block shift of the 2^24..2^25 band.
+ *
+ * The rounding is done in integers, not as (int)(float)v: MSVC's optimizer
+ * drops that round trip in some inlined call sites (seen on Windows: the
+ * x/z = 2^24 + odd checks in tests/test_bedrock.cpp failed). Identical to the
+ * float cast for every int in [-2^28, 2^28], checked exhaustively. */
+RK_INLINE rk_i32 rk_be_coord(rk_i32 v) {
+    rk_u32 a = v < 0 ? 0u - (rk_u32)v : (rk_u32)v; /* |v| */
+    if (a < (1u << 24)) return v;
+    int s = 1; /* low bits a float can't hold */
+    while ((a >> s) >= (1u << 24)) ++s;
+    const rk_u32 tie = 1u << (s - 1), rem = a & ((1u << s) - 1u);
+    rk_u32 q = a >> s;
+    if (rem > tie || (rem == tie && (q & 1u))) ++q; /* nearest, ties to even */
+    a = q << s;
+    return v < 0 ? (rk_i32)(0u - a) : (rk_i32)a;
+}
 
 #endif /* ROKKDOXX_BEDROCK_CORE_H */

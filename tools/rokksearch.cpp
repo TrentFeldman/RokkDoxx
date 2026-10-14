@@ -709,11 +709,11 @@ int main(int argc, char** argv) {
     // in that error.
     if (size_s && req.pattern.w == 0) {
         long long w, h;
-        if (std::sscanf(size_s, "%lldx%lld", &w, &h) == 2) {
-            req.pattern.w = static_cast<int>(w);
-            req.pattern.h = static_cast<int>(h);
-            req.pattern.cells.assign(static_cast<std::size_t>(w) * h, Cell::unknown);
-        }
+        if (std::sscanf(size_s, "%lldx%lld", &w, &h) != 2 || w < 1 || h < 1 || w > kMaxDim || h > kMaxDim)
+            usage(2);
+        req.pattern.w = static_cast<int>(w);
+        req.pattern.h = static_cast<int>(h);
+        req.pattern.cells.assign(static_cast<std::size_t>(w * h), Cell::unknown);
     }
 
     if (region_s) {

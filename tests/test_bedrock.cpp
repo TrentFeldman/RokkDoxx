@@ -237,6 +237,13 @@ void test_bedrock_edition() {
                           "bedrock edition " + std::to_string(x) + " " + std::to_string(y) + " " + std::to_string(z));
                 }
 
+    // rk_be_coord: float rounding done in integers (nearest, ties to even).
+    const int coords[][2] = {{5, 5}, {16777215, 16777215}, {16777217, 16777216}, {16777219, 16777220},
+                             {16777218, 16777218}, {-16777217, -16777216}, {-16777219, -16777220},
+                             {33554434, 33554432}, {33554438, 33554440}, {-29999101, -29999100}};
+    for (const auto& c : coords)
+        check(rk_be_coord(c[0]) == c[1], "rk_be_coord(" + std::to_string(c[0]) + ")");
+
     // rk_be_chunk_rows walks MT19937 with cursors; std::mt19937 is the textbook one.
     std::mt19937 pick(1);
     for (int t = 0; t < 50; ++t) {
