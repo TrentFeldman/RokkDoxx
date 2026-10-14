@@ -6,6 +6,9 @@
 // Bedrock fingerprints come from the independent Python reference
 // (tests/reference/bedrock_ref.py), itself validated against the same Java
 // vectors. The broad C++/Python cross-check is a separate ctest.
+//
+// ctest name: unit. If this fails, the generator itself is wrong, and every
+// search result is suspect -- fix this before looking at search/GPU tests.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +45,7 @@ float next_float(rk_u64* lo, rk_u64* hi) {
 
 // ---------------------------------------------------------------------------
 
+// rk_xoro_seed == Java's Xoroshiro128PlusPlus(long) constructor.
 void test_seed_upgrade() {
     std::printf("test_seed_upgrade\n");
     // (seed, expected mixed lo, expected mixed hi)  -- Java-generated
@@ -65,6 +69,7 @@ void test_seed_upgrade() {
     }
 }
 
+// rk_xoro_next == Java's nextLong(), three steps from each seed.
 void test_next_long() {
     std::printf("test_next_long\n");
     struct C {
@@ -86,6 +91,7 @@ void test_next_long() {
     }
 }
 
+// The top-24-bits float Java derives from nextLong (what the gradient compares).
 void test_next_float() {
     std::printf("test_next_float\n");
     struct C {
@@ -131,6 +137,7 @@ void test_block_pos_seed() {
     }
 }
 
+// The whole fork chain in BedrockGenerator's constructor, end to end.
 void test_floor_factory() {
     std::printf("test_floor_factory\n");
     // Derived positional-factory seeds for "minecraft:bedrock_floor", seed 0.
@@ -164,7 +171,9 @@ void test_gradient_shape() {
     }
 }
 
-// FNV-1a over a bedrock bitfield; matches tests/reference/bedrock_ref.py's fnv().
+// FNV-1a over a bedrock bitfield. The expected values below come from running
+// this same loop over tests/reference/bedrock_ref.py's BedrockGenerator (that
+// file has no FNV helper of its own; it is a few lines of Python).
 std::uint64_t fnv_grid(std::int64_t seed, int y, int x0, int z0, int n) {
     rokkdoxx::BedrockGenerator g(seed);
     std::uint64_t h = 0xcbf29ce484222325ULL;
@@ -183,6 +192,8 @@ void test_grid_fingerprints() {
     expect_u64(fnv_grid(0, -62, -48, -48, 96), 0x22b2792f67a79145ULL, "fnv seed 0 y=-62 neg origin");
 }
 
+// Exact per-layer bedrock counts in a fixed square (catches threshold errors
+// the statistical test above is too loose to see).
 void test_counts_reference() {
     std::printf("test_counts_reference\n");
     // seed 0, 64x64 at origin -- exact counts from the Python reference.

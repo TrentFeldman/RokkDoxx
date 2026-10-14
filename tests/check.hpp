@@ -1,4 +1,7 @@
 // The tests' whole framework: count failures, print them, return the exit code.
+// A test calls check(cond, "what") as often as it likes (a failure doesn't
+// stop the test), and main() ends with `return report();` so ctest sees a
+// non-zero exit if anything failed.
 #pragma once
 
 #include <cstdio>

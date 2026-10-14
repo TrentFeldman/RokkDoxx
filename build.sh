@@ -4,6 +4,12 @@
 #
 # OpenCL: set ROKK_OPENCL=1 to compile the GPU worker (needs opencl-headers +
 # libOpenCL). Off by default so this works on a bare box.
+#
+#   ./build.sh          build everything into build/
+#   ./build.sh test     build, then run every test (what ctest runs)
+# Each binary is compiled from all of its sources in one compiler call (no
+# object files, no incremental builds). Writes to the same build/ directory
+# CMake's examples use, so it overwrites binaries from a CMake build there.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
@@ -43,7 +49,7 @@ if [[ "${ROKK_OPENCL:-0}" == "1" ]]; then
   GPU_TEST="build/test_gpu"
 fi
 
-CORE=(src/gen/bedrock.cpp "${SVC[@]}")
+CORE=(src/gen/bedrock.cpp "${SVC[@]}")  # = CMake's rokkdoxx_gen + rokksvc
 
 "$CXX" "${FLAGS[@]}" tools/dump_bedrock.cpp src/gen/bedrock.cpp -o build/dump_bedrock
 TUI=(tools/tui/model.cpp tools/tui/frame.cpp tools/tui/screens.cpp)

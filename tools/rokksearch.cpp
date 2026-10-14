@@ -4,6 +4,16 @@
 //   (see --help for all options)
 //
 // Streams a progress line to stderr; prints matches ("x z mask") to stdout.
+//
+// Modes (chosen in main(), first match wins):
+//   --list-backends            print list_backends() and exit
+//   --demo <time>              demo::run   -- write a plantable pattern file
+//   --benchmark[-long]         bmark::run  -- fixed workload, drives a Worker
+//                                             directly (no SearchService)
+//   otherwise                  a normal search through SearchClient (the same
+//                              path rokktui uses)
+// Exit codes: 0 ok, 1 runtime failure (bad backend, job error, file I/O, an
+// inconsistent --benchmark-long), 2 bad command line.
 #include <csignal>
 #include <algorithm>
 #include <chrono>
@@ -49,12 +59,10 @@ namespace {
                  "  --first               stop at the first match (the search scans outward from\n"
                  "                        the middle of the region, so this finds the nearest)\n"
                  "  --cap <n>             max matches to keep (default 1048576)\n"
-                 "  --tile <n>            tile side floor (default 4096)\n"
                  "  --checkpoint <file>   resumable progress file\n"
                  "  --backend <id>        cpu | dedicated | integrated | opencl:N | auto (default auto:\n"
                  "                        dedicated GPU, else integrated GPU, else cpu)\n"
                  "  --json               machine-readable output\n"
-                 "  --bench              measure the search you asked for (rate only)\n"
                  "  --benchmark          run the standard reproducible benchmark\n"
                  "                       (fixed workload; ignores --seed/--pattern/--region;\n"
                  "                       --edition bedrock benchmarks Bedrock Edition's floor)\n"
@@ -70,14 +78,6 @@ namespace {
                  "  --out <file>          where --demo writes (default demo_pattern.txt)\n"
                  "  --list-backends\n");
     std::exit(code);
-}
-
-bool parse2(const char* s, long long& a, long long& b, char sep) {
-    const char* p = std::strchr(s, sep);
-    if (!p) return false;
-    a = std::atoll(std::string(s, p).c_str());
-    b = std::atoll(p + 1);
-    return true;
 }
 
 // "90" / "90s" / "5m" / "1.5h" -> seconds; "max" -> `max` (the whole world).
@@ -147,6 +147,9 @@ struct Digest {
 // One timed sweep of `region` through an already-configured worker. Mirrors
 // SearchService::run()'s pump loop (two tiles in flight) so the benchmark
 // measures the overlapped path the service ships with.
+// If you change the pump's depth or order there, change it here too, or the
+// benchmark stops measuring what users run. `d`, if given, collects an
+// order-independent digest of the matches (for --benchmark-long).
 inline double sweep(Worker& w, const Region& region, int tile_side, Digest* d = nullptr) {
     TileScheduler sched(region, tile_side);
     Tile t;
@@ -177,32 +180,18 @@ inline double sweep(Worker& w, const Region& region, int tile_side, Digest* d = 
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-inline long long candidates_of(long r) {
-    const long long side = 2LL * r + 1;
-    return side * side;
-}
-
-// radius whose region has ~`cand` candidate origins, clamped to sane bounds.
-inline long radius_for(double cand, double cap = static_cast<double>(kMaxCandidates)) {
-    if (cand > cap) cand = cap;
-    long r = static_cast<long>((std::sqrt(cand) - 1.0) / 2.0);
-    return r < 1000 ? 1000 : r;
-}
-
-// Extrapolate from one measured sweep to the radius that should take `target_s`.
-inline long calibrate_from(long r, double elapsed, double target_s,
-                           double cap = static_cast<double>(kMaxCandidates)) {
-    if (elapsed < 1e-6) return radius_for(cap, cap);
-    const double rate = static_cast<double>(candidates_of(r)) / elapsed;  // cand / s
-    return radius_for(rate * target_s, cap);
-}
-
 // Warm up, then size the workload: a radius-3000 probe, then one sweep per target,
-// each extrapolating the radius that takes that many seconds.
+// each extrapolating the radius that takes that many seconds (at least 1000, at
+// most `cap` candidates).
 inline long calibrate(Worker& w, int tile_side, std::initializer_list<double> targets,
                       double cap = static_cast<double>(kMaxCandidates)) {
     long r = 3000;
-    for (double t : targets) r = calibrate_from(r, sweep(w, Region::centered(0, 0, r), tile_side), t, cap);
+    for (double t : targets) {
+        const Region region = Region::centered(0, 0, r);
+        const double el = sweep(w, region, tile_side);
+        const double cand = el < 1e-6 ? cap : std::min(cap, static_cast<double>(region.candidates()) / el * t);
+        r = std::max(1000L, static_cast<long>((std::sqrt(cand) - 1.0) / 2.0));
+    }
     return r;
 }
 
@@ -216,6 +205,8 @@ struct PhaseResult {
     int iters;
 };
 
+// One benchmark phase: configure the worker for this pattern, size the region
+// to ~target_s per sweep, then time `iters` sweeps and keep median/min/max.
 inline PhaseResult run_phase(Worker& w, const char* name, const std::vector<KnownCell>& knowns,
                              bool all_orient, int tile_side, const WorkerConfig& base,
                              double target_s, int iters) {
@@ -225,8 +216,8 @@ inline PhaseResult run_phase(Worker& w, const char* name, const std::vector<Know
     w.configure(cfg);
 
     const long r = calibrate(w, tile_side, {0.4, target_s, target_s});
-    const long long cand = candidates_of(r);
     const Region region = Region::centered(0, 0, r);
+    const long long cand = region.candidates();
 
     std::vector<double> rates, times;
     for (int i = 0; i < iters; ++i) {
@@ -250,6 +241,7 @@ inline PhaseResult run_phase(Worker& w, const char* name, const std::vector<Know
     return pr;
 }
 
+// Host description for the benchmark header (compile-time facts only).
 inline const char* host_os() {
 #if defined(_WIN32)
     return "windows";
@@ -322,7 +314,7 @@ inline int run_long(Worker& w, WorkerConfig cfg, int tile_side, double minutes, 
     const double world = 4.0 * static_cast<double>(Region::kWorldBorder) * Region::kWorldBorder;
     const long r = calibrate(w, tile_side, {2.0, kLongSweepS}, world);
     const Region region = Region::centered(0, 0, r);
-    const long long cand = candidates_of(r);
+    const long long cand = region.candidates();
 
     // Progress lines go to stderr in --json mode so stdout stays one object.
     FILE* out = json ? stderr : stdout;
@@ -400,10 +392,13 @@ inline int open_worker(const std::string& backend_arg, BackendInfo& chosen,
 inline double measure_rate(Worker& w, const WorkerConfig& cfg) {
     w.configure(cfg);
     const int tile_side = std::max(4096, w.preferred_tile_side());
-    const long r = calibrate(w, tile_side, {0.4, 1.0});
-    return static_cast<double>(candidates_of(r)) / sweep(w, Region::centered(0, 0, r), tile_side);
+    const Region region = Region::centered(0, 0, calibrate(w, tile_side, {0.4, 1.0}));
+    return static_cast<double>(region.candidates()) / sweep(w, region, tile_side);
 }
 
+// --benchmark entry point (from main). Three phases on one worker: exact and
+// all-8 with the asymmetric 6x6 pattern, all-8 with the symmetric plus. The
+// kernel is compiled once (open_worker) and only re-specialized per phase.
 inline int run(const std::string& backend_arg, bool json, double target_s, int iters,
                double long_minutes, Edition edition) {
     if (target_s <= 0.05) target_s = 0.05;
@@ -481,6 +476,11 @@ namespace demo {
 constexpr double kMaxExtraMatches = 0.1;  // expected spurious matches we tolerate
 constexpr int kMargin = 40;               // the planted spot stays this far inside the region
 
+// --demo entry point (from main). Steps: pick a seed, measure this machine's
+// rate, size a region for `seconds`, plant a spot inside it, grow a pattern
+// copied from that spot until it is unlikely to match anywhere else, write the
+// pattern file, and print the coordinates the search should report.
+// tests/demo_test.py runs the written file and checks that promise.
 inline int run(const std::string& backend, Edition edition, const char* seed_s, int y, bool all_orient,
                double seconds, bool max, const std::string& out_path) {
     const bool be = edition == Edition::bedrock;
@@ -586,6 +586,9 @@ inline int run(const std::string& backend, Edition edition, const char* seed_s, 
 
 }  // namespace
 
+// Order of precedence for a normal search: explicit flags > the --pattern file >
+// built-in defaults. The region is --region, else --center/--radius, else the
+// file's center/radius.
 int main(int argc, char** argv) {
 #ifdef SIGPIPE
     std::signal(SIGPIPE, SIG_IGN);  // don't die if the reader of stdout goes away
@@ -596,8 +599,7 @@ int main(int argc, char** argv) {
                *region_s = nullptr, *orient_s = nullptr;
     int y = -60;
     std::uint32_t cap = 1u << 20;
-    int tile = 4096;
-    bool json = false, bench = false, benchmark = false, first = false;
+    bool json = false, benchmark = false, first = false;
     double benchmark_seconds = 2.0;
     int benchmark_iters = 5;
     double benchmark_long = 0;
@@ -605,35 +607,37 @@ int main(int argc, char** argv) {
     std::string out_path = "demo_pattern.txt";
     bool have_y = false;
 
+    // Pass 1: collect flags. Nothing is acted on here except --help,
+    // --list-backends and unknown flags (a usage error), so flag order does
+    // not matter.
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto val = [&](const char* /*hint*/) -> const char* {
+        // The flag's value: the next argv entry (usage error if there is none).
+        auto val = [&]() -> const char* {
             if (i + 1 >= argc) usage(2);
             return argv[++i];
         };
         if (a == "-h" || a == "--help") usage(0);
-        else if (a == "--edition") edition_s = val("edition");
-        else if (a == "--seed") seed_s = val("seed");
-        else if (a == "--y") { y = std::atoi(val("y")); have_y = true; }
-        else if (a == "--size") size_s = val("size");
-        else if (a == "--pattern") pattern_path = val("pattern");
-        else if (a == "--center") center_s = val("center");
-        else if (a == "--radius") radius_s = val("radius");
-        else if (a == "--region") region_s = val("region");
-        else if (a == "--orientations") orient_s = val("orientations");
-        else if (a == "--cap") cap = static_cast<std::uint32_t>(std::strtoul(val("cap"), nullptr, 10));
-        else if (a == "--tile") tile = std::atoi(val("tile"));
-        else if (a == "--checkpoint") checkpoint = val("checkpoint");
-        else if (a == "--backend") backend = val("backend");
+        else if (a == "--edition") edition_s = val();
+        else if (a == "--seed") seed_s = val();
+        else if (a == "--y") { y = std::atoi(val()); have_y = true; }
+        else if (a == "--size") size_s = val();
+        else if (a == "--pattern") pattern_path = val();
+        else if (a == "--center") center_s = val();
+        else if (a == "--radius") radius_s = val();
+        else if (a == "--region") region_s = val();
+        else if (a == "--orientations") orient_s = val();
+        else if (a == "--cap") cap = static_cast<std::uint32_t>(std::strtoul(val(), nullptr, 10));
+        else if (a == "--checkpoint") checkpoint = val();
+        else if (a == "--backend") backend = val();
         else if (a == "--first") first = true;
         else if (a == "--json") json = true;
-        else if (a == "--bench") bench = true;
         else if (a == "--benchmark") benchmark = true;
-        else if (a == "--benchmark-seconds") benchmark_seconds = std::atof(val("benchmark-seconds"));
-        else if (a == "--benchmark-iters") benchmark_iters = std::atoi(val("benchmark-iters"));
-        else if (a == "--benchmark-long") { benchmark = true; benchmark_long = std::atof(val("benchmark-long")); }
-        else if (a == "--demo") demo_arg = val("demo");
-        else if (a == "--out") out_path = val("out");
+        else if (a == "--benchmark-seconds") benchmark_seconds = std::atof(val());
+        else if (a == "--benchmark-iters") benchmark_iters = std::atoi(val());
+        else if (a == "--benchmark-long") { benchmark = true; benchmark_long = std::atof(val()); }
+        else if (a == "--demo") demo_arg = val();
+        else if (a == "--out") out_path = val();
         else if (a == "--list-backends") {
             for (const auto& b : list_backends())
                 std::printf("%-10s  %s%s\n", b.id.c_str(), b.label.c_str(),
@@ -668,6 +672,7 @@ int main(int argc, char** argv) {
         return bmark::run(backend, json, benchmark_seconds, benchmark_iters, benchmark_long, edition);
     }
 
+    // Build the SearchRequest: file values first, then explicit flags on top.
     SearchRequest req;
     PatternFile pf;
     if (!pattern_path.empty()) {
@@ -697,12 +702,14 @@ int main(int argc, char** argv) {
     if (orient_s) req.all_orientations = std::strcmp(orient_s, "exact") != 0;
     req.match_cap = cap;
     req.stop_at_first_match = first;
-    req.tile_side = tile;
     req.checkpoint_path = checkpoint;
 
+    // --size without a file gives an all-unknown pattern of that size. The
+    // service rejects a pattern with no known cells, so on its own this ends
+    // in that error.
     if (size_s && req.pattern.w == 0) {
         long long w, h;
-        if (parse2(size_s, w, h, 'x')) {
+        if (std::sscanf(size_s, "%lldx%lld", &w, &h) == 2) {
             req.pattern.w = static_cast<int>(w);
             req.pattern.h = static_cast<int>(h);
             req.pattern.cells.assign(static_cast<std::size_t>(w) * h, Cell::unknown);
@@ -710,18 +717,12 @@ int main(int argc, char** argv) {
     }
 
     if (region_s) {
-        const char* p1 = std::strchr(region_s, ',');
-        if (!p1) usage(2);
-        const char* p2 = std::strchr(p1 + 1, ',');
-        const char* p3 = p2 ? std::strchr(p2 + 1, ',') : nullptr;
-        if (!p2 || !p3) usage(2);
-        req.region.x0 = std::atoll(std::string(region_s, p1).c_str());
-        req.region.x1 = std::atoll(std::string(p1 + 1, p2).c_str());
-        req.region.z0 = std::atoll(std::string(p2 + 1, p3).c_str());
-        req.region.z1 = std::atoll(p3 + 1);
+        long long x0, x1, z0, z1;
+        if (std::sscanf(region_s, "%lld,%lld,%lld,%lld", &x0, &x1, &z0, &z1) != 4) usage(2);
+        req.region = Region{x0, x1, z0, z1};
     } else if (center_s) {
         long long cx, cz;
-        if (!parse2(center_s, cx, cz, ',')) usage(2);
+        if (std::sscanf(center_s, "%lld,%lld", &cx, &cz) != 2) usage(2);
         long long r = radius_s ? std::atoll(radius_s) : 5000;
         req.region = r == -1 ? Region::world() : Region::centered(cx, cz, r);
     } else if (pattern_path.empty()) {  // otherwise the region came from the file
@@ -729,6 +730,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Submit, then poll every 100 ms, redrawing one progress line (\r) on
+    // stderr until the job ends. Ctrl+C kills the process; there is no
+    // graceful cancel here (use --checkpoint to be able to resume).
     std::unique_ptr<SearchClient> client;
     JobId job = 0;
     JobStatus fin;
@@ -761,13 +765,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (bench) {
-        std::printf("%s: %.3f Gcand/s  (%lld candidates in %.2fs, %" PRIu64 " matches%s)\n",
-                    client->backend_name().c_str(), fin.rate / 1e9,
-                    static_cast<long long>(fin.candidates_total), fin.elapsed_s, fin.matches,
-                    fin.truncated ? ", capped" : "");
-        return 0;
-    }
     if (json) {
         std::printf("{\"backend\":\"%s\",\"elapsed_s\":%.3f,\"candidates\":%lld,\"truncated\":%s,\"matches\":[",
                     client->backend_name().c_str(), fin.elapsed_s,

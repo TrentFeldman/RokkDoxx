@@ -1,3 +1,12 @@
+# RokkDoxx build. Targets, bottom of the stack first:
+#   rokkdoxx_gen   static lib: bedrock generation (src/gen)
+#   rokksvc        static lib: search service + workers (src/svc), links gen;
+#                  adds the OpenCL worker when OpenCL is found
+#   rokktui_core   static lib: the TUI minus its terminal backend (tools/tui)
+#   dump_bedrock, rokksearch, rokktui   executables (tools/)
+#   test_*         one executable per C++ test file, registered with ctest
+# build.sh mirrors this for machines without make/ninja; keep the two in sync
+# when adding a source file.
 cmake_minimum_required(VERSION 3.16)
 project(rokkdoxx LANGUAGES CXX)
 
@@ -15,6 +24,7 @@ else()
   add_compile_options(-Wall -Wextra)
 endif()
 
+# ON = use OpenCL if found (falls back to CPU-only with a message if not).
 option(ROKK_ENABLE_OPENCL "Build the OpenCL compute worker" ON)
 
 find_package(Threads REQUIRED)
@@ -53,10 +63,6 @@ if(ROKK_ENABLE_OPENCL)
                  src/gen/bedrock_core.h src/cl/search_tile.cl)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/gen/bedrock_core.h" ROKK_BEDROCK_CORE)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/cl/search_tile.cl" ROKK_SEARCH_TILE)
-    # Normalise line endings so a CRLF checkout (Windows, autocrlf) does not put
-    # stray \r inside the embedded raw-string literals.
-    string(REGEX REPLACE "\r\n" "\n" ROKK_BEDROCK_CORE "${ROKK_BEDROCK_CORE}")
-    string(REGEX REPLACE "\r\n" "\n" ROKK_SEARCH_TILE "${ROKK_SEARCH_TILE}")
     configure_file(
       "${CMAKE_CURRENT_SOURCE_DIR}/src/svc/kernel_sources.h.in"
       "${CMAKE_BINARY_DIR}/generated/kernel_sources.h"
@@ -69,6 +75,8 @@ endif()
 add_library(rokksvc STATIC ${SVC_SOURCES})
 target_include_directories(rokksvc PUBLIC src)
 target_link_libraries(rokksvc PUBLIC rokkdoxx_gen Threads::Threads)
+# ROKK_ENABLE_OPENCL as a *compile definition* is what the C++ checks
+# (#ifdef in workers.cpp etc.); it is PUBLIC so tests and tools see it too.
 if(ROKK_HAVE_OPENCL)
   target_compile_definitions(rokksvc PUBLIC ROKK_ENABLE_OPENCL)
   target_link_libraries(rokksvc PUBLIC OpenCL::OpenCL)
@@ -102,6 +110,8 @@ add_executable(rokktui tools/rokktui.cpp ${ROKKTUI_TERM})
 target_link_libraries(rokktui PRIVATE rokktui_core)
 
 # --- tests -------------------------------------------------------------
+# ctest names: unit, search, tui, gpu (OpenCL builds only), differential and
+# demo (need python3). Run one with `ctest --test-dir build -R search -V`.
 enable_testing()
 
 add_executable(test_bedrock tests/test_bedrock.cpp)

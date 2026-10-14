@@ -1,3 +1,15 @@
+// rokktui's screens. Layout of this file:
+//   colours + small helpers
+//   parameters screen     draw_params / handle_params
+//   pattern grid screen   draw_grid / handle_grid
+//   search map            pick_map_side, track_map, cell_style, draw_map
+//   search / results      start_search, draw_result / handle_result, saving
+//   text prompt           draw_prompt / handle_prompt
+//   public entry points   select_backend, resume_session, draw, handle_key,
+//                         refresh_job, cancel_job (declared in screens.hpp)
+// Every draw_* writes rows into a Frame; every handle_* takes one Key and
+// returns false only to quit. Nothing here blocks: the search is polled by
+// refresh_job once per tick.
 #include "screens.hpp"
 
 #include <algorithm>
@@ -9,6 +21,7 @@ namespace rokkdoxx::tui {
 
 namespace {
 
+// ANSI SGR colour codes (ESC [ ... m). kRst must follow every coloured run.
 const char* kDim = "\x1b[2m";
 const char* kRst = "\x1b[0m";
 const char* kInv = "\x1b[7m";
@@ -29,27 +42,16 @@ void status_line(const App& app, Frame& fr) {
 // parameters
 // ---------------------------------------------------------------------------
 
+// The rows of the params screen, top to bottom; App::field indexes this.
+// Adding a field: add it here, then to kFieldNames, field_value and
+// handle_params' switch.
 enum Field {
     F_EDITION, F_SEED, F_W, F_H, F_Y, F_CX, F_CZ, F_RADIUS, F_ORIENT, F_STOP, F_BACKEND, F_CKPT, F_COUNT
 };
 
-const char* field_name(int f) {
-    switch (f) {
-        case F_EDITION: return "edition";
-        case F_SEED: return "seed";
-        case F_W: return "width";
-        case F_H: return "height";
-        case F_Y: return "Y layer";
-        case F_CX: return "center X";
-        case F_CZ: return "center Z";
-        case F_RADIUS: return "radius (-1=all)";
-        case F_ORIENT: return "orientations";
-        case F_STOP: return "stop at first";
-        case F_BACKEND: return "backend";
-        case F_CKPT: return "checkpoint file";
-    }
-    return "";
-}
+const char* const kFieldNames[F_COUNT] = {
+    "edition", "seed", "width", "height", "Y layer", "center X", "center Z",
+    "radius (-1=all)", "orientations", "stop at first", "backend", "checkpoint file"};
 
 std::string backend_text(const App& app) {
     if (app.backend_idx < 0) return "auto  (" + app.backend_label + ")";
@@ -90,7 +92,7 @@ void draw_params(const App& app, Frame& fr) {
     for (int f = 0; f < F_COUNT; ++f) {
         const bool sel = (f == app.field);
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "  %s %-16s ", sel ? "\xe2\x96\xb6" : " ", field_name(f));
+        std::snprintf(buf, sizeof(buf), "  %s %-16s ", sel ? "\xe2\x96\xb6" : " ", kFieldNames[f]);
         fr.put(buf);
         if (sel) fr.put(kInv);
         fr.put(" " + field_value(app, f) + " ");
@@ -126,7 +128,10 @@ void draw_params(const App& app, Frame& fr) {
     status_line(app, fr);
 }
 
-void edit_text(std::string& s, int key, bool digits_only, bool allow_sign) {
+// Shared line editing for text fields and the prompt: Backspace deletes the
+// last char, Delete clears, printable keys append (digits and a leading '-'
+// only, for numeric fields). No cursor movement within the text.
+void edit_text(std::string& s, int key, bool digits_only) {
     if (key == K_BACKSPACE) {
         if (!s.empty()) s.pop_back();
     } else if (key == K_DELETE) {
@@ -134,13 +139,16 @@ void edit_text(std::string& s, int key, bool digits_only, bool allow_sign) {
     } else if (key >= 32 && key < 127) {
         const char c = static_cast<char>(key);
         if (digits_only) {
-            if ((c >= '0' && c <= '9') || (allow_sign && c == '-' && s.empty())) s.push_back(c);
+            if ((c >= '0' && c <= '9') || (c == '-' && s.empty())) s.push_back(c);
         } else if (s.size() < 240) {
             s.push_back(c);
         }
     }
 }
 
+// Switch to the one-line prompt. On Enter, handle_prompt returns to `ret` and
+// calls `done(app)`, which reads app.prompt_buf (do_load_pattern,
+// do_save_pattern, do_save_matches, do_save_session).
 void begin_prompt(App& app, const std::string& label, Screen ret, void (*done)(App&)) {
     app.prompt_label = label;
     app.prompt_buf.clear();
@@ -180,6 +188,8 @@ void cycle_backend(App& app, int dir) {
     }
 }
 
+// Keys on the params screen. Letters are typed into the free-text fields
+// (seed, checkpoint), so `q` / `L` only act when one of those isn't selected.
 bool handle_params(App& app, int k) {
     Model& m = app.m;
     if (k == 'q' && app.field != F_SEED && app.field != F_CKPT) return false;
@@ -215,13 +225,13 @@ bool handle_params(App& app, int k) {
             if (step != 0 || k == ' ')
                 m.edition = m.edition == svc::Edition::java ? svc::Edition::bedrock : svc::Edition::java;
             break;
-        case F_SEED: edit_text(m.seed, k, false, false); break;
+        case F_SEED: edit_text(m.seed, k, false); break;
         case F_W: m.w = std::clamp(m.w + step, 1, kMaxDim); break;
         case F_H: m.h = std::clamp(m.h + step, 1, kMaxDim); break;
         case F_Y: m.y = std::clamp(m.y + step, -64, -59); break;
-        case F_CX: edit_text(m.cx, k, true, true); break;
-        case F_CZ: edit_text(m.cz, k, true, true); break;
-        case F_RADIUS: edit_text(m.radius, k, true, true); break;
+        case F_CX: edit_text(m.cx, k, true); break;
+        case F_CZ: edit_text(m.cz, k, true); break;
+        case F_RADIUS: edit_text(m.radius, k, true); break;
         case F_ORIENT:
             if (step != 0 || k == ' ') m.all_orient = !m.all_orient;
             break;
@@ -231,8 +241,9 @@ bool handle_params(App& app, int k) {
         case F_BACKEND:
             if (step != 0) cycle_backend(app, step);
             break;
-        case F_CKPT: edit_text(m.checkpoint, k, false, false); break;
+        case F_CKPT: edit_text(m.checkpoint, k, false); break;
     }
+    // The pattern may have shrunk: keep the grid cursor inside it.
     app.gx = std::min(app.gx, m.w - 1);
     app.gy = std::min(app.gy, m.h - 1);
     return true;
@@ -256,6 +267,9 @@ void scroll_to_cursor(App& app, int vis_rows, int vis_cols) {
     fit(app.grid_left, app.gx, vis_cols, app.m.w);
 }
 
+// The pattern editor: header, column index, the visible part of the grid
+// (it scrolls when the window is smaller than the pattern), a summary and the
+// key help. Not const: it updates the scroll position.
 void draw_grid(App& app, Frame& fr) {
     const Model& m = app.m;
     long long r = 0, cx = 0, cz = 0;
@@ -508,6 +522,10 @@ std::string map_caption(const svc::Region& r, const MapView& v) {
 }
 
 // `resume_text`: progress from an earlier run of this same search (empty = start fresh).
+// Called by Enter on the grid, `r` on the result screen, and resume_session.
+// Resets everything the previous job left in App, builds the request from the
+// Model, asks for a map sized to the terminal, and submits. Errors (bad model,
+// backend failure) are shown on the result screen as a job error.
 void start_search(App& app, const std::string& resume_text = "") {
     svc::SearchRequest req;
     std::string err;
@@ -552,6 +570,7 @@ void paint(App& app, svc::Cell c) {
     else if (app.gy + 1 < app.m.h) app.gx = 0, ++app.gy;
 }
 
+// Keys on the pattern grid. Arrows/hjkl wrap around the edges.
 bool handle_grid(App& app, int k) {
     Model& m = app.m;
     switch (k) {
@@ -614,7 +633,7 @@ std::string progress_bar(double frac, int width) {
     return s;
 }
 
-constexpr int kResultFooterRows = 5;
+constexpr int kResultFooterRows = 5;  // rows kept free under the match list
 
 // A stopped search can carry on: cancelled, or ended early at a match.
 bool can_continue(const App& app) {
@@ -623,6 +642,9 @@ bool can_continue(const App& app) {
             (app.jst.state == svc::JobState::done && app.jst.stopped_early));
 }
 
+// The search screen: status lines, then either the live map or (once the job
+// has ended and the map has had its moment) the scrolling match list, then
+// the key help for the current state.
 void draw_result(App& app, Frame& fr) {
     const svc::JobStatus& st = app.jst;
     // Sized from the whole terminal, so this comes before any row is drawn.
@@ -745,6 +767,8 @@ void do_save_session(App& app) {
     app.status = "saved -> " + path + " + " + ckpt + "   (continue later: rokktui --resume " + path + ")";
 }
 
+// Keys on the search screen. While a job runs only p / s / c act; once it
+// has stopped, the list scrolls and S / s / r / m / Enter work.
 bool handle_result(App& app, int k) {
     if (k == 'p' && app.job_running) {
         app.want_pause = !app.want_pause;
@@ -816,12 +840,13 @@ bool handle_prompt(App& app, int k) {
         if (app.prompt_done) app.prompt_done(app);
         return true;
     }
-    edit_text(app.prompt_buf, k, false, false);
+    edit_text(app.prompt_buf, k, false);
     return true;
 }
 
 }  // namespace
 
+// Called at start-up (rokktui.cpp) and by cycle_backend on the params screen.
 bool select_backend(App& app, const std::string& id, std::string& err) {
     try {
         auto c = svc::make_client(id);
@@ -851,6 +876,7 @@ bool resume_session(App& app, const std::string& path, std::string& err) {
     return true;
 }
 
+// Called once per tick by rokktui.cpp's redraw(), right after frame.begin().
 void draw(App& app, Frame& fr) {
     app.term_cols = fr.cols();
     app.term_rows = fr.rows_left();  // nothing is drawn yet: that is the whole height
@@ -872,6 +898,10 @@ bool handle_key(App& app, int key) {
     return true;
 }
 
+// Called once per tick by the main loop (and by tests in a loop). poll() only
+// copies a status, so this never blocks on the search. When the job reaches a
+// final state the results are fetched once and job_running drops to false,
+// which is what unlocks the result screen's other keys.
 void refresh_job(App& app) {
     if (!app.job_running) return;
     try {

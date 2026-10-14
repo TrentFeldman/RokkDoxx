@@ -1,6 +1,11 @@
 // OpenCL bit-exactness + search parity. Requires a working OpenCL device; if
 // none is present the test prints a note and passes (so CI without a GPU is
 // green -- run it on the real device to actually exercise the kernel).
+//
+// ctest name: gpu (OpenCL builds only). Always uses device opencl:0. Every
+// check compares the GPU with the CPU worker, which test_search has already
+// checked against a brute force -- so a failure here points at
+// search_tile.cl / opencl_worker.cpp, not at the generator.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +43,7 @@ const std::vector<Case> kCases = {
     {-9223372036854775807LL - 1, -7, 9, 20, 20},
 };
 
+// Raw Java generation on the GPU (dump_plane) vs BedrockGenerator, block by block.
 void test_dump_bit_exact(OpenclWorker& w) {
     std::printf("test_dump_bit_exact\n");
     for (const Case& c : kCases) {
@@ -57,6 +63,7 @@ void test_dump_bit_exact(OpenclWorker& w) {
     }
 }
 
+// Run `req` to completion on a fresh service with this worker; matches as a map.
 std::map<std::pair<int, int>, std::uint8_t> run(WorkerFactory f, const SearchRequest& req) {
     SearchService svc(std::move(f));
     JobId id = svc.submit(req);
@@ -75,6 +82,7 @@ std::map<std::pair<int, int>, std::uint8_t> run(WorkerFactory f, const SearchReq
     return m;
 }
 
+// Full searches, CPU vs GPU, all-8 and exact; plus the planted spot is found.
 void test_search_parity() {
     std::printf("test_search_parity\n");
     struct P {

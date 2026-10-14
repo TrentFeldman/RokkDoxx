@@ -1,3 +1,5 @@
+// BedrockGenerator: per-seed setup + single-block queries on top of the shared
+// math in bedrock_core.h. See bedrock.hpp for who uses it.
 #include "bedrock.hpp"
 
 #include <algorithm>
@@ -5,6 +7,15 @@
 #include "bedrock_core.h"
 
 namespace rokkdoxx {
+
+namespace {
+// threshold(y) for y = -64 .. -59, as P(bedrock) * 2^24. Java: ceil(prob * 2^24)
+// with prob = vanilla's Mth.map(y, -64, -59, 1.0, 0.0) = 1.0, 0.8, 0.6, 0.4,
+// 0.2, 0 (bedrock_core.h's header says why ceil() makes the integer compare
+// exact). Bedrock Edition: 1, 1, 3/4, 1/2, 1/4, 0.
+constexpr std::uint32_t kJavaThresholds[6] = {16777216, 13421773, 10066330, 6710887, 3355444, 0};
+constexpr std::uint32_t kBedrockThresholds[6] = {16777216, 16777216, 12582912, 8388608, 4194304, 0};
+}  // namespace
 
 // Reproduces BedrockReader's setup chain (Developer-Mike/minecraft-bedrock-generator):
 //
@@ -15,13 +26,13 @@ namespace rokkdoxx {
 //
 // == RandomState.getOrCreateRandomFactory(new ResourceLocation("bedrock_floor"))
 //    then forkPositional(), in the vanilla surface system.
+//
+// The result is two 64-bit numbers (lo_, hi_) that are all a block query needs
+// from the seed: rk_bits24_at() xors the block hash into lo_ and draws once.
+// Doing this chain once per job (in svc::worker_config) is what lets the GPU
+// kernel take the seed as two plain ulongs.
 BedrockGenerator::BedrockGenerator(std::int64_t world_seed, Edition edition) : edition_(edition) {
-    if (edition == Edition::bedrock) {
-        const std::uint32_t q = 1u << 22;  // P(bedrock) at y = -64 .. -59: 1, 1, 3/4, 1/2, 1/4, 0
-        const std::uint32_t t[6] = {4 * q, 4 * q, 3 * q, 2 * q, q, 0};
-        std::copy(t, t + 6, thresholds_);
-        return;
-    }
+    if (edition == Edition::bedrock) return;  // no seed chain: the floor is the same in every world
     std::uint64_t lo, hi;
     rk_xoro_seed(static_cast<std::uint64_t>(world_seed), &lo, &hi);
     const std::uint64_t d0_lo = rk_xoro_next(&lo, &hi);
@@ -37,18 +48,21 @@ BedrockGenerator::BedrockGenerator(std::int64_t world_seed, Edition edition) : e
     }
     lo_ = rk_xoro_next(&lo, &hi);
     hi_ = rk_xoro_next(&lo, &hi);
-
-    for (int i = 0; i < 6; ++i) thresholds_[i] = rk_floor_threshold(kFloorMinY + i);
 }
 
+// Clamped table lookup: below the floor behaves like y = -64 (always), above
+// it like y = -59 (never).
 std::uint32_t BedrockGenerator::threshold(int y) const noexcept {
-    if (y <= kFloorMinY) return thresholds_[0];
-    if (y >= -59) return thresholds_[5];
-    return thresholds_[y - kFloorMinY];
+    const std::uint32_t* t = edition_ == Edition::bedrock ? kBedrockThresholds : kJavaThresholds;
+    return t[std::clamp(y, kFloorMinY, kFloorMaxY) - kFloorMinY];
 }
 
 bool BedrockGenerator::is_bedrock_floor(int x, int y, int z) const noexcept {
     if (edition_ == Edition::bedrock) {
+        // Round the coordinates the way the game does (only matters past
+        // +/-2^24), then generate the column's chunk and pick its bit.
+        // `>> 4` / `& 15` are floor-division / modulo by 16 that also work for
+        // negative coordinates (arithmetic shift), so -1 lands in chunk -1 at 15.
         const int sx = rk_be_coord(x), sz = rk_be_coord(z);
         std::uint32_t rows[16];
         rk_be_chunk_rows(sx >> 4, sz >> 4, y + 63, rows);
@@ -60,8 +74,8 @@ bool BedrockGenerator::is_bedrock_floor(int x, int y, int z) const noexcept {
     // VerticalGradientCondition. Vanilla computes
     //   place bedrock  iff  (double)nextFloat() < Mth.map(y, -64, -59, 1.0, 0.0)
     // which is exactly  rk_bits24_at(...) < ceil(prob_double * 2^24)  -- see
-    // bedrock_core.h. thresholds_ holds that cutoff per y.
-    return rk_bits24_at(lo_, hi_, x, y, z) < thresholds_[y - kFloorMinY];
+    // bedrock_core.h. kJavaThresholds holds that cutoff per y.
+    return rk_bits24_at(lo_, hi_, x, y, z) < kJavaThresholds[y - kFloorMinY];
 }
 
 }  // namespace rokkdoxx

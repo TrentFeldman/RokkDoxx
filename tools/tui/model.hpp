@@ -20,6 +20,9 @@ namespace svc = rokkdoxx::svc;
 
 using svc::kMaxDim;
 
+// What the user is editing on the params and grid screens. Text fields (seed,
+// center, radius, checkpoint) are kept as typed and only parsed when a search
+// is built (build_request), so half-typed values like "-" are allowed.
 struct Model {
     svc::Edition edition = svc::Edition::java;
     std::string seed = "0";  // Java only
@@ -27,7 +30,7 @@ struct Model {
     int y = -60;
     std::string cx = "0", cz = "0", radius = "5000";
     bool all_orient = true;
-    bool stop_first = false;  // end the search at the first match (not saved in pattern files)
+    bool stop_first = false;  // end the search at the first match (saved in sessions, not plain pattern files)
     std::string checkpoint;  // empty = no checkpointing
 
     // Fixed kMaxDim x kMaxDim storage, so shrinking and re-growing the pattern
@@ -43,6 +46,10 @@ struct Model {
 // Whole-string integer parse; false on junk or overflow.
 bool parse_i64(const std::string& s, long long& out);
 
+// Model <-> pattern file. model_to_file leaves checkpoint / stop_first unset
+// (a plain pattern); do_save_session (screens.cpp) adds them for a session.
+// file_to_model only overwrites checkpoint / stop_first when the file sets
+// them, so loading a plain pattern keeps the user's checkpoint field.
 svc::PatternFile model_to_file(const Model& m);
 void file_to_model(const svc::PatternFile& pf, Model& m);
 

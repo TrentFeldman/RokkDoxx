@@ -30,7 +30,6 @@ enum Key : int {
     K_DELETE = -12,
     K_PGUP = -13,
     K_PGDN = -14,
-    K_RESIZE = -15,  // the window changed size; redraw everything
 };
 
 struct TermSize {
@@ -49,6 +48,7 @@ bool enter();
 // Undo enter(). Safe to call more than once.
 void leave();
 
+// The visible window in character cells; 80x24 if it can't be queried.
 TermSize size();
 
 // Wait up to `timeout_ms` for a key. Returns K_NONE on timeout.

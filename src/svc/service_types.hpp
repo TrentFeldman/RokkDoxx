@@ -1,20 +1,40 @@
 // The vocabulary of the search service: the plain data types every other svc/
-// file speaks in, plus two tiny pure helpers. No behaviour, no I/O, no threads.
+// file speaks in, plus a few small pure helpers. No behaviour, no I/O, no
+// threads.
 //
 // Responsibilities:
 //   - describe a search job   (Pattern, Region, SearchRequest)
-//   - describe its result     (Match, JobStatus, JobId)
-//   - describe a unit of work (Tile, WorkerConfig) and the Worker interface
-//   - parse a world seed string (seed_from_string)
+//   - describe its result     (Match, JobStatus, MapCell, JobId)
+//   - describe a unit of work (Tile, WorkerConfig, SearchPlan) and the Worker
+//     interface
+//   - small helpers: seed_from_string, format_duration, to_string(JobState),
+//     and the declarations of world_patch / worker_config / build_search_plan
+//     (defined in workers.cpp)
 // Not this file's job: running a search (search_service.*), the compute itself
 // (workers.*, opencl_worker.*), or the front-end handle (client.*).
+//
+// Glossary (these words mean the same thing everywhere in the code):
+//   pattern     the little grid the user drew: bedrock / not bedrock / unknown
+//   plane / y   the one bedrock layer (-64..-59) the pattern lies on
+//   candidate   one world (x, z) position the search tests; "Gcand/s" is
+//               10^9 candidates per second. A region of W x H blocks has
+//               W*H candidates.
+//   anchor      the pattern cell the search lines up with each candidate
+//               (SearchPlan). A Match's (x, z) is where the anchor cell sits
+//               in the world -- NOT the pattern's top-left corner.
+//   orientation one of the 8 D4 rotations/mirrors (kOrientations); bit g of
+//               Match::orient_mask = orientation g matched.
+//   variant     a group of orientations that give the identical cell set
+//               after recentring (symmetric patterns have fewer than 8).
+//   tile        a rectangle of candidates handed to a Worker in one call.
+//   map cell    a coarse square of the region for the TUI's progress picture;
+//               it groups whole tiles.
 #pragma once
 
 #include <array>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -40,6 +60,8 @@ struct KnownCell {
     std::uint8_t want;   // 1 = bedrock, 0 = not bedrock
 };
 
+// The user's drawing. i runs along world +x (east), j along world +z (south),
+// matching how the TUI and pattern files lay it out.
 struct Pattern {
     int w = 0, h = 0;
     std::vector<Cell> cells;  // row-major, size w*h (index = j*w + i)
@@ -47,6 +69,7 @@ struct Pattern {
     Cell at(int i, int j) const { return cells[static_cast<std::size_t>(j) * w + i]; }
 
     // Drop the wildcards; keep only the cells the search has to check.
+    // Row-major order. This is what WorkerConfig::knowns carries to a worker.
     std::vector<KnownCell> knowns() const {
         std::vector<KnownCell> out;
         for (int j = 0; j < h; ++j)
@@ -59,9 +82,13 @@ struct Pattern {
     }
 };
 
-inline constexpr int kMaxDim = 32;  // largest pattern side; the search refuses bigger
+// Largest pattern side; the search refuses bigger. The GPU sizes its plane
+// buffers for the halo this allows (opencl_worker.cpp), and the pattern file
+// loader / TUI clamp to it.
+inline constexpr int kMaxDim = 32;
 
 // A fully known w x h pattern copied from the world at (x0, z0). (workers.cpp)
+// Used to plant a guaranteed match: tests, rokksearch --benchmark / --demo.
 Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h,
                     Edition edition = Edition::java);
 
@@ -72,6 +99,8 @@ Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h,
 // Each entry is a 2x2 integer matrix [[a b][c d]]. It maps a pattern offset
 // (i, j) to a world offset (du, dv) = (a*i + b*j, c*i + d*j).
 // Index 0 is the identity -- the round-trip test relies on that.
+// The index is also the bit position in Match::orient_mask, and the order of
+// the names in tui::orient_names(), so do not reorder.
 struct Transform {
     int a, b, c, d;
 };
@@ -91,13 +120,17 @@ inline constexpr std::array<Transform, 8> kOrientations = {{
 // The square of world to search, as inclusive block-coordinate ranges. 64-bit
 // so a full 30M x 30M sweep does not overflow the span arithmetic (and so it
 // stays 64-bit on Win64, where `long` is only 32 bits).
+// The coordinates are candidate positions, i.e. where the anchor cell may be;
+// the rest of the pattern may reach up to kMaxDim blocks outside the region.
 struct Region {
     std::int64_t x0 = 0, x1 = 0, z0 = 0, z1 = 0;
 
+    // The (2*radius + 1)-block square around (cx, cz).
     static Region centered(std::int64_t cx, std::int64_t cz, std::int64_t radius) {
         return Region{cx - radius, cx + radius, cz - radius, cz + radius};
     }
     // Every block inside the default Overworld world border (+/-29,999,984).
+    // Front-ends map "radius -1" to this.
     static constexpr std::int64_t kWorldBorder = 29'999'984;
     static Region world() {
         return Region{-kWorldBorder, kWorldBorder - 1, -kWorldBorder, kWorldBorder - 1};
@@ -110,6 +143,12 @@ struct Region {
 
 // --- request / result -----------------------------------------------------
 
+// Everything a front-end says about one search. Built by rokksearch's main(),
+// tui::build_request(), or a test, then handed to SearchClient::submit(). The
+// service copies it, so the caller may reuse or destroy it right away.
+// Validation (plane range, pattern size, empty pattern, Bedrock Edition's
+// coordinate limit) happens inside the job, and failures surface as
+// JobState::error -- submit() itself never rejects a request.
 struct SearchRequest {
     Edition edition = Edition::java;
     std::int64_t seed = 0;  // Java only: Bedrock Edition's floor is the same in every world
@@ -136,18 +175,28 @@ struct SearchRequest {
 
     // A front-end that wants a picture of the search asks for a map_w x map_h
     // overview (0 = none; clamped to the tile grid) in JobStatus::map. The
-    // region is then scanned one map cell at a time, so each cell fills in
-    // completely before the next begins.
+    // scan order does not change: tiles still spiral out from the middle, so a
+    // map cell can be partly done (MapCell::partial) while others start.
     int map_w = 0, map_h = 0;
 };
 
-// A place where the pattern occurs. orient_mask has bit g set for every
+// A place where the pattern occurs: (x, z) is the world position of the
+// pattern's anchor cell (SearchPlan::anchor_i/j inside the pattern; roughly
+// its centre), not of its top-left corner. orient_mask has bit g set for every
 // orientation g (index into kOrientations) that matched at this origin.
+// Written to stdout / saved files as "x z mask".
 struct Match {
     int x, z;
     std::uint8_t orient_mask;
+    bool operator==(const Match&) const = default;
 };
 
+// Lifecycle of a job:
+//   pending (submitted; validating, opening the device, compiling kernels)
+//   -> running <-> paused
+//   -> one of done / cancelled / error
+// done, cancelled and error are final; poll() keeps returning the last status
+// after that.
 enum class JobState { pending, running, paused, done, cancelled, error };
 
 // One square of JobStatus::map: how far the search of that area has got, and
@@ -175,18 +224,19 @@ inline const char* to_string(JobState s) {
 
 // A snapshot of a running job. The service updates it after every tile; a
 // front-end polls it for the progress display.
+// Returned BY VALUE from poll(), so a front-end can read it without locks.
 struct JobStatus {
     JobState state = JobState::pending;
     double progress = 0.0;  // 0..1
     long long candidates_total = 0;
-    long long candidates_done = 0;
+    long long candidates_done = 0;  // includes tiles restored from a checkpoint
     std::uint64_t matches = 0;
-    double elapsed_s = 0.0;
+    double elapsed_s = 0.0;  // this run only, paused time excluded
     double rate = 0.0;   // candidate origins / second, this run (not counting resumed tiles)
     double eta_s = 0.0;  // seconds left at `rate`; 0 until the first tile lands
-    bool truncated = false;
+    bool truncated = false;  // a match cap was hit (job-wide or a GPU tile's): some matches were dropped
     bool stopped_early = false;  // done, but cut short by stop_at_first_match
-    std::string error;
+    std::string error;           // set when state == error
 
     // The search region as a map_w x map_h grid, row-major, north-west (x0, z0)
     // first. Empty unless the request asked for one; the size can be smaller
@@ -195,6 +245,8 @@ struct JobStatus {
     std::vector<MapCell> map;
 };
 
+// Handle for a submitted job, unique per SearchService (starts at 1; 0 means
+// "no job" in the TUI).
 using JobId = std::uint64_t;
 
 // "1h 02m 03s" / "4m 05s" / "7s" -- for ETA and elapsed displays.
@@ -213,10 +265,12 @@ inline std::string format_duration(double seconds) {
 // --- worker (compute tier) ----------------------------------------------
 
 // A rectangular block of candidate origins to test. World block coordinates.
+// Made by TileScheduler::tile_at(); `index` is its position in the scheduler's
+// row-major tile grid (what the checkpoint "done" list records).
 struct Tile {
     int index = 0;
     std::int64_t x0 = 0, z0 = 0;
-    int w = 0, h = 0;
+    int w = 0, h = 0;  // edge tiles are clipped to the region, so may be smaller
 };
 
 // Everything a worker needs that stays constant for the whole job. The service
@@ -233,6 +287,8 @@ struct WorkerConfig {
 };
 
 // A WorkerConfig with the per-seed part filled in; callers add the pattern. (workers.cpp)
+// Called by SearchService::run() and by rokksearch's benchmark/demo, which
+// drive a Worker directly.
 WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition = Edition::java);
 
 // --- search plan (shared prep for both workers) ---------------------------
@@ -251,6 +307,12 @@ WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition = Edi
 // Orientations whose transformed cell set is identical are collapsed into one
 // "variant"; variant_mask[v] carries the original orientation bits so the
 // output is unchanged.
+//
+// Reading the tables: for variant v and cell c, the block to test for a
+// candidate at world (x, z) is (x + off_x[v*n_cells + c], z + off_z[v*n_cells + c]),
+// and it must be bedrock iff want[c] == 1. Cell 0's offset is (0, 0) in every
+// variant. If every cell of variant v passes, the candidate matches with
+// orientations variant_mask[v].
 struct SearchPlan {
     int n_cells = 0;     // includes the anchor at index 0
     int n_variants = 0;  // 1..8 (fewer than 8 for symmetric patterns)
@@ -262,42 +324,48 @@ struct SearchPlan {
 };
 
 // `all_orientations == false` -> a single variant (identity only). `knowns` must not be empty.
+// `threshold` (from BedrockGenerator::threshold) only decides which cell type
+// is rarer. Called by CpuWorker::configure, OpenclWorker::configure, the
+// brute-force reference in tests, and rokksearch --demo (to print the anchor).
 SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
                              bool all_orientations);
 
 // The compute tier. The orchestrator configures it once, then feeds it tiles.
 // Implementations: CpuWorker (workers.*) and OpenclWorker (opencl_worker.*).
+//
+// Call sequence (SearchService::run, rokksearch's bmark::sweep):
+//   configure(cfg)                  once per job (may be called again to reset)
+//   begin_tile(t1) [, begin_tile(t2)]   at most 2 outstanding
+//   end_tile() -> matches of t1     strictly FIFO
+//   begin_tile(t3) ... end_tile() ...
+// A worker is used from one thread at a time (the job's pump thread); it may
+// start its own threads internally (CpuWorker does).
 class Worker {
 public:
     virtual ~Worker() = default;
+    // Per-job setup: build the SearchPlan, upload tables (GPU), reset the
+    // match-cap / truncation state.
     virtual void configure(const WorkerConfig& cfg) = 0;
 
-    // Matches whose origin lies inside `tile`. May stop early once match_cap is
-    // reached (then truncated() returns true).
-    virtual std::vector<Match> run_tile(const Tile& tile) = 0;
+    // Pipelined dispatch -- what the pump calls. begin_tile() enqueues `tile`;
+    // end_tile() blocks for and returns the matches of the OLDEST
+    // not-yet-collected begin_tile() call (strict FIFO pairing): those whose
+    // anchor position (see SearchPlan) lies inside that tile. May stop early
+    // once match_cap is reached (then truncated() returns true).
+    virtual void begin_tile(const Tile& tile) = 0;
+    virtual std::vector<Match> end_tile() = 0;
     virtual bool truncated() const { return false; }
 
     // Tile side this backend prefers (0 = let the caller decide). A GPU wants
     // big tiles so the fixed per-dispatch cost is amortised; the CPU wants
     // smaller tiles so progress and cancellation stay responsive.
     virtual int preferred_tile_side() const { return 0; }
-
-    // Pipelined dispatch -- what the pump calls. begin_tile() enqueues `tile`;
-    // end_tile() blocks for and returns the matches of the OLDEST
-    // not-yet-collected begin_tile() call (strict FIFO pairing). The default
-    // just runs the tile synchronously in begin_tile(); a worker that can
-    // overlap on-device dispatch with read-back (OpenclWorker) overrides both.
-    virtual void begin_tile(const Tile& tile) { queued_.push_back(run_tile(tile)); }
-    virtual std::vector<Match> end_tile() {
-        std::vector<Match> m = std::move(queued_.front());
-        queued_.pop_front();
-        return m;
-    }
-
-private:
-    std::deque<std::vector<Match>> queued_;
 };
 
+// Makes a fresh Worker for one job. SearchService calls it at the start of
+// every job (on the job's thread), so each job owns its worker -- and a GPU
+// worker compiles its kernels there, not at client creation.
+// Built by make_worker_factory() (workers.cpp).
 using WorkerFactory = std::function<std::unique_ptr<Worker>()>;
 
 // --- seed parsing ------------------------------------------------------
@@ -307,6 +375,8 @@ using WorkerFactory = std::function<std::unique_ptr<Worker>()>;
 // else is hashed exactly the way Java's String.hashCode does, then
 // sign-extended to 64 bits -- which is what the vanilla client does with a
 // non-numeric seed.
+// (A number too big for 64 bits fails from_chars and so is hashed as text.
+// The unsigned multiply makes the 32-bit wrap well-defined, as in Java.)
 inline std::int64_t seed_from_string(std::string_view s) {
     std::int64_t v = 0;
     const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);

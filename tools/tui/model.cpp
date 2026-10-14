@@ -1,3 +1,5 @@
+// The Model's pure logic. Everything here is deterministic and terminal-free;
+// tests/test_tui.cpp calls it directly.
 #include "model.hpp"
 
 #include <algorithm>
@@ -48,6 +50,10 @@ void file_to_model(const svc::PatternFile& pf, Model& m) {
         for (int i = 0; i < m.w; ++i) m.at(i, j) = pf.pattern.at(i, j);
 }
 
+// Called by start_search (screens.cpp) when Enter is pressed on the grid or a
+// session is resumed. Only the TUI-side checks happen here; the service does
+// the rest (plane range, size limit, Bedrock Edition bounds) and reports them
+// as a job error on the search screen.
 bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
     long long cx, cz, rad;
     if (!parse_i64(m.cx, cx) || !parse_i64(m.cz, cz) || !parse_i64(m.radius, rad) || rad < -1) {
@@ -65,26 +71,28 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
     req.region = rad == -1 ? svc::Region::world() : svc::Region::centered(cx, cz, rad);
     req.all_orientations = m.all_orient;
     req.stop_at_first_match = m.stop_first;
-    req.match_cap = 1u << 20;
     req.checkpoint_path = m.checkpoint;
     return true;
 }
 
+// The `P` key. The pattern's top-left cell is placed AT (center X, center Z)
+// -- not centred on it -- so the search should report (cx, cz) plus the
+// anchor offset.
 bool fill_from_world(Model& m, std::string& err) {
     long long cx = 0, cz = 0;
     if (!parse_i64(m.cx, cx) || !parse_i64(m.cz, cz)) {
         err = "set integer center X/Z first";
         return false;
     }
-    BedrockGenerator gen(svc::seed_from_string(m.seed), m.edition);
+    const svc::Pattern p = svc::world_patch(svc::seed_from_string(m.seed), m.y, static_cast<int>(cx),
+                                            static_cast<int>(cz), m.w, m.h, m.edition);
     for (int j = 0; j < m.h; ++j)
-        for (int i = 0; i < m.w; ++i)
-            m.at(i, j) = gen.is_bedrock_floor(static_cast<int>(cx + i), m.y, static_cast<int>(cz + j))
-                             ? svc::Cell::bedrock
-                             : svc::Cell::not_bedrock;
+        for (int i = 0; i < m.w; ++i) m.at(i, j) = p.at(i, j);
     return true;
 }
 
+// threshold() is P * 2^24 for both editions (BedrockGenerator); the seed
+// doesn't change it, so seed 0 is fine.
 double bedrock_probability(svc::Edition edition, int y) {
     return BedrockGenerator(0, edition).threshold(y) / 16777216.0;
 }

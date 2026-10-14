@@ -2,6 +2,11 @@
 # Independent reference implementation of Minecraft 26.2 Overworld bedrock-floor
 # generation, written from the algorithm spec (not ported from the C++). Used to
 # differentially test src/gen. Also runnable as a CLI matching tools/dump_bedrock.
+# Java Edition only. It deliberately keeps vanilla's float compare
+# (next_float() < prob) instead of the C++'s integer threshold, so it also
+# checks that the threshold trick in bedrock_core.h is exact.
+# Python ints are unbounded, so every 64-bit operation is masked (& MASK64) or
+# re-signed (_s32/_s64) by hand to mimic Java's wrapping arithmetic.
 #
 #   bedrock_ref.py <seed> <x0> <z0> <width> <height> [y|all]
 
@@ -92,6 +97,8 @@ def block_pos_seed(x, y, z):
     return _s64(u) >> 16                             # arithmetic shift
 
 
+# The fork chain from BedrockGenerator's constructor (src/gen/bedrock.cpp),
+# but computing the md5 at runtime instead of using the baked constant.
 def make_floor_factory(seed):
     world = Xoroshiro.from_seed(seed & MASK64)
     a = world.next()

@@ -15,6 +15,10 @@
 //   model.*                                     editable state + pure logic
 //   screens.*                                   drawing + key handling
 // This file only parses arguments and runs the loop.
+//
+// Everything is single-threaded on this side: the loop below polls the search
+// (it never blocks on it), so a keypress is handled within one 100 ms tick even
+// mid-search. The search's own threads live inside SearchService.
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -61,6 +65,7 @@ int main(int argc, char** argv) {
         tui::file_to_model(pf, app.m);
     }
 
+    // Open the client now so a bad --backend fails before the screen switches.
     app.backends = svc::list_backends();
     {
         std::string err;
@@ -106,16 +111,20 @@ int main(int argc, char** argv) {
         }
     }
     redraw();
+    // One tick: wait up to 100 ms for a key, advance the animation clock, pull
+    // the job's latest status, apply the key, repaint (only changed rows go
+    // out). handle_key returns false on quit.
     for (;;) {
         const int k = tui::read_key(100);
         app.now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - t0)
                          .count();
         tui::refresh_job(app);
-        if (k == tui::K_RESIZE) frame.invalidate();
-        else if (k != tui::K_NONE && !tui::handle_key(app, k)) break;
+        if (k != tui::K_NONE && !tui::handle_key(app, k)) break;
         redraw();
     }
+    // Quit: stop the search (App's client then joins its thread on destruction)
+    // and restore the terminal.
     tui::cancel_job(app);
     tui::leave();
     return 0;

@@ -1,36 +1,32 @@
 // OpenclWorker: one OpenCL device running the search kernel. Only compiled when
 // the build finds OpenCL (ROKK_ENABLE_OPENCL). The generation math is the shared
 // src/gen/bedrock_core.h, so the kernel is bit-identical to CpuWorker.
+//
+// Created by the factory from make_worker_factory("opencl:N") (workers.cpp),
+// once per job, on the job's thread. The host-side walkthrough is at the top
+// of opencl_worker.cpp; the kernels are in src/cl/search_tile.cl.
 #pragma once
 
 #include <memory>
-#include <string>
 #include <vector>
 
-#include "service_types.hpp"
+#include "workers.hpp"
 
 namespace rokkdoxx::svc {
 
-struct OpenclDevice {
-    int index = 0;  // position in the flattened platform x device list
-    std::string label;  // "<platform> / <device>"
-    std::string cl_version;      // CL_DEVICE_VERSION, e.g. "OpenCL 2.0 AMD-APP..."
-    std::string driver_version;  // CL_DRIVER_VERSION
-    int compute_units = 0;       // CL_DEVICE_MAX_COMPUTE_UNITS
-    bool is_cpu = false;         // CL_DEVICE_TYPE_CPU (e.g. pocl): not a GPU
-    bool integrated = false;     // GPU sharing host memory (iGPU/APU), by CL_DEVICE_HOST_UNIFIED_MEMORY
-};
-
-// Enumerate every OpenCL device on the host (empty if no platform / ICD).
-std::vector<OpenclDevice> opencl_list_devices();
+// Every OpenCL device on the host as BackendInfo "opencl:<N>", label
+// "<platform> / <device>" (empty if no platform / ICD).
+std::vector<BackendInfo> opencl_list_devices();
 
 class OpenclWorker : public Worker {
 public:
+    // Opens device `device_index` (the N of "opencl:N"), creates its context
+    // and queues, and compiles the generic kernels. Throws std::runtime_error
+    // (with the compiler log) if the device is missing or the build fails.
     explicit OpenclWorker(int device_index);
     ~OpenclWorker() override;
 
     void configure(const WorkerConfig& cfg) override;
-    std::vector<Match> run_tile(const Tile& tile) override;
     bool truncated() const override;
     int preferred_tile_side() const override { return 16384; }
 
@@ -42,16 +38,18 @@ public:
     std::vector<Match> end_tile() override;
 
     // Direct plane dump for the bit-exactness test (row-major w*h, 1 = bedrock).
+    // Java Edition only (it calls rk_bits24_at). Synchronous; independent of
+    // configure(). Used by tests/test_gpu.cpp.
     std::vector<std::uint8_t> dump_plane(std::uint64_t derived_lo, std::uint64_t derived_hi,
                                          int plane_y, std::uint32_t threshold, int x0, int z0, int w,
                                          int h);
 
 private:
-    struct Impl;
+    struct Impl;  // all OpenCL objects; keeps <CL/opencl.hpp> out of this header
     std::unique_ptr<Impl> impl_;
 
-    void enqueue_search(int slot, const Tile& tile);
-    std::vector<Match> read_results(int slot);
+    void enqueue_search(int slot, const Tile& tile);  // non-blocking dispatch
+    std::vector<Match> read_results(int slot);        // blocking read-back
 };
 
 }  // namespace rokkdoxx::svc

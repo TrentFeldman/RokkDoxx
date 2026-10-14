@@ -21,8 +21,17 @@
 
 namespace rokkdoxx::tui {
 
+// Which screen is up. Transitions (all in screens.cpp's handle_* functions):
+//   params --Enter--> grid --Enter--> result (start_search)
+//   grid --Tab--> params      result --Enter/Esc/q, once stopped--> grid
+//   params `L`, grid `S`, result `S`/`s` --> prompt --Enter/Esc--> back
+//   quit: q / Esc on params, q on grid (never while a search runs)
 enum class Screen { params, grid, result, prompt };
 
+// All of rokktui's state: the Model being edited, UI cursors, the search
+// client and the job being shown, and the map animation bookkeeping. One App
+// lives in main() and is passed by reference to draw / handle_key /
+// refresh_job each tick. Tests build Apps directly.
 struct App {
     Model m;
     Screen screen = Screen::params;
@@ -62,16 +71,22 @@ struct App {
     bool want_pause = false;              // `p` was pressed: the job is pausing or paused
     std::string session_path;             // the last session saved or resumed (the save prompt's default)
 
-    // text prompt
+    // text prompt (see begin_prompt in screens.cpp): what to show, what was
+    // typed, where to go back to, and what to do with the text on Enter.
     std::string prompt_label, prompt_buf;
     Screen prompt_return = Screen::grid;
     void (*prompt_done)(App&) = nullptr;
 };
 
-// Create the client for `id` ("" / "auto", "cpu", "opencl:N") and remember
-// it. False + `err` if the backend can't be opened (the old client is kept).
+// Create the client for `id` ("" / "auto", "cpu", "dedicated", "integrated",
+// "opencl:N") and remember it. False + `err` if the backend can't be opened
+// (the old client is kept). Replacing the client while a job runs would end
+// that job; the backend field is only reachable on the params screen.
 bool select_backend(App& app, const std::string& id, std::string& err);
 
+// Draw the current screen into `fr`. Not const: it records the terminal size
+// (term_cols/rows, used to size the next search's map) and the result list's
+// page height.
 void draw(App& app, Frame& fr);
 
 // Handle one key. Returns false when the user asked to quit.

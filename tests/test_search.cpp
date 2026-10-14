@@ -1,6 +1,11 @@
 // Service-layer tests (CPU worker): the orchestrator + scheduler + sink produce
 // exactly what a direct BedrockGenerator brute force does, including all 8
 // orientations and regardless of tiling.
+//
+// ctest name: search. Also covers the scheduler (spiral order, map cells,
+// checkpoints), pause / cancel / stop-at-first, in-memory checkpoints, and the
+// pattern file format. Timing-sensitive checks compare within one run
+// (rate * elapsed) rather than across runs, so a busy machine doesn't flake them.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -9,7 +14,6 @@
 #include <fstream>
 #include <iterator>
 #include <map>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +29,8 @@ using namespace rokkdoxx::svc;
 namespace {
 
 SearchService make_service() { return SearchService(make_worker_factory("cpu")); }
+
+// Poll until the job reaches `want` (or errors, or times out); returns the last status.
 
 JobStatus wait_for(SearchService& svc, JobId id, JobState want, double timeout_s = 20) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -42,6 +48,7 @@ std::map<std::pair<int, int>, std::uint8_t> as_map(const std::vector<Match>& ms)
     return out;
 }
 
+// Submit, wait for done (checked), return the matches.
 std::vector<Match> run(SearchService& svc, const SearchRequest& req) {
     const JobId id = svc.submit(req);
     const JobStatus st = wait_for(svc, id, JobState::done, 600);
@@ -86,6 +93,8 @@ std::map<std::pair<int, int>, std::uint8_t> brute(const SearchRequest& req) {
     return out;
 }
 
+// The core promise: a pattern copied from the world is found where it was
+// copied from, and the service's full result set equals the brute force.
 void test_roundtrip_and_equiv() {
     std::printf("test_roundtrip_and_equiv\n");
     auto svc = make_service();
@@ -150,6 +159,7 @@ void test_bedrock_equiv() {
     check(st.state == JobState::error, "Bedrock searches past +/-2^25 are refused");
 }
 
+// Matches near tile edges must not be lost or duplicated, whatever the tile size.
 void test_tiling_invariant() {
     std::printf("test_tiling_invariant\n");
     auto svc = make_service();
@@ -170,6 +180,7 @@ void test_tiling_invariant() {
               std::to_string(small.size()) + ")");
 }
 
+// cancel() stops a huge job quickly, in state `cancelled`.
 void test_cancel() {
     std::printf("test_cancel\n");
     auto svc = make_service();
@@ -196,6 +207,8 @@ void test_cancel() {
     check(false, "job did not cancel within 5s");
 }
 
+// Checkpoint write -> load restores done tiles and matches; a wrong
+// fingerprint is rejected.
 void test_scheduler_checkpoint() {
     std::printf("test_scheduler_checkpoint\n");
     SearchRequest req;
@@ -210,7 +223,7 @@ void test_scheduler_checkpoint() {
     Tile t;
     int marked = 0;
     while (s1.next(t) && marked < s1.tile_count() / 2) {
-        s1.mark_done(t);
+        s1.mark_done(t.index);
         ++marked;
     }
     std::ofstream out(path);
@@ -223,16 +236,12 @@ void test_scheduler_checkpoint() {
     std::vector<Match> restored;
     check(s2.load_checkpoint(path, fp, restored), "checkpoint loads with matching fingerprint");
     check(s2.done_count() == marked, "resumed with the right tile count");
-    check(restored.size() == saved_matches.size(), "resumed with the right match count");
-    bool matches_equal = restored.size() == saved_matches.size();
-    for (std::size_t i = 0; matches_equal && i < restored.size(); ++i)
-        matches_equal = restored[i].x == saved_matches[i].x && restored[i].z == saved_matches[i].z &&
-                         restored[i].orient_mask == saved_matches[i].orient_mask;
-    check(matches_equal, "resumed matches are byte-identical to what was saved");
+    check(restored == saved_matches, "resumed matches are identical to what was saved");
 
     TileScheduler s3(req.region, req.tile_side);
     std::vector<Match> ignored;
-    check(!s3.load_checkpoint(path, fp ^ 1, ignored), "checkpoint rejected on fingerprint mismatch");
+    check(!s3.load_checkpoint(path, fp ^ 1, ignored) && s3.done_count() == 0,
+          "checkpoint rejected on fingerprint mismatch, changing nothing");
 
     std::remove(path.c_str());
 }
@@ -359,7 +368,7 @@ void test_scheduler_map() {
         inflight.pop_front();
         --busy[cell_of(d)];
         ++done[cell_of(d)];
-        s.mark_done(d);
+        s.mark_done(d.index);
         const std::vector<MapCell> m = s.map();
         states_ok = states_ok && m == expected();
         for (const MapCell& c : m) {
@@ -418,7 +427,7 @@ void test_scheduler_map() {
     TileScheduler part(region, 100, 3, 2);
     for (int i = 0; i < 12; ++i) {
         part.next(t);
-        part.mark_done(t);
+        part.mark_done(t.index);
     }
     std::ofstream out(path);
     part.write_checkpoint(out, fp, {});
@@ -661,21 +670,6 @@ void test_checkpoint_text() {
     wait_for(svc, id3, JobState::done);
     wait_for(svc, id4, JobState::done);
     check(as_map(svc.results(id3)) == as_map(svc.results(id4)), "checkpoint text for another search is ignored");
-
-    // Round trip through the stream API, matches included.
-    TileScheduler a(Region{0, 699, 0, 499}, 100);
-    Tile t;
-    for (int i = 0; i < 12; ++i) { a.next(t); a.mark_done(t); }
-    std::ostringstream os;
-    a.write_checkpoint(os, 77, {{10, 20, 1}, {-5, 300, 0x83}});
-    TileScheduler b(Region{0, 699, 0, 499}, 100);
-    std::istringstream is(os.str());
-    std::vector<Match> back;
-    check(b.read_checkpoint(is, 77, back) && b.done_count() == 12 && back.size() == 2 && back[1].x == -5,
-          "checkpoint text round-trips through the stream API");
-    TileScheduler c(Region{0, 699, 0, 499}, 100);
-    std::istringstream bad(os.str());
-    check(!c.read_checkpoint(bad, 78, back) && c.done_count() == 0, "a wrong fingerprint changes nothing");
 }
 
 void test_pattern_io_roundtrip() {
@@ -723,9 +717,6 @@ void test_pattern_io_roundtrip() {
     std::remove(path.c_str());
 }
 
-// build_search_plan: anchor choice + duplicate-orientation collapse, plus an
-// end-to-end check that a symmetric pattern still returns exactly what a plain
-// 8-orientation brute force does (keyed to the anchor).
 void test_format_duration() {
     std::printf("test_format_duration\n");
     check(format_duration(0) == "0s" && format_duration(-3) == "0s", "zero / negative");
@@ -735,6 +726,10 @@ void test_format_duration() {
     check(format_duration(100 * 3600.0) == "100h 00m 00s", "long runs keep counting hours");
 }
 
+// build_search_plan: anchor choice + duplicate-orientation collapse, plus an
+// end-to-end check of an asymmetric real-world pattern against the brute force
+// (keyed to the anchor) and the pattern-size limit. (The symmetric plus is
+// only checked at the plan level here, not end to end.)
 void test_search_plan() {
     std::printf("test_search_plan\n");
 
@@ -774,7 +769,7 @@ void test_search_plan() {
     }
     check(all == 0xFF && bits == 8, "8 variant masks partition the 8 orientations");
 
-    // End-to-end: symmetric plus, seed with real bedrock, brute vs service.
+    // End-to-end: a real 5x5 patch of seed 555 (asymmetric), brute vs service.
     auto svc = make_service();
     const int y = -60, cx = -700, cz = 900;
     Pattern fp = world_patch(555, y, cx, cz, 5, 5);  // 5x5 real config (asymmetric)

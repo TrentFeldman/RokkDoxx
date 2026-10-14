@@ -20,8 +20,8 @@ namespace {
 
 HANDLE g_in = INVALID_HANDLE_VALUE;
 HANDLE g_out = INVALID_HANDLE_VALUE;
-DWORD g_orig_in = 0, g_orig_out = 0;
-UINT g_orig_cp = 0;
+DWORD g_orig_in = 0, g_orig_out = 0;  // console modes before enter()
+UINT g_orig_cp = 0;                   // output code page before enter() (we switch to UTF-8)
 bool g_raw = false;
 
 // Ctrl+C / close: put the console back, then let the default handler end the
@@ -31,6 +31,8 @@ BOOL WINAPI on_ctrl(DWORD) {
     return FALSE;
 }
 
+// A key-down event -> Key. Windows reports special keys as virtual-key codes
+// rather than escape sequences, so no decoder is needed here.
 int map_key(const KEY_EVENT_RECORD& k) {
     switch (k.wVirtualKeyCode) {
         case VK_UP: return K_UP;
@@ -68,8 +70,8 @@ bool enter() {
     if (!SetConsoleMode(g_out, g_orig_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
         return false;  // pre-Windows-10 console: no VT support
     // No line buffering / echo; keep ENABLE_PROCESSED_INPUT so Ctrl+C still
-    // reaches on_ctrl; ENABLE_WINDOW_INPUT reports resizes.
-    if (!SetConsoleMode(g_in, ENABLE_PROCESSED_INPUT | ENABLE_WINDOW_INPUT)) {
+    // reaches on_ctrl.
+    if (!SetConsoleMode(g_in, ENABLE_PROCESSED_INPUT)) {
         SetConsoleMode(g_out, g_orig_out);
         return false;
     }
@@ -106,6 +108,8 @@ TermSize size() {
     return {};
 }
 
+// Loops because the console queue also holds events we ignore (key-ups,
+// mouse, focus); the deadline keeps the total wait at `timeout_ms`.
 int read_key(int timeout_ms) {
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
     for (;;) {
@@ -116,7 +120,6 @@ int read_key(int timeout_ms) {
         INPUT_RECORD rec;
         DWORD n = 0;
         if (!ReadConsoleInputW(g_in, &rec, 1, &n) || n == 0) return K_NONE;
-        if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT) return K_RESIZE;
         if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) {
             const int k = map_key(rec.Event.KeyEvent);
             if (k != K_NONE) return k;

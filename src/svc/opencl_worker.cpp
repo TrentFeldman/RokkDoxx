@@ -16,8 +16,29 @@
 // literals (specialized_source); if that build fails the generic kernel is used.
 //
 // begin_tile()/end_tile() ping-pong two buffer/queue slots so one tile's
-// dispatch can overlap another's read-back; run_tile() is the fully
-// synchronous single-slot form.
+// dispatch can overlap another's read-back.
+//
+// Call flow (who calls what):
+//   OpenclWorker(index)     job thread, via the WorkerFactory: open the device,
+//                           compile kernel_source() into `program`
+//   configure(cfg)          SearchService::run, once per job: build_search_plan,
+//                           upload the plan tables, size the plane buffers for
+//                           the halo, build the specialized match_plane
+//   begin_tile(t)           the pump: enqueue_search(slot, t) + flush
+//     enqueue_search          per kChunk piece: fill (Java or Bedrock Edition)
+//                             then match, all on queue[slot], non-blocking
+//   end_tile()              the pump: read_results(slot) -- blocks on the
+//                           read-back, which waits for that slot's kernels
+//
+// Memory per slot: buf_plane (+ buf_raw for Bedrock Edition) ~34 MB each at the
+// largest halo, buf_xz/buf_orient for up to 2^20 matches (~9 MB), buf_count.
+// The plan tables (buf_var_off, buf_want, buf_var_mask) are shared by both
+// slots. Nothing is allocated per tile.
+//
+// Debugging tips: a kernel build error throws from the constructor with the
+// compiler log (look for it in JobStatus::error). If GPU and CPU results
+// differ, tests/test_gpu.cpp narrows it down: dump_plane checks the raw Java
+// generation, the parity tests check fill + match end to end.
 #include "opencl_worker.hpp"
 
 #include <algorithm>
@@ -49,11 +70,13 @@ namespace rokkdoxx::svc {
 
 namespace {
 
+// Drivers pad some info strings with spaces or a trailing NUL.
 std::string trimmed(std::string s) {
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\0')) s.pop_back();
     return s;
 }
 
+// The program text: the shared math first, then the kernels that use it.
 std::string kernel_source() {
     return std::string(kBedrockCoreSrc) + "\n\n" + kSearchTileSrc;
 }
@@ -65,6 +88,17 @@ std::string kernel_source() {
 // kernel, ~7-20% faster on a 7900 XTX. Empty if the markers are missing.
 constexpr int kInlineCells = 6;
 
+// For a 2-variant plan with 8 cells the generated block looks like:
+//     { uint m = alive;
+//       if (m) m &= plane_bits(plane, words_w, row + (0), col + (1));
+//       if (m) m &= ~plane_bits(plane, words_w, row + (-2), col + (0));
+//       ...                                       (cells 1..5, literals)
+//       for (int c = 6; c < n_cells && m; ++c) { ...generic... }
+//       mv[0] = m; any |= m; }
+//     { uint m = alive; ... mv[1] = m; any |= m; }
+// The compiler can then fold the offsets into addressing and drop the
+// var_off/want loads. Called by configure(); the result is compared to the
+// previous one so an unchanged pattern skips the rebuild.
 std::string specialized_source(const SearchPlan& plan) {
     std::string src = kernel_source();
     const std::string begin = "// rk:variants-begin", end = "// rk:variants-end";
@@ -73,6 +107,8 @@ std::string specialized_source(const SearchPlan& plan) {
     const std::size_t e = src.find(end, b);
     if (fn == std::string::npos || b == std::string::npos || e == std::string::npos) return {};
 
+    // Cell 0 (the anchor) is already folded into `alive` by the kernel, so
+    // the baked cells start at 1.
     const int baked = std::min(kInlineCells, plan.n_cells);
     std::string code = "\n";
     for (int v = 0; v < plan.n_variants; ++v) {
@@ -90,6 +126,7 @@ std::string specialized_source(const SearchPlan& plan) {
                     " m &= want[c] ? w : ~w; }\n";
         code += "      mv[" + std::to_string(v) + "] = m; any |= m; }\n";
     }
+    // Replace only what lies between the markers; the marker lines stay.
     src.replace(b + begin.size(), e - (b + begin.size()), code);
     return src;
 }
@@ -101,10 +138,16 @@ std::string specialized_source(const SearchPlan& plan) {
 std::size_t round_up(std::size_t v, std::size_t mult) { return ((v + mult - 1) / mult) * mult; }
 
 // Work-group shape for the plane kernels: 32x8 (measured fastest on a 7900 XTX),
-// halved until it fits `limit` -- the most work-items either kernel can launch
+// halved until it fits the most work-items either kernel `a` or `b` can launch
 // with. Most GPUs allow 256+, but Apple's OpenCL can cap a kernel lower, and its
 // CPU device allows 1; an oversized group is a hard CL_INVALID_WORK_GROUP_SIZE.
-std::pair<std::size_t, std::size_t> fit_local(std::size_t limit) {
+std::pair<std::size_t, std::size_t> fit_local(const cl::Kernel& a, const cl::Kernel& b, const cl::Device& dev) {
+    std::size_t limit = 256;  // unqueryable: assume the old default
+    try {
+        limit = std::min(a.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(dev),
+                         b.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(dev));
+    } catch (const cl::Error&) {
+    }
     std::size_t w = 32, h = 8;
     while (w * h > limit && w * h > 1) {
         if (h > 1) h /= 2;
@@ -113,7 +156,11 @@ std::pair<std::size_t, std::size_t> fit_local(std::size_t limit) {
     return {w, h};
 }
 
-std::vector<cl::Device> flat_devices(std::vector<std::string>* labels = nullptr) {
+// Every device of every platform, in one flat list; the position in it is the
+// N of "opencl:N". Platforms that fail to enumerate are skipped rather than
+// failing the whole list. Must give the same order every call, because
+// opencl_list_devices() and the OpenclWorker constructor both index into it.
+std::vector<cl::Device> flat_devices() {
     std::vector<cl::Device> all;
     std::vector<cl::Platform> plats;
     cl::Platform::get(&plats);
@@ -124,47 +171,43 @@ std::vector<cl::Device> flat_devices(std::vector<std::string>* labels = nullptr)
         } catch (...) {
             continue;
         }
-        std::string pn;
-        try {
-            pn = p.getInfo<CL_PLATFORM_NAME>();
-        } catch (...) {
-        }
-        for (auto& d : devs) {
-            all.push_back(d);
-            if (labels) {
-                std::string dn;
-                try {
-                    dn = d.getInfo<CL_DEVICE_NAME>();
-                } catch (...) {
-                }
-                labels->push_back(pn + " / " + dn);
-            }
-        }
+        all.insert(all.end(), devs.begin(), devs.end());
     }
     return all;
 }
 
 }  // namespace
 
-std::vector<OpenclDevice> opencl_list_devices() {
-    std::vector<OpenclDevice> out;
+// Never throws: a missing ICD loader or a broken driver just means "no
+// devices", so the CPU backend still works. Called by list_backends().
+std::vector<BackendInfo> opencl_list_devices() {
+    std::vector<BackendInfo> out;
     try {
-        std::vector<std::string> labels;
-        auto devs = flat_devices(&labels);
+        const std::vector<cl::Device> devs = flat_devices();
         for (std::size_t i = 0; i < devs.size(); ++i) {
-            OpenclDevice d;
-            d.index = static_cast<int>(i);
-            d.label = labels[i];
-            // Kind first: if a later query throws, "auto" can still pick by it.
+            BackendInfo b;
+            b.id = "opencl:" + std::to_string(i);
+            std::string pn, dn;
             try {
-                d.is_cpu = (devs[i].getInfo<CL_DEVICE_TYPE>() & CL_DEVICE_TYPE_CPU) != 0;
-                d.integrated = !d.is_cpu && devs[i].getInfo<CL_DEVICE_HOST_UNIFIED_MEMORY>() != CL_FALSE;
-                d.compute_units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
-                d.cl_version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
-                d.driver_version = trimmed(devs[i].getInfo<CL_DRIVER_VERSION>());
+                pn = cl::Platform(devs[i].getInfo<CL_DEVICE_PLATFORM>()).getInfo<CL_PLATFORM_NAME>();
             } catch (...) {
             }
-            out.push_back(std::move(d));
+            try {
+                dn = devs[i].getInfo<CL_DEVICE_NAME>();
+            } catch (...) {
+            }
+            b.label = pn + " / " + dn;
+            b.is_gpu = true;  // until CL_DEVICE_TYPE says CPU
+            // Kind first: if a later query throws, "auto" can still pick by it.
+            try {
+                b.is_gpu = (devs[i].getInfo<CL_DEVICE_TYPE>() & CL_DEVICE_TYPE_CPU) == 0;
+                b.integrated = b.is_gpu && devs[i].getInfo<CL_DEVICE_HOST_UNIFIED_MEMORY>() != CL_FALSE;
+                b.units = static_cast<int>(devs[i].getInfo<CL_DEVICE_MAX_COMPUTE_UNITS>());
+                b.version = trimmed(devs[i].getInfo<CL_DEVICE_VERSION>());
+                b.driver = trimmed(devs[i].getInfo<CL_DRIVER_VERSION>());
+            } catch (...) {
+            }
+            out.push_back(std::move(b));
         }
     } catch (...) {
     }
@@ -179,21 +222,25 @@ struct OpenclWorker::Impl {
 
     cl::Device device;
     cl::Context ctx;
-    cl::CommandQueue queue[kSlots];
-    cl::Program program;
+    cl::CommandQueue queue[kSlots];  // in-order queues, one per slot
+    cl::Program program;             // the generic kernels (constructor)
     cl::Kernel k_dump;
 
     WorkerConfig cfg;
     int n_cells = 1;
     int n_variants = 1;
-    cl::Buffer buf_var_off;
-    cl::Buffer buf_want;
-    cl::Buffer buf_var_mask;
+    // The SearchPlan on the device (see SearchPlan for the layout).
+    cl::Buffer buf_var_off;   // int2[n_variants * n_cells]: (off_x, off_z)
+    cl::Buffer buf_want;      // uchar[n_cells]
+    cl::Buffer buf_var_mask;  // uchar[n_variants]
+    // Per-slot results: match_plane atomically bumps buf_count and writes
+    // (x, z) / mask at that index while it is below `cap`.
     cl::Buffer buf_count[kSlots];
     cl::Buffer buf_xz[kSlots];
     cl::Buffer buf_orient[kSlots];
+    // Max matches kept PER TILE (the job-wide cap is applied by SearchService::run).
     std::uint32_t cap = 0;
-    std::atomic<bool> trunc{false};
+    std::atomic<bool> trunc{false};  // some tile found more than `cap`
 
     int next_begin = 0;  // slot the next begin_tile() dispatches into
     int next_end = 0;    // slot the next end_tile() drains
@@ -208,23 +255,17 @@ struct OpenclWorker::Impl {
     cl::Kernel k_fill_be, k_remap_be;  // Bedrock Edition's fill: chunks into buf_raw, then remap
     cl::Program specialized_program;  // the current pattern's match_plane (one at a time)
     std::string specialized_src;      // its source, so an unchanged pattern isn't rebuilt
-    cl::Buffer buf_plane[kSlots];
+    cl::Buffer buf_plane[kSlots];  // 1 bit per block; layout in search_tile.cl
     cl::Buffer buf_raw[kSlots];  // Bedrock Edition only
-    int halo_w = 0, halo_h = 0;
+    int halo_w = 0, halo_h = 0;  // pattern reach from the anchor, in blocks
 
     // Call whenever k_fill / k_match change: the specialized match_plane can
     // have a smaller launch limit than the generic one.
-    void pick_local() {
-        std::size_t limit = 256;  // unqueryable: assume the old default
-        try {
-            limit = std::min(k_fill.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(device),
-                             k_match.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(device));
-        } catch (const cl::Error&) {
-        }
-        std::tie(local_w, local_h) = fit_local(limit);
-    }
+    void pick_local() { std::tie(local_w, local_h) = fit_local(k_fill, k_match, device); }
 };
 
+// Runs on the job's thread (the factory is called inside SearchService::run),
+// so a slow driver compile shows up as the job sitting in "pending".
 OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
     auto devs = flat_devices();
     if (devs.empty()) throw std::runtime_error("no OpenCL devices found");
@@ -252,13 +293,10 @@ OpenclWorker::OpenclWorker(int device_index) : impl_(std::make_unique<Impl>()) {
     impl_->k_fill_be = cl::Kernel(impl_->program, "fill_plane_be");
     impl_->k_remap_be = cl::Kernel(impl_->program, "remap_plane_be");
     impl_->pick_local();
-    std::size_t be_limit = 256;
-    try {
-        be_limit = std::min(impl_->k_fill_be.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(impl_->device),
-                            impl_->k_remap_be.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(impl_->device));
-    } catch (const cl::Error&) {
-    }
-    std::tie(impl_->be_local_w, impl_->be_local_h) = fit_local(be_limit);
+    // The Bedrock Edition kernels keep their own work-group shape: they never
+    // change after this, and their limit can differ from the match kernel's.
+    std::tie(impl_->be_local_w, impl_->be_local_h) =
+        fit_local(impl_->k_fill_be, impl_->k_remap_be, impl_->device);
 }
 
 // = default: OpenCL keeps objects alive until their queued commands finish.
@@ -266,6 +304,9 @@ OpenclWorker::~OpenclWorker() = default;
 
 bool OpenclWorker::truncated() const { return impl_->trunc.load(); }
 
+// Per-job setup. Reallocates every buffer (sizes depend on the pattern) and
+// resets the slot ping-pong, so it must not be called with tiles in flight --
+// the pump and the benchmark only call it between sweeps.
 void OpenclWorker::configure(const WorkerConfig& cfg) {
     impl_->cfg = cfg;
     impl_->trunc.store(false);
@@ -291,6 +332,8 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     impl_->buf_var_mask = cl::Buffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                      vmask.size() * sizeof(cl_uchar), vmask.data());
 
+    // Result buffers are sized for `cap` matches per slot, so it is clamped to
+    // keep them bounded (2^20 * 9 bytes) whatever match_cap the request has.
     impl_->cap = std::min<std::uint32_t>(cfg.match_cap, 1u << 20);
     for (int i = 0; i < Impl::kSlots; ++i) {
         impl_->buf_count[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, sizeof(cl_uint));
@@ -303,25 +346,21 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     // The halo is the pattern's world-space reach from the anchor over every
     // variant: how far fill_plane must draw beyond a piece's own candidates.
     // Pattern cell spacing is user-controlled, so it is computed per job.
-    std::int64_t min_dx = 0, max_dx = 0, min_dz = 0, max_dz = 0;  // anchor (0,0) always included
-    for (std::int32_t v : plan.off_x) {
-        min_dx = std::min<std::int64_t>(min_dx, v);
-        max_dx = std::max<std::int64_t>(max_dx, v);
-    }
-    for (std::int32_t v : plan.off_z) {
-        min_dz = std::min<std::int64_t>(min_dz, v);
-        max_dz = std::max<std::int64_t>(max_dz, v);
-    }
-    const std::int64_t halo_w = std::max(max_dx, -min_dx);
-    const std::int64_t halo_h = std::max(max_dz, -min_dz);
-    impl_->halo_w = static_cast<int>(halo_w);
-    impl_->halo_h = static_cast<int>(halo_h);
+    // The anchor's (0,0) is in every variant, so min <= 0 <= max.
+    const auto [lox, hix] = std::minmax_element(plan.off_x.begin(), plan.off_x.end());
+    const auto [loz, hiz] = std::minmax_element(plan.off_z.begin(), plan.off_z.end());
+    impl_->halo_w = std::max(*hix, -*lox);
+    impl_->halo_h = std::max(*hiz, -*loz);
     // Bedrock Edition's plane starts on a chunk-pair boundary: up to 31 / 15 more
     // halo on the low side, and buf_raw holds whole chunks plus a row.
+    // Worst case over all pieces: a full kChunk piece plus the halo on both
+    // sides, +31 for rounding up to whole words, +1 spare word (plane_bits
+    // reads two words). enqueue_search computes the exact per-piece size,
+    // which is never larger.
     const bool be = cfg.edition == Edition::bedrock;
     const std::size_t pad = be ? 32 : 0;
-    const std::size_t words = (Impl::kChunk + 2 * halo_w + 31 + pad) / 32 + 1;
-    const std::size_t rows = Impl::kChunk + 2 * halo_h + pad;
+    const std::size_t words = (Impl::kChunk + 2 * impl_->halo_w + 31 + pad) / 32 + 1;
+    const std::size_t rows = Impl::kChunk + 2 * impl_->halo_h + pad;
     for (int i = 0; i < Impl::kSlots; ++i) {
         impl_->buf_plane[i] = cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint));
         impl_->buf_raw[i] = be ? cl::Buffer(impl_->ctx, CL_MEM_READ_WRITE, words * rows * sizeof(cl_uint))
@@ -329,6 +368,7 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     }
 
     // ~200 ms the first time a pattern is seen (the driver caches repeats).
+    // Only one specialized program is kept; a new pattern replaces it.
     try {
         const std::string src = specialized_source(plan);
         if (src.empty()) throw std::runtime_error("kernel markers missing");
@@ -351,6 +391,16 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
 // kernel's argument values at enqueue time, not at execution time, so a later
 // setArg() (for the other slot) can never retroactively change a command
 // that's already been enqueued.
+//
+// Tiles are cut into kChunk x kChunk pieces (a 16384 tile is one piece; the
+// scheduler grows whole-world tiles to 65536, i.e. 16 pieces). For each piece,
+// in queue order:
+//   1. fill: draw the piece's blocks + halo into buf_plane[slot]
+//      (Java: fill_plane; Bedrock Edition: fill_plane_be, plus remap_plane_be
+//      when the piece is in the float-rounded band past +/-2^24)
+//   2. match: match_plane tests the piece's candidates against the plane
+// The in-order queue guarantees match N runs after fill N and fill N+1 after
+// match N, so one plane buffer per slot is enough.
 void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
     impl_->queue[slot].enqueueFillBuffer(impl_->buf_count[slot], cl_uint{0}, 0, sizeof(cl_uint));
 
@@ -367,12 +417,18 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
             // low side: Bedrock Edition's is rounded down to a chunk pair.
             const std::int64_t px = be ? (x0 - hw) & ~std::int64_t{31} : x0 - hw;
             const std::int64_t pz = be ? (z0 - hh) & ~std::int64_t{15} : z0 - hh;
+            // lo_w/lo_h: plane columns/rows before the piece's first candidate
+            // (= the halo for Java, possibly more for Bedrock Edition).
+            // words_w: plane row length in 32-bit words, +1 spare for
+            // plane_bits' two-word read. rows: plane height.
             const int lo_w = static_cast<int>(x0 - px), lo_h = static_cast<int>(z0 - pz);
             const int words_w = (w + lo_w + hw + 31) / 32 + 1;
             const int rows = h + lo_h + hh;
 
             cl_uint a = 0;
             if (be) {
+                // One work-item per 32x16 block pair, so rows round up to a
+                // whole chunk; +1 because remap can read the row below the last.
                 const int raw_rows = (rows + 1 + 15) / 16 * 16;
                 // Within +/-2^24 the remap is a copy: fill the plane directly.
                 const int kNear = 1 << 24;
@@ -418,6 +474,8 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
                     cl::NDRange(round_up(words_w, lw), round_up(rows, lh)), local);
             }
 
+            // One work-item per 32 candidates of a row (see match_plane). The
+            // argument order must match the kernel's parameter list exactly.
             cl::Kernel& m = impl_->k_match;
             a = 0;
             m.setArg(a++, static_cast<cl_int>(x0));
@@ -447,6 +505,8 @@ void OpenclWorker::enqueue_search(int slot, const Tile& tile) {
 // enqueueReadBuffer call is enough by itself to wait for that slot's queue to
 // finish (in-order queue: the read is ordered after the fill + kernels), so no
 // separate finish()/wait is needed here.
+// The count can exceed `cap` (the kernel keeps counting past it but stops
+// writing), which is how truncation is detected.
 std::vector<Match> OpenclWorker::read_results(int slot) {
     cl_uint n = 0;
     impl_->queue[slot].enqueueReadBuffer(impl_->buf_count[slot], CL_TRUE, 0, sizeof(cl_uint), &n);
@@ -468,14 +528,6 @@ std::vector<Match> OpenclWorker::read_results(int slot) {
     return out;
 }
 
-std::vector<Match> OpenclWorker::run_tile(const Tile& tile) {
-    // Fully synchronous single-slot path (the pump uses begin/end_tile). The
-    // blocking read in read_results() waits for this slot's fill + kernels too
-    // (in-order queue).
-    enqueue_search(0, tile);
-    return read_results(0);
-}
-
 void OpenclWorker::begin_tile(const Tile& tile) {
     const int s = impl_->next_begin;
     enqueue_search(s, tile);
@@ -490,6 +542,7 @@ std::vector<Match> OpenclWorker::end_tile() {
     return out;
 }
 
+// One work-item per block; uses queue 0 and waits for the result.
 std::vector<std::uint8_t> OpenclWorker::dump_plane(std::uint64_t dlo, std::uint64_t dhi, int plane_y,
                                                   std::uint32_t threshold, int x0, int z0, int w,
                                                   int h) {

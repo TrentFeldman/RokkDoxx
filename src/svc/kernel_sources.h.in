@@ -1,5 +1,7 @@
 // Generated from src/svc/kernel_sources.h.in by CMake (configure_file).
 // Do not edit -- edit src/gen/bedrock_core.h / src/cl/search_tile.cl instead.
+// Included only by src/svc/opencl_worker.cpp (kernel_source()). build.sh writes
+// an equivalent header itself instead of using this template.
 #pragma once
 
 namespace rokkdoxx::svc {

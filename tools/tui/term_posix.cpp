@@ -1,5 +1,5 @@
-// term.hpp on Linux/macOS: termios raw mode, poll() for timed reads, SIGWINCH
-// for resizes, and a small VT escape-sequence decoder.
+// term.hpp on Linux/macOS: termios raw mode, poll() for timed reads, and a
+// small VT escape-sequence decoder.
 #include "term.hpp"
 
 #include <poll.h>
@@ -15,17 +15,16 @@ namespace rokkdoxx::tui {
 
 namespace {
 
-termios g_orig{};
-bool g_raw = false;
-volatile std::sig_atomic_t g_resized = 0;
+termios g_orig{};   // terminal settings before enter(), restored by leave()
+bool g_raw = false;  // between enter() and leave()
 
+// SIGINT/SIGTERM/SIGHUP: restore the terminal, then die of the same signal
+// (default action) so the parent shell sees the usual exit status.
 void on_fatal_signal(int sig) {
     leave();
     std::signal(sig, SIG_DFL);
     std::raise(sig);
 }
-
-void on_winch(int) { g_resized = 1; }
 
 // Read one byte, waiting at most `timeout_ms`. -1 on timeout / error.
 int read_byte(int timeout_ms) {
@@ -40,6 +39,7 @@ int read_byte(int timeout_ms) {
 // press is followed by nothing.
 constexpr int kSeqTimeoutMs = 30;
 
+// The final byte of "ESC [ A" / "ESC O A" style arrow and Home/End keys.
 int key_for_final(int c) {
     switch (c) {
         case 'A': return K_UP;
@@ -64,6 +64,8 @@ int key_for_tilde(int n) {
     return K_NONE;
 }
 
+// Called after an ESC byte: read the rest of the sequence (if any arrives
+// within kSeqTimeoutMs) and map it to a Key. Unknown sequences become K_ESC.
 int decode_escape() {
     const int s0 = read_byte(kSeqTimeoutMs);
     if (s0 < 0) return K_ESC;
@@ -123,10 +125,6 @@ bool enter() {
         std::signal(SIGTERM, on_fatal_signal);
         std::signal(SIGHUP, on_fatal_signal);
         std::signal(SIGPIPE, SIG_IGN);
-        struct sigaction sa {};
-        sa.sa_handler = on_winch;  // no SA_RESTART: poll() wakes with EINTR
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGWINCH, &sa, nullptr);
     }
     write_out("\x1b[?1049h\x1b[?25l");
     return true;
@@ -139,6 +137,7 @@ void leave() {
     g_raw = false;
 }
 
+// Asks the kernel each call (cheap), so a resize is picked up on the next draw.
 TermSize size() {
     winsize ws{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0)
@@ -147,15 +146,7 @@ TermSize size() {
 }
 
 int read_key(int timeout_ms) {
-    if (g_resized) {
-        g_resized = 0;
-        return K_RESIZE;
-    }
     const int c = read_byte(timeout_ms);
-    if (g_resized) {  // poll() was interrupted by SIGWINCH
-        g_resized = 0;
-        return K_RESIZE;
-    }
     if (c < 0) return K_NONE;
     if (c == '\r' || c == '\n') return K_ENTER;
     if (c == '\t') return K_TAB;

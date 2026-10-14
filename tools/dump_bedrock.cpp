@@ -2,9 +2,13 @@
 //
 // Prints the Overworld bedrock floor as an ASCII grid: rows are z (north->south,
 // increasing), columns are x (west->east, increasing), 'X' = bedrock, '.' = not.
-// With `all` (or no y), prints every layer y = -64 .. -59.
+// With `all` (or no y), prints every layer y = -64 .. -60 (-59 is never
+// bedrock, so it is skipped).
 //
-// Used by the differential test against the independent Python reference.
+// Used by the differential test against the independent Python reference
+// (tests/diff_test.py compares this program's stdout byte for byte with
+// tests/reference/bedrock_ref.py's). Java Edition only. The per-layer counts go
+// to stderr so they don't affect the comparison.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

@@ -11,6 +11,12 @@
 //   stop_at_first yes          (optional: end the search at the first match)
 //   size <w> <h>
 //   <h lines of w chars: '#' bedrock, 'o' not-bedrock, '.' unknown>
+//
+// Rows run north to south (z increasing), characters west to east (x
+// increasing), the same orientation as the TUI grid. center / radius stay
+// strings here and are parsed by the front-end (radius -1 = whole world).
+// A "session" is just a pattern file with a `checkpoint` line, written by the
+// TUI's `s`; rokksearch --pattern and rokktui --resume both honour it.
 #pragma once
 
 #include <string>
@@ -19,6 +25,7 @@
 
 namespace rokkdoxx::svc {
 
+// Everything a pattern file holds. Defaults are what a missing line means.
 struct PatternFile {
     Edition edition = Edition::java;
     std::string seed = "0";
@@ -32,7 +39,13 @@ struct PatternFile {
     Pattern pattern;
 };
 
+// Lenient reader: unknown header lines are treated as the start of the grid,
+// missing cells are unknown, sizes are clamped to 1..kMaxDim. Only fails if the
+// file can't be opened. On failure `out` is untouched and `err` says why.
 bool load_pattern_file(const std::string& path, PatternFile& out, std::string& err);
+// Writes `pf` (overwriting `path`). Optional lines (edition, checkpoint,
+// stop_at_first) are written only when set, so a plain Java pattern file stays
+// byte-identical to the original format.
 bool save_pattern_file(const std::string& path, const PatternFile& pf, std::string& err);
 
 }  // namespace rokkdoxx::svc

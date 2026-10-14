@@ -9,8 +9,22 @@
 // match reports the anchor's world position. The float compare vanilla does is
 // a host-precomputed `bits < threshold` (see bedrock_core.h) so results are
 // bit-identical to the CPU on any device.
+//
+// Kernels, and who launches them (all from src/svc/opencl_worker.cpp):
+//   dump_plane      OpenclWorker::dump_plane   -- test helper, 1 byte per block
+//   fill_plane      enqueue_search, Java       -- 1 bit per block into `plane`
+//   fill_plane_be   enqueue_search, Bedrock Ed. -- 2 chunks per work-item
+//   remap_plane_be  enqueue_search, Bedrock Ed. past +/-2^24 only
+//   match_plane     enqueue_search, both editions, after the fill
+// The host passes arguments by position (setArg), so a parameter added,
+// removed or reordered here must be changed in enqueue_search too.
+//
+// Coordinates are 32-bit ints here (the host casts): fine inside the world
+// border. Global id 0 runs along x (32 blocks per work-item in the plane
+// kernels), id 1 along z.
 
 // Bit-exactness check helper: dump `bits < threshold` for a rectangle.
+// One work-item per block; Java Edition only.
 __kernel void dump_plane(const ulong derived_lo, const ulong derived_hi, const int plane_y,
                          const uint threshold, const int origin_x, const int origin_z, const int w,
                          const int h, __global uchar *out) {
@@ -30,7 +44,13 @@ __kernel void dump_plane(const ulong derived_lo, const ulong derived_hi, const i
 // Plane layout: row r, bit k  <->  world (px0 + k, pz0 + r); bit k lives in
 // word k/32 at bit k%32. `words_w` includes one spare word so the unaligned
 // two-word read in plane_bits never runs off the row.
+//
+// The plane's corner (px0, pz0) is the piece's first candidate minus the
+// low-side margin, so pattern cells to the west/north of a candidate are in
+// the plane too; the host sizes words_w/rows to cover the far-side halo.
 
+// One work-item = one plane word = 32 consecutive blocks of one row. Bit b is
+// the block at x = px0 + 32*wx + b.
 __kernel void fill_plane(const ulong derived_lo, const ulong derived_hi, const int plane_y,
                          const uint threshold, const int px0, const int pz0, const int words_w,
                          const int rows, __global uint *plane) {
@@ -46,6 +66,9 @@ __kernel void fill_plane(const ulong derived_lo, const ulong derived_hi, const i
 }
 
 // 32 plane bits starting at bit `start` of `row`.
+// Bit b of the result = plane bit (start + b), i.e. the block start + b
+// columns into the row. An unaligned window straddles two words; the s == 0
+// case is separate because `p[1] << 32` is undefined.
 inline uint plane_bits(__global const uint *plane, const int words_w, const int row, const int start) {
     __global const uint *p = plane + (size_t)row * words_w + (start >> 5);
     const int s = start & 31;
@@ -54,6 +77,19 @@ inline uint plane_bits(__global const uint *plane, const int words_w, const int 
 
 // One work-item = candidates (origin_x + 32*wx + b, origin_z + gz), b = 0..31.
 // The plane was filled from (origin_x - halo_w, origin_z - halo_h).
+// (The host passes its lo_w/lo_h as halo_w/halo_h: the plane's margin before
+// the first candidate. For Bedrock Edition that is the halo plus up to 31/15
+// blocks of alignment.)
+//
+// Bit b of every uint below stands for candidate b of this work-item, so one
+// AND tests a pattern cell for 32 candidates at once:
+//   alive    candidates whose anchor cell is right
+//   m        candidates still passing every cell of the current variant
+//   mv[v]    survivors of variant v (8 = the most variants a plan can have)
+//   any      OR of all mv[]: candidates that matched at least one variant
+// Matches are appended to match_xz/match_orient through an atomic counter, so
+// their order is arbitrary; the count keeps rising past match_cap (only the
+// writes stop), which the host uses to detect truncation.
 __kernel void match_plane(const int origin_x, const int origin_z, const int tile_w,
                           const int tile_h, const int halo_w, const int halo_h,
                           const int words_w, __global const uint *plane, const int n_cells,
@@ -70,9 +106,9 @@ __kernel void match_plane(const int origin_x, const int origin_z, const int tile
     // Shared anchor: cell 0 sits on the candidate itself for every variant.
     const uint a = plane_bits(plane, words_w, row, col);
     uint alive = want[0] ? a : ~a;
-    const int rem = tile_w - 32 * wx;
-    if (rem < 32) alive &= (1u << rem) - 1u;
-    if (!alive) return;
+    const int rem = tile_w - 32 * wx;  // candidates left in this row
+    if (rem < 32) alive &= (1u << rem) - 1u;  // last word of a row: drop bits past the piece
+    if (!alive) return;  // the common case: no candidate survives the anchor test
 
     uint mv[8];
     uint any = 0;
@@ -92,14 +128,16 @@ __kernel void match_plane(const int origin_x, const int origin_z, const int tile
     }
     // rk:variants-end
 
+    // Emit one match per set bit of `any`, lowest first.
     while (any) {
-        const uint low = any & (0u - any);
+        const uint low = any & (0u - any);  // isolate the lowest set bit
         any ^= low;
         uchar mask = 0;
         for (int v = 0; v < n_variants; ++v)
             if (mv[v] & low) mask |= var_mask[v];
         const uint idx = atomic_inc(match_count);
         if (idx < match_cap) {
+            // 31 - clz(low) = the index of the single set bit = candidate b.
             match_xz[idx] = (int2)(origin_x + 32 * wx + (31 - (int)clz(low)), origin_z + gz);
             match_orient[idx] = mask;
         }
@@ -115,6 +153,9 @@ __kernel void match_plane(const int origin_x, const int origin_z, const int tile
 // position (rk_be_coord), one block away at most. Nearer in it would be a copy,
 // so there the host has fill_plane_be write `plane` directly.
 
+// Work-item (wx, cj) = chunks ((px0>>4) + 2wx, (pz0>>4) + cj) and the one east
+// of it; their 16-bit row masks are packed side by side into one plane word.
+// The host launches it over ceil(rows/16) chunk rows (raw_rows / 16).
 __kernel void fill_plane_be(const int plane_y, const int px0, const int pz0, const int words_w,
                             const int rows, __global uint *raw) {
     const int wx = get_global_id(0);
@@ -128,6 +169,8 @@ __kernel void fill_plane_be(const int plane_y, const int px0, const int pz0, con
 }
 
 // `raw` has one more row than `plane`: a far row can show the row below it.
+// One work-item per plane word. Rows are remapped by picking the source row
+// rk_be_coord(z) (a whole-row choice); columns by the bit shuffle below.
 __kernel void remap_plane_be(const int px0, const int pz0, const int words_w, const int rows,
                              __global const uint *raw, __global uint *plane) {
     const int wx = get_global_id(0);

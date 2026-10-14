@@ -1,6 +1,12 @@
 // rokktui logic tests -- no terminal involved: the Model and its conversions,
 // a fill-from-world round trip through a real (CPU) search, the matches file
 // format, and the Frame diff/clipping.
+//
+// ctest name: tui. Screens are tested by drawing into a Frame and inspecting
+// the escape-coded bytes flush() returns (screen_rows / map_rows below), and
+// by feeding keys to handle_key. Animation is driven by setting App::now_ms
+// by hand, so nothing here depends on wall-clock timing except the real
+// searches.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -78,8 +84,8 @@ void test_build_request_errors() {
 }
 
 // Paint from the world, then search for it: the spot we painted from must come
-// back, reported (post Step 9) at the anchor cell -- somewhere inside the
-// pattern's footprint.
+// back, reported at the anchor cell -- somewhere inside the pattern's
+// footprint.
 void test_fill_and_find(bool all_orient, svc::Edition edition = svc::Edition::java) {
     Model m;
     m.edition = edition;
@@ -522,11 +528,9 @@ void slow_search(App& app) {
     app.m.seed = "99";
     app.m.w = app.m.h = 9;
     app.m.y = -60;
-    app.m.cx = "5004";
-    app.m.cz = "-6996";
     app.m.radius = "15000";
     app.m.all_orient = false;
-    fill_from_world(app.m, err);  // fills at the model's centre: move it to the planted spot
+    // fill_from_world fills at the model's centre: point it at the planted spot first
     app.m.cx = "5000";
     app.m.cz = "-7000";
     fill_from_world(app.m, err);

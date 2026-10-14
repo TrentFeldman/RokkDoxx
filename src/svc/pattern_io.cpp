@@ -1,3 +1,6 @@
+// Reader/writer for the pattern / session file format documented in
+// pattern_io.hpp. Callers: rokksearch main() (--pattern; --demo writes one),
+// rokktui (--load, --resume, L / S / s keys), and the tests.
 #include "pattern_io.hpp"
 
 #include <algorithm>
@@ -21,7 +24,7 @@ bool load_pattern_file(const std::string& path, PatternFile& out, std::string& e
     bool in_grid = false;
     std::string line;
     while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF files from Windows
         if (line.empty()) continue;
         if (in_grid) {
             rows.push_back(line);
@@ -66,6 +69,7 @@ bool load_pattern_file(const std::string& path, PatternFile& out, std::string& e
         }
     }
 
+    // Size: the declared one, else inferred from the rows (widest row wins).
     int w = declared_w;
     int h = declared_h ? declared_h : static_cast<int>(rows.size());
     if (w <= 0)
@@ -79,6 +83,7 @@ bool load_pattern_file(const std::string& path, PatternFile& out, std::string& e
     for (int j = 0; j < h && j < static_cast<int>(rows.size()); ++j) {
         const std::string& r = rows[static_cast<std::size_t>(j)];
         for (int i = 0; i < w && i < static_cast<int>(r.size()); ++i) {
+            // Anything but '#' / 'o' (e.g. '.', ' ', '?') is a wildcard.
             Cell c = r[i] == '#' ? Cell::bedrock : r[i] == 'o' ? Cell::not_bedrock : Cell::unknown;
             pf.pattern.cells[static_cast<std::size_t>(j) * w + i] = c;
         }

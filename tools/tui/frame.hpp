@@ -21,6 +21,9 @@ namespace rokkdoxx::tui {
 // had to cut.
 std::string clip_visible(const std::string& s, int cols);
 
+// Usage, once per tick (rokktui.cpp's redraw):
+//   frame.begin(size());  draw(app, frame);  write_out(frame.flush());
+// Drawing code only calls put()/line(); it never writes to the terminal.
 class Frame {
 public:
     // Start a new frame for a terminal of this size. A size change forces the
@@ -35,16 +38,13 @@ public:
     int rows_left() const;
     int cols() const { return size_.cols; }
 
-    // Force the next flush to repaint the whole screen.
-    void invalidate() { full_ = true; }
-
     // The bytes to write to bring the terminal from the previous frame to this
     // one. Empty if nothing changed.
     std::string flush();
 
 private:
-    std::vector<std::string> cur_, prev_;
-    std::string partial_;
+    std::vector<std::string> cur_, prev_;  // this frame's rows / what the terminal shows
+    std::string partial_;                  // put() text not yet ended by line()
     TermSize size_{}, prev_size_{};
     bool full_ = true;
 };

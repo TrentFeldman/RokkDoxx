@@ -1,3 +1,4 @@
+// The only SearchClient implementation: a SearchService in this process.
 #include "client.hpp"
 
 #include "search_service.hpp"
@@ -8,6 +9,7 @@ namespace rokkdoxx::svc {
 namespace {
 
 // The service lives in this process; calls forward straight to it.
+// The label is resolved once here, so backend_name() never touches a driver.
 class InProcessClient : public SearchClient {
 public:
     explicit InProcessClient(const std::string& backend)

@@ -1,3 +1,6 @@
+// CpuWorker, the shared search prep (world_patch, worker_config,
+// build_search_plan) and backend selection. OpenclWorker lives in
+// opencl_worker.cpp and is only referenced here behind ROKK_ENABLE_OPENCL.
 #include "workers.hpp"
 
 #include <algorithm>
@@ -18,6 +21,8 @@ namespace rokkdoxx::svc {
 
 // --- search prep ----------------------------------------------------------
 
+// Copy w x h blocks of the real floor into a fully known Pattern (no unknown
+// cells). Searching for the result must find (x0, z0) + the anchor offset.
 Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h, Edition edition) {
     const BedrockGenerator gen(seed, edition);
     Pattern p;
@@ -31,6 +36,8 @@ Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h, Edit
     return p;
 }
 
+// The per-seed half of a WorkerConfig: runs BedrockGenerator's fork chain once
+// so workers get plain numbers (derived_lo/hi, threshold) instead of a seed.
 WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition) {
     const BedrockGenerator gen(seed, edition);
     WorkerConfig cfg;
@@ -42,14 +49,24 @@ WorkerConfig worker_config(std::int64_t seed, int plane_y, Edition edition) {
     return cfg;
 }
 
+// See SearchPlan (service_types.hpp) for what the output means. Steps:
+//   1. sort cells rare-type first (fail fast)
+//   2. pick the anchor (a rare cell near the centroid)
+//   3. recentre on the anchor, apply each orientation, collapse duplicates
+// Deterministic: the same knowns always give the same plan, so the GPU's
+// rebuild check (opencl_worker.cpp) can skip recompiling an unchanged pattern.
 SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t threshold,
                              bool all_orientations) {
     SearchPlan plan;
+    // threshold is P(bedrock) * 2^24, so <= 2^23 means P(bedrock) <= 1/2:
+    // bedrock is the rarer cell type (Java's y -60, Bedrock Edition's -61 and
+    // -60), else air is.
     const bool bedrock_rare = threshold <= (1u << 23);
     const std::uint8_t rare_want = bedrock_rare ? 1 : 0;
 
     // Fail-fast order: rarer cell type first, so a wrong candidate is usually
-    // rejected on cell 1 (of each variant).
+    // rejected on cell 1 (of each variant). stable_sort keeps the row-major
+    // order within each type, so the plan is reproducible.
     std::stable_sort(knowns.begin(), knowns.end(), [&](const KnownCell& a, const KnownCell& b) {
         return ((a.want == 1) == bedrock_rare) && ((b.want == 1) != bedrock_rare);
     });
@@ -93,8 +110,12 @@ SearchPlan build_search_plan(std::vector<KnownCell> knowns, std::uint32_t thresh
 
     // Recentre each cell on the anchor, apply every orientation, and collapse
     // orientations whose transformed (offset, want) set is identical.
+    // The comparison uses a sorted copy (`key`) of the cells, because two
+    // orientations of a symmetric shape list the same cells in different
+    // orders. The stored offsets (ox/oz) keep plan cell order, so cell c of
+    // every variant is the same pattern cell (want[c] applies to all).
     const int gN = all_orientations ? 8 : 1;
-    std::vector<std::vector<std::tuple<int, int, int>>> canon;
+    std::vector<std::vector<std::tuple<int, int, int>>> canon;  // sorted key of each variant so far
     for (int g = 0; g < gN; ++g) {
         const Transform tf = kOrientations[static_cast<std::size_t>(g)];
         std::vector<std::int32_t> ox(cells.size()), oz(cells.size());
@@ -134,6 +155,7 @@ CpuWorker::CpuWorker(unsigned threads) : threads_(threads) {
     if (threads_ == 0) threads_ = 1;
 }
 
+// Called once per job by SearchService::run (and per phase by the benchmark).
 void CpuWorker::configure(const WorkerConfig& cfg) {
     cfg_ = cfg;
     plan_ = build_search_plan(cfg.knowns, cfg.threshold, cfg.all_orientations);
@@ -141,6 +163,14 @@ void CpuWorker::configure(const WorkerConfig& cfg) {
     emitted_.store(0);
 }
 
+// The CPU search. Called through CpuWorker::begin_tile (synchronously) by the
+// pump. Structure:
+//   - java_bed / be_bed: "is the block at world (x, z) bedrock?" for this plane
+//   - Bedrock Edition only: prefill every chunk the tile + pattern can touch
+//   - work(t, bed): thread t scans rows t, t+T, ... testing every candidate
+//     against the SearchPlan, OR-ing the variant masks that pass
+//   - join, concatenate the per-thread buckets
+// Matches come out grouped by thread, not sorted; SearchService::run sorts.
 std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     const int T = static_cast<int>(threads_);
     // Each thread writes into its own bucket, so there is no locking on the hot
@@ -153,6 +183,8 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     const SearchPlan& p = plan_;
     const int nc = p.n_cells;
 
+    // Java: one positional RNG draw per block (bedrock_core.h). The int casts
+    // assume coordinates fit in 32 bits (the world border is ~3e7).
     auto java_bed = [&](std::int64_t x, std::int64_t z) {
         return static_cast<int>(rk_bits24_at(dlo, dhi, static_cast<int>(x), y, static_cast<int>(z)) < thr);
     };
@@ -162,12 +194,17 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
     std::vector<std::uint32_t> chunks;
     int c0x = 0, c0z = 0, ncx = 0;
     if (cfg_.edition == Edition::bedrock) {
+        // The pattern's reach from the anchor over every variant, then the
+        // chunk range covering [tile start + min offset, tile end + max offset]
+        // after the game's float rounding.
         const auto [lox, hix] = std::minmax_element(p.off_x.begin(), p.off_x.end());
         const auto [loz, hiz] = std::minmax_element(p.off_z.begin(), p.off_z.end());
         c0x = rk_be_coord(static_cast<int>(tile.x0 + *lox)) >> 4;
         c0z = rk_be_coord(static_cast<int>(tile.z0 + *loz)) >> 4;
         ncx = (rk_be_coord(static_cast<int>(tile.x0 + tile.w - 1 + *hix)) >> 4) - c0x + 1;
         const int ncz = (rk_be_coord(static_cast<int>(tile.z0 + tile.h - 1 + *hiz)) >> 4) - c0z + 1;
+        // Layout: chunk (i, j) relative to (c0x, c0z) at [(j * ncx + i) * 16],
+        // 16 row masks each. Filled in parallel, one chunk row per thread turn.
         chunks.resize(static_cast<std::size_t>(ncx) * ncz * 16);
         std::vector<std::thread> fill;
         for (int t = 0; t < T; ++t)
@@ -179,6 +216,7 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
             });
         for (auto& th : fill) th.join();
     }
+    // Bedrock Edition: a lookup into the prefilled chunks.
     auto be_bed = [&](std::int64_t x, std::int64_t z) {
         const int sx = rk_be_coord(static_cast<int>(x)), sz = rk_be_coord(static_cast<int>(z));
         const std::size_t c = static_cast<std::size_t>((sz >> 4) - c0z) * ncx + ((sx >> 4) - c0x);
@@ -187,6 +225,8 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
 
     // Thread t handles every T-th row of the tile (z = t, t+T, t+2T, ...).
     // (x, z) is the candidate world position of the anchor cell (plan cell 0).
+    // `bed` is java_bed or be_bed; taking it as a generic lambda parameter
+    // means each edition gets its own inlined copy of the loop.
     auto work = [&](int t, auto bed) {
         auto& out = buckets[static_cast<std::size_t>(t)];
         for (int dz = t; dz < tile.h; dz += T) {
@@ -212,6 +252,8 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
                     if (ok) mask |= p.variant_mask[static_cast<std::size_t>(v)];
                 }
                 if (mask) {
+                    // One shared counter across threads and tiles enforces the
+                    // job's match cap without a lock.
                     if (emitted_.fetch_add(1) < cfg_.match_cap)
                         out.push_back({static_cast<int>(x), static_cast<int>(z), mask});
                     else
@@ -235,6 +277,8 @@ std::vector<Match> CpuWorker::run_tile(const Tile& tile) {
 
 // --- backend selection ----------------------------------------------------
 
+// Called by rokksearch --list-backends, the TUI (at start-up, for the backend
+// picker) and resolve_backend below.
 std::vector<BackendInfo> list_backends() {
     std::vector<BackendInfo> out;
     {
@@ -245,21 +289,15 @@ std::vector<BackendInfo> list_backends() {
         out.push_back(std::move(cpu));
     }
 #ifdef ROKK_ENABLE_OPENCL
-    for (const OpenclDevice& d : opencl_list_devices()) {
-        BackendInfo b;
-        b.id = "opencl:" + std::to_string(d.index);
-        b.label = d.label;
-        b.is_gpu = !d.is_cpu;
-        b.integrated = d.integrated;
-        b.version = d.cl_version;
-        b.driver = d.driver_version;
-        b.units = d.compute_units;
-        out.push_back(std::move(b));
-    }
+    const std::vector<BackendInfo> gpus = opencl_list_devices();
+    out.insert(out.end(), gpus.begin(), gpus.end());
 #endif
     return out;
 }
 
+// Name -> device. Every front-end path goes through here (make_client ->
+// InProcessClient, rokksearch's open_worker), so the "auto" policy lives in
+// exactly one place.
 BackendInfo resolve_backend(const std::string& id) {
     const std::string want = id.empty() ? "auto" : id;
     const std::vector<BackendInfo> all = list_backends();
@@ -284,6 +322,7 @@ BackendInfo resolve_backend(const std::string& id) {
     }
     if (b) return *b;
 
+    // Nothing matched: give the most useful error for why.
 #ifndef ROKK_ENABLE_OPENCL
     if (want.rfind("opencl", 0) == 0 || want == "dedicated" || want == "integrated")
         throw std::runtime_error("this build has no OpenCL support (rebuild with ROKK_ENABLE_OPENCL)");
@@ -293,6 +332,7 @@ BackendInfo resolve_backend(const std::string& id) {
     throw std::runtime_error("unknown backend: " + id + " (see --list-backends)");
 }
 
+// The returned lambda is what SearchService calls at the start of each job.
 WorkerFactory make_worker_factory(const std::string& id) {
     const BackendInfo b = resolve_backend(id);
     if (b.id == "cpu") return [] { return std::make_unique<CpuWorker>(); };

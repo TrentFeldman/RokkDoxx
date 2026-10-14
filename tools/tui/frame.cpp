@@ -45,6 +45,10 @@ void Frame::line(const std::string& s) {
 
 int Frame::rows_left() const { return std::max(0, size_.rows - static_cast<int>(cur_.size())); }
 
+// Rows are addressed absolutely (ESC [ row ; 1 H) and each written row ends
+// with "reset colour + clear to end of line", so a shorter new row leaves no
+// leftovers from the old one. A full repaint clears the screen first and can
+// then skip empty rows.
 std::string Frame::flush() {
     if (!partial_.empty()) line();
     const int rows = std::max(1, size_.rows);
@@ -57,6 +61,7 @@ std::string Frame::flush() {
     const bool full = full_ || !(size_ == prev_size_);
     std::string out;
     if (full) out += "\x1b[0m\x1b[H\x1b[2J";
+    // Also visit rows that existed last frame but not now, so they get cleared.
     const std::size_t n = std::max(cur_.size(), full ? 0 : prev_.size());
     for (std::size_t r = 0; r < n; ++r) {
         const std::string empty;
