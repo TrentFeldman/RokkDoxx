@@ -1,6 +1,6 @@
 # RokkDoxx
 
-**v1.1.0 - Bedrock Edition**
+**v1.1.1 - Bedrock Edition**
 
 **Got Bedrock? Get Locations.**
 
@@ -29,6 +29,17 @@ RokkDoxx 1.1 adds Bedrock Edition. Its floor is the same in every world, so a se
 seed: `--edition bedrock` in `rokksearch`, or `edition` in `rokktui`. The generator is bit-exact
 with Bedrock Dedicated Server 1.26.52, on CPU and GPU. Bedrock patterns, benchmarks and demos
 work the same way as Java ones.
+
+## v1.1.1
+
+- Autosave: every search saves its progress about once a minute and picks up where it left
+  off after Ctrl-C, a closed terminal or a crash (see Autosave under Usage).
+- Checkpoints: a cut-off file is ignored instead of half-loaded, and GPU and CPU checkpoints
+  no longer resume each other's progress.
+- Faster Java Edition GPU search (~10% on a 7900 XTX).
+- Windows: Bedrock Edition coordinates past +/-2^24 are now correct with MSVC.
+- `rokktui` opens on a splash screen; `rokksearch --size` rejects bad sizes.
+- Fixed: a search without a checkpoint file re-sorted all its matches after every tile.
 
 ## Build - Linux
 
@@ -167,7 +178,7 @@ build/rokktui [--load pattern.txt | --resume session.txt] [--backend auto|cpu|de
    - `orientations` - `all 8` tries every rotation/mirror, so the picture needn't face north.
    - `stop at first` - `yes` ends the search at the first match. It scans outward from the
      region's center (spawn, by default), so a nearby build is found in seconds.
-   - `backend`, `checkpoint file` - device choice; optional progress file.
+   - `backend`, `checkpoint file` - device choice; progress file (blank = autosave, below).
 2. **Pattern editor** (`Enter`). Type the grid like text: `b` bedrock, `e` empty
    (not-bedrock), `.` unknown; each moves the cursor on, wrapping to the next row, and
    `Backspace` steps back. Arrows/`hjkl` move, `space` cycles a cell. Unknown cells are
@@ -191,6 +202,13 @@ rokktui --resume NAME       # or headless: rokksearch --pattern NAME
 Saves are as of the last few seconds; pause first for an exact one. A resumed session keeps
 updating its `.ckpt`.
 
+**Autosave.** Every search (`rokktui` and `rokksearch`) writes its progress, finished tiles and
+matches, about once a minute: to the checkpoint file if you named one, else to
+`rokkdoxx-autosave.ckpt` in the current folder. If it gets killed (Ctrl-C, closed terminal,
+crash), run the same search again and it carries on from the last save. The autosave is deleted
+when the search finishes; a named file is kept. A cut-off checkpoint is ignored (the search starts
+over), and a GPU checkpoint doesn't resume on the CPU or the other way round.
+
 ### `rokksearch` - headless
 
 ```sh
@@ -201,8 +219,9 @@ rokksearch --pattern p.txt --region -1000000,1000000,-500000,500000 --orientatio
 
 Progress (with ETA) goes to stderr, matches (`x z orient_mask`) to stdout.
 `--edition bedrock` searches Bedrock Edition's floor (or put `edition bedrock` in the pattern
-file). `--json` for machine output, `--checkpoint FILE` to make a run resumable (Ctrl-C, then
-rerun), `--first` to stop at the first match, `--help` for the rest.
+file). `--json` for machine output, `--checkpoint FILE` to name the progress file (default
+`rokkdoxx-autosave.ckpt`, see Autosave), `--first` to stop at the first match, `--help` for the
+rest.
 
 The search spirals out from the region's center (spawn, for `--radius -1`). With `--first`, a
 target 14k blocks from spawn takes ~0.3 s and one 3M out ~3 min, against ~6.7 h for the whole
@@ -342,7 +361,7 @@ catches throttling or a device that goes wrong under heat.
 | [x] | All 8 orientations | shared anchor, symmetric patterns collapsed |
 | [x] | Whole-world search | `radius -1` |
 | [x] | Outward search, stop at first match | nearest-to-spawn first; `--first` |
-| [x] | Resumable runs | `--checkpoint`, or save/resume sessions |
+| [x] | Resumable runs | autosave every ~1 min, `--checkpoint`, or save/resume sessions |
 | [x] | Live map, pause/resume (`rokktui`) | `p`, `s`, `r`; `rokktui --resume` |
 | [x] | Demo searches | `rokksearch --demo` |
 | [x] | ETA + sustained benchmark | `--benchmark-long 15` checks results stay identical |

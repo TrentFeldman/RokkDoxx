@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -242,6 +243,16 @@ void test_scheduler_checkpoint() {
     std::vector<Match> ignored;
     check(!s3.load_checkpoint(path, fp ^ 1, ignored) && s3.done_count() == 0,
           "checkpoint rejected on fingerprint mismatch, changing nothing");
+
+    // Killed mid-write: every cut is rejected whole, never a partial resume.
+    std::ostringstream full;
+    s1.write_checkpoint(full, fp, saved_matches);
+    for (std::size_t cut = 1; cut < full.str().size(); ++cut) {
+        TileScheduler s4(req.region, req.tile_side);
+        std::istringstream in(full.str().substr(0, cut));
+        check(!s4.read_checkpoint(in, fp, ignored) && s4.done_count() == 0 && ignored.empty(),
+              "a truncated checkpoint is rejected, changing nothing");
+    }
 
     std::remove(path.c_str());
 }

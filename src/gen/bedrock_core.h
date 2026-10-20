@@ -89,13 +89,17 @@ RK_INLINE rk_u64 rk_mix_stafford13(rk_u64 z) {
  * The output function of Xoroshiro128++ is rotl(lo + hi, 17) + lo; the state
  * update (see rk_xoro_next) is skipped because nobody reads the next state.
  * The all-zero guard mirrors Java's Xoroshiro128PlusPlus constructor, which
- * swaps an all-zero state for the two constants above. */
+ * swaps an all-zero state for the two constants above; here it selects that
+ * state's output (a constant) instead. The GPU's per-seed program defines
+ * RK_HI_NONZERO when derived_hi != 0, so the state can't be all-zero. */
 RK_INLINE rk_u64 rk_xoro_first(rk_u64 lo, rk_u64 hi) {
-    if ((lo | hi) == (rk_u64)0) {
-        lo = RK_GOLDEN_RATIO_64;
-        hi = RK_SILVER_RATIO_64;
-    }
-    return rk_rotl64(lo + hi, 17) + lo;
+    const rk_u64 n = rk_rotl64(lo + hi, 17) + lo;
+#if defined(RK_HI_NONZERO)
+    return n;
+#else
+    return (lo | hi) == (rk_u64)0 ? rk_rotl64(RK_GOLDEN_RATIO_64 + RK_SILVER_RATIO_64, 17) + RK_GOLDEN_RATIO_64
+                                  : n;
+#endif
 }
 
 #if !defined(__OPENCL_VERSION__)

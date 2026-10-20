@@ -59,7 +59,7 @@ namespace {
                  "  --first               stop at the first match (the search scans outward from\n"
                  "                        the middle of the region, so this finds the nearest)\n"
                  "  --cap <n>             max matches to keep (default 1048576)\n"
-                 "  --checkpoint <file>   resumable progress file\n"
+                 "  --checkpoint <file>   resumable progress file (default rokkdoxx-autosave.ckpt)\n"
                  "  --backend <id>        cpu | dedicated | integrated | opencl:N | auto (default auto:\n"
                  "                        dedicated GPU, else integrated GPU, else cpu)\n"
                  "  --json               machine-readable output\n"
@@ -702,7 +702,7 @@ int main(int argc, char** argv) {
     if (orient_s) req.all_orientations = std::strcmp(orient_s, "exact") != 0;
     req.match_cap = cap;
     req.stop_at_first_match = first;
-    req.checkpoint_path = checkpoint;
+    req.checkpoint_path = checkpoint.empty() ? kAutosavePath : checkpoint;
 
     // --size without a file gives an all-unknown pattern of that size. The
     // service rejects a pattern with no known cells, so on its own this ends
@@ -732,7 +732,7 @@ int main(int argc, char** argv) {
 
     // Submit, then poll every 100 ms, redrawing one progress line (\r) on
     // stderr until the job ends. Ctrl+C kills the process; there is no
-    // graceful cancel here (use --checkpoint to be able to resume).
+    // graceful cancel here (rerun the same search to resume from the checkpoint).
     std::unique_ptr<SearchClient> client;
     JobId job = 0;
     JobStatus fin;

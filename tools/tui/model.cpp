@@ -71,7 +71,7 @@ bool build_request(const Model& m, svc::SearchRequest& req, std::string& err) {
     req.region = rad == -1 ? svc::Region::world() : svc::Region::centered(cx, cz, rad);
     req.all_orientations = m.all_orient;
     req.stop_at_first_match = m.stop_first;
-    req.checkpoint_path = m.checkpoint;
+    req.checkpoint_path = m.checkpoint.empty() ? svc::kAutosavePath : m.checkpoint;
     return true;
 }
 

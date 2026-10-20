@@ -224,7 +224,7 @@ std::string field_value(const App& app, int f) {
         case F_STOP:
             return m.stop_first ? "yes  (end at the first match)" : "no  (scan the whole region)";
         case F_BACKEND: return backend_text(app);
-        case F_CKPT: return m.checkpoint.empty() ? "(off)" : m.checkpoint;
+        case F_CKPT: return m.checkpoint.empty() ? std::string("(auto) ") + svc::kAutosavePath : m.checkpoint;
     }
     return "";
 }

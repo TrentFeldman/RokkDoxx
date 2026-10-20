@@ -13,7 +13,9 @@
 // (16384-block) tiles to keep the fixed per-dispatch cost small.
 //
 // match_plane is rebuilt per pattern with the first cells' offsets baked in as
-// literals (specialized_source); if that build fails the generic kernel is used.
+// literals (specialized_source), and Java's fill_plane is taken from the same
+// program (RK_HI_NONZERO drops the all-zero guard); if that build fails the
+// generic kernels are used.
 //
 // begin_tile()/end_tile() ping-pong two buffer/queue slots so one tile's
 // dispatch can overlap another's read-back.
@@ -253,7 +255,7 @@ struct OpenclWorker::Impl {
     std::size_t be_local_w = 32, be_local_h = 8;  // the same for the Bedrock Edition kernels
     cl::Kernel k_fill, k_match;
     cl::Kernel k_fill_be, k_remap_be;  // Bedrock Edition's fill: chunks into buf_raw, then remap
-    cl::Program specialized_program;  // the current pattern's match_plane (one at a time)
+    cl::Program specialized_program;  // the current pattern's match_plane + fill_plane (one at a time)
     std::string specialized_src;      // its source, so an unchanged pattern isn't rebuilt
     cl::Buffer buf_plane[kSlots];  // 1 bit per block; layout in search_tile.cl
     cl::Buffer buf_raw[kSlots];  // Bedrock Edition only
@@ -370,8 +372,9 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
     // ~200 ms the first time a pattern is seen (the driver caches repeats).
     // Only one specialized program is kept; a new pattern replaces it.
     try {
-        const std::string src = specialized_source(plan);
+        std::string src = specialized_source(plan);
         if (src.empty()) throw std::runtime_error("kernel markers missing");
+        if (cfg.derived_hi != 0) src = "#define RK_HI_NONZERO\n" + src;
         if (src != impl_->specialized_src) {
             cl::Program p(impl_->ctx, src);
             p.build("-cl-std=CL1.2");
@@ -379,8 +382,10 @@ void OpenclWorker::configure(const WorkerConfig& cfg) {
             impl_->specialized_src = src;
         }
         impl_->k_match = cl::Kernel(impl_->specialized_program, "match_plane");
+        impl_->k_fill = cl::Kernel(impl_->specialized_program, "fill_plane");
     } catch (const std::exception&) {
         impl_->k_match = cl::Kernel(impl_->program, "match_plane");  // oh-shit fallback: generic, silently
+        impl_->k_fill = cl::Kernel(impl_->program, "fill_plane");
     }
     impl_->pick_local();
 }

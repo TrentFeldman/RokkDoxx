@@ -87,6 +87,10 @@ struct Pattern {
 // loader / TUI clamp to it.
 inline constexpr int kMaxDim = 32;
 
+// Where the front-ends checkpoint a search when no file is named. Deleted when
+// the search finishes; kept on cancel / kill so rerunning the same search resumes.
+inline constexpr const char* kAutosavePath = "rokkdoxx-autosave.ckpt";
+
 // A fully known w x h pattern copied from the world at (x0, z0). (workers.cpp)
 // Used to plant a guaranteed match: tests, rokksearch --benchmark / --demo.
 Pattern world_patch(std::int64_t seed, int y, int x0, int z0, int w, int h,

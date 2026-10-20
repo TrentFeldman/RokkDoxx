@@ -89,6 +89,8 @@ void test_next_long() {
         expect_i64(static_cast<std::int64_t>(rk_xoro_next(&lo, &hi)), c.n2, "nextLong2 seed " + std::to_string(c.seed));
         expect_i64(static_cast<std::int64_t>(rk_xoro_next(&lo, &hi)), c.n3, "nextLong3 seed " + std::to_string(c.seed));
     }
+    rk_u64 lo = RK_GOLDEN_RATIO_64, hi = RK_SILVER_RATIO_64;
+    check(rk_xoro_first(0, 0) == rk_xoro_next(&lo, &hi), "all-zero state draws as Java's substitute state");
 }
 
 // The top-24-bits float Java derives from nextLong (what the gradient compares).
